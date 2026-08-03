@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 1,
+  "frameMagic": "DQR1",
+  "frameHeaderBytes": 48,
+  "containerMagic": "DQRC",
+  "recordHeaderBytes": 24,
+  "frameKinds": {"data": 1, "endWindow": 2, "calibration": 3},
+  "recordTypes": {"session": 1, "directory": 2, "fileBegin": 3, "fileData": 4, "fileEnd": 5, "transferEnd": 6},
+  "default": {"qrVersion": 15, "ecc": "M", "modulePixels": 4, "payloadBytes": 364, "holdMilliseconds": 750, "repetitions": 1, "windowFrames": 32},
+  "presets": {
+    "fps": {"qrVersion": 12, "ecc": "M", "modulePixels": 4, "payloadBytes": 239, "holdMilliseconds": 0, "windowFrames": 64},
+    "bulk": {"qrVersion": 40, "ecc": "M", "modulePixels": 2, "payloadBytes": 2283, "holdMilliseconds": 0, "windowFrames": 32}
+  }
+}

@@ -1,0 +1,3 @@
+Hello from DOSfer optical transfer.
+This file has a known, short payload for the first live CRT/camera test.
+

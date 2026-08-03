@@ -1,0 +1,103 @@
+package org.dosfer.receiver;
+
+import android.content.Context;
+import java.io.*;
+import java.util.*;
+
+public final class SessionStore {
+    public enum Result { STORED, DUPLICATE, INVALID, OTHER_SESSION, CALIBRATION }
+    public static final class Stats {
+        public long session;public int window,expected,uniqueWindow,duplicates,invalid,other;
+        public long uniqueTotal,totalPayload,calibrationUnique,calibrationMissed;public double decodedFps,usefulBps,avgLatencyMs;
+        public String missing="-",calibration="WAITING FOR PROTOCOL QR";public boolean complete;
+    }
+    private final Context context;private long active;
+    private final Map<Integer,Integer> windowExpected=new HashMap<>();
+    private final Map<Integer,BitSet> windowSeen=new HashMap<>();
+    private long duplicates,invalid,other,totalPayload,endIndex=-1,firstStoredNanos;
+    private final ArrayDeque<Long> decodeTimes=new ArrayDeque<>();
+    private double latencySum;private long latencyCount,calLast=-1,calMissed,calUnique,calDuplicates;
+
+    public SessionStore(Context c){context=c.getApplicationContext();active=context.getSharedPreferences("dosfer",0).getLong("active",0);reload();}
+    private File dir(){File d=new File(context.getFilesDir(),"sessions/"+Long.toUnsignedString(active,16));d.mkdirs();return d;}
+    private File file(long index){return new File(dir(),String.format(Locale.US,"frame_%010d.dqr",index));}
+    private File xorFile(long index){return new File(dir(),String.format(Locale.US,"xor_%010d.dqr",index));}
+    private static boolean isDataName(String n){return n.startsWith("frame_")&&n.endsWith(".dqr");}
+    private static boolean isXorName(String n){return n.startsWith("xor_")&&n.endsWith(".dqr");}
+    private void activate(long session){active=session;windowExpected.clear();windowSeen.clear();totalPayload=0;endIndex=-1;firstStoredNanos=0;context.getSharedPreferences("dosfer",0).edit().putLong("active",active).apply();}
+    public synchronized Result accept(byte[] raw,long latencyNanos){
+        Protocol.Frame f;
+        try{f=Protocol.parseFrame(raw);}catch(RuntimeException e){invalid++;return Result.INVALID;}
+        noteDecode(raw.length,latencyNanos);
+        if(f.kind==Protocol.CALIBRATION){noteCalibration(f);return Result.CALIBRATION;}
+        Protocol.Record record=null;
+        if(f.kind==Protocol.DATA)try{record=Protocol.parseRecord(f.payload);}catch(RuntimeException e){invalid++;return Result.INVALID;}
+        /* An end-window marker can remain visible while the user presses Reset.
+           It must not claim the next empty session. A valid data frame from a
+           different session may replace an empty stale session automatically. */
+        if(active==0){if(f.kind==Protocol.END_WINDOW)return Result.OTHER_SESSION;activate(f.session);}
+        if(active!=f.session){if(f.kind==Protocol.DATA&&countFrames()==0)activate(f.session);else{other++;return Result.OTHER_SESSION;}}
+        if(f.kind==Protocol.END_WINDOW){windowExpected.put(f.window,f.windowCount);return Result.STORED;}
+        if(f.kind==Protocol.CHAIN_XOR){
+            windowExpected.put(f.window,f.windowCount);File target=xorFile(f.globalIndex);
+            if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
+            if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverFrom(f.globalIndex);return Result.STORED;
+        }
+        if(record!=null&&record.type==Protocol.TRANSFER_END)endIndex=f.globalIndex;
+        windowExpected.put(f.window,f.windowCount);BitSet bits=windowSeen.computeIfAbsent(f.window,k->new BitSet());
+        File target=file(f.globalIndex);
+        if(target.exists()){
+            try{Protocol.Frame old=Protocol.parseFrame(readAll(target));if(Arrays.equals(old.payload,f.payload)){duplicates++;bits.set(f.windowIndex);return Result.DUPLICATE;}}
+            catch(Exception ignored){}
+            invalid++;return Result.INVALID;
+        }
+        if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}
+        bits.set(f.windowIndex);if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=f.payloadLength;recoverFrom(f.globalIndex-1,f.globalIndex);return Result.STORED;
+    }
+    private void noteDecode(int bytes,long latency){long now=System.nanoTime();decodeTimes.addLast(now);while(!decodeTimes.isEmpty()&&now-decodeTimes.peekFirst()>5_000_000_000L)decodeTimes.removeFirst();latencySum+=latency/1e6;latencyCount++;}
+    private void noteCalibration(Protocol.Frame f){calUnique++;if(calLast>=0){if(f.globalIndex==calLast)calDuplicates++;else if(f.globalIndex>calLast+1)calMissed+=f.globalIndex-calLast-1;}if(f.globalIndex>calLast)calLast=f.globalIndex;}
+    private static byte[] readAll(File f)throws IOException{try(FileInputStream in=new FileInputStream(f);ByteArrayOutputStream o=new ByteArrayOutputStream()){byte[] b=new byte[4096];int n;while((n=in.read(b))>0)o.write(b,0,n);return o.toByteArray();}}
+    private static boolean storeRaw(File target,byte[] raw){File temp=new File(target.getPath()+".tmp");
+        try(FileOutputStream out=new FileOutputStream(temp)){out.write(raw);}catch(IOException e){temp.delete();return false;}
+        if(!temp.renameTo(target)){temp.delete();return false;}return true;}
+    private static long bodyU32(byte[] b,int p){return ((long)(b[p]&255)<<24)|((long)(b[p+1]&255)<<16)|((long)(b[p+2]&255)<<8)|(b[p+3]&255);}
+    private boolean storeRecovered(Protocol.Frame chain,long index,int wi,byte[] payload) {
+        Protocol.Record r=Protocol.parseRecord(payload);long sid=0,off=0;
+        if(r.type==Protocol.FILE_BEGIN||r.type==Protocol.FILE_DATA||r.type==Protocol.FILE_END)sid=r.fileId;
+        if(r.type==Protocol.FILE_DATA){if(r.body.length<4)throw new IllegalArgumentException("file data");off=bodyU32(r.body,0);}
+        byte[] raw=Protocol.encodeFrame(Protocol.DATA,Protocol.FLAG_WHITENED,chain.session,chain.window,index,wi,chain.windowCount,sid,off,payload);
+        if(!storeRaw(file(index),raw))return false;
+        windowExpected.put(chain.window,chain.windowCount);windowSeen.computeIfAbsent(chain.window,k->new BitSet()).set(wi);
+        if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=payload.length;
+        if(r.type==Protocol.TRANSFER_END)endIndex=index;return true;
+    }
+    private long recoverEquation(File eq) {
+        try{Protocol.Frame chain=Protocol.parseFrame(readAll(eq));if(chain.kind!=Protocol.CHAIN_XOR||chain.windowIndex+1>=chain.windowCount)return -1;
+            File left=file(chain.globalIndex),right=file(chain.globalIndex+1);boolean haveLeft=left.exists(),haveRight=right.exists();if(haveLeft==haveRight)return -1;
+            Protocol.Frame known=Protocol.parseFrame(readAll(haveLeft?left:right));byte[] recovered=Protocol.recoverChain(chain,known.payload,haveLeft);
+            long index=haveLeft?chain.globalIndex+1:chain.globalIndex;return storeRecovered(chain,index,haveLeft?chain.windowIndex+1:chain.windowIndex,recovered)?index:-1;
+        }catch(Exception ignored){return -1;}
+    }
+    private void recoverFrom(long... roots) {ArrayDeque<Long> queue=new ArrayDeque<>();for(long root:roots)if(root>=0)queue.add(root);
+        while(!queue.isEmpty()){long left=queue.removeFirst();File eq=xorFile(left);if(!eq.exists())continue;long recovered=recoverEquation(eq);
+            if(recovered>=0){if(recovered>0)queue.add(recovered-1);queue.add(recovered);}}
+    }
+    private void recoverAvailable() {
+        boolean changed;do{changed=false;File[] equations=dir().listFiles((d,n)->isXorName(n));if(equations==null)return;
+            for(File eq:equations)if(recoverEquation(eq)>=0)changed=true;
+        }while(changed);
+    }
+    private void reload(){if(active==0)return;File[] files=dir().listFiles((d,n)->isDataName(n));if(files==null)return;
+        for(File file:files)try{byte[] raw=readAll(file);Protocol.Frame f=Protocol.parseFrame(raw);Protocol.Record r=Protocol.parseRecord(f.payload);
+            windowExpected.put(f.window,f.windowCount);windowSeen.computeIfAbsent(f.window,k->new BitSet()).set(f.windowIndex);if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=f.payloadLength;if(r.type==Protocol.TRANSFER_END)endIndex=f.globalIndex;
+        }catch(Exception ignored){} recoverAvailable(); }
+    public synchronized Stats stats(){Stats s=new Stats();s.session=active;s.uniqueTotal=countFrames();s.duplicates=(int)duplicates;s.invalid=(int)invalid;s.other=(int)other;s.totalPayload=totalPayload;
+        int newest=-1;for(int w:windowExpected.keySet())if(w>newest)newest=w;s.window=Math.max(0,newest);s.expected=windowExpected.getOrDefault(s.window,0);BitSet b=windowSeen.getOrDefault(s.window,new BitSet());s.uniqueWindow=b.cardinality();s.missing=ranges(b,s.expected);
+        long span=decodeTimes.size()>1?decodeTimes.peekLast()-decodeTimes.peekFirst():0;s.decodedFps=span>0?(decodeTimes.size()-1)*1e9/span:0;s.usefulBps=firstStoredNanos==0?0:totalPayload*1e9/Math.max(1,System.nanoTime()-firstStoredNanos);s.avgLatencyMs=latencyCount==0?0:latencySum/latencyCount;
+        s.complete=endIndex>=0&&s.uniqueTotal==endIndex+1;s.calibrationUnique=calUnique;s.calibrationMissed=calMissed;s.calibration=calibrationText();return s;}
+    private long countFrames(){File[] f=dir().listFiles((d,n)->isDataName(n));return f==null?0:f.length;}
+    private static String ranges(BitSet b,int count){StringBuilder s=new StringBuilder();int i=0;while(i<count){i=b.nextClearBit(i);if(i>=count)break;int e=i;while(e+1<count&&!b.get(e+1))e++;if(s.length()>0)s.append(',');s.append(i+1);if(e>i)s.append('-').append(e+1);i=e+1;}return s.length()==0?"-":s.toString();}
+    private String calibrationText(){if(calUnique==0)return "WAITING FOR PROTOCOL QR";double dup=(double)calDuplicates/Math.max(1,calUnique);if(calMissed>calUnique/10)return "TOO FAST — frames are being skipped";if(dup>4)return "EXCESSIVE DUPLICATES — speed can increase";if(invalid>0)return "MARGINAL — invalid frames seen";return "RELIABLE";}
+    public synchronized List<File> orderedFrames(){File[] a=dir().listFiles((d,n)->isDataName(n));if(a==null)return Collections.emptyList();Arrays.sort(a,Comparator.comparing(File::getName));return Arrays.asList(a);}
+    public synchronized void reset(){File d=dir();File[] a=d.listFiles();if(a!=null)for(File f:a)f.delete();d.delete();active=0;windowExpected.clear();windowSeen.clear();decodeTimes.clear();duplicates=invalid=other=totalPayload=0;endIndex=-1;firstStoredNanos=0;latencySum=0;latencyCount=calMissed=calUnique=calDuplicates=0;calLast=-1;context.getSharedPreferences("dosfer",0).edit().remove("active").apply();}
+}

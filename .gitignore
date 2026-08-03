@@ -1,0 +1,33 @@
+# Project build outputs
+/build/
+/dos_sender/build/
+/dos_sender/*.obj
+/dos_sender/*.err
+/dos_sender/*.map
+/*.obj
+
+# Android/Gradle local state
+.gradle/
+local.properties
+*.iml
+/android_receiver/app/build/
+/android_receiver/build/
+
+# Optional local 86Box installation, upstream sources, ROMs and disk images
+/tools/86box/app/
+/tools/86box/downloads/
+/tools/86box/rom_extract/
+/tools/86box/source_ref/
+/tools/86box/vm/dosfer-486/*
+!/tools/86box/vm/dosfer-486/86box.cfg
+
+# Locally installed Python packages used by the disk-image helpers
+/tools/pydeps/
+
+# Python/editor/OS noise
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
