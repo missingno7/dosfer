@@ -6,10 +6,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.zip.CRC32;
 
 public final class Protocol {
-    public static final int DATA=1, END_WINDOW=2, CALIBRATION=3, CHAIN_XOR=4, BLOCK_XOR=5;
+    public static final int DATA=1, END_WINDOW=2, CALIBRATION=3, CHAIN_XOR=4, BLOCK_XOR=5, PLANE_CODED=6;
     public static final int SESSION=1, DIRECTORY=2, FILE_BEGIN=3, FILE_DATA=4, FILE_END=5, TRANSFER_END=6;
     public static final int FRAME_HEADER=48, RECORD_HEADER=24;
-    public static final int FLAG_REPEATED=0x0001, FLAG_PAIR_WHITENED=0x0004, FLAG_WHITENED=0x0008;
+    public static final int FLAG_REPEATED=0x0001, FLAG_PAIR_WHITENED=0x0004, FLAG_WHITENED=0x0008, FLAG_PLANE_WHITENED=0x0010;
 
     public static final class Frame {
         public final int kind, flags, window, windowIndex, windowCount, payloadLength;
@@ -36,24 +36,28 @@ public final class Protocol {
         long session=u32(b);int window=b.getInt();long global=u32(b);int wi=Short.toUnsignedInt(b.getShort()),wc=Short.toUnsignedInt(b.getShort());
         long sid=u32(b),off=u32(b);int plen=Short.toUnsignedInt(b.getShort()),hlen=Short.toUnsignedInt(b.getShort());
         long pcrc=u32(b),hcrc=u32(b),reserved=u32(b);
-        if(ver!=1||hlen!=48||reserved!=0||session==0||(flags&~0x000f)!=0||kind<1||kind>5||raw.length!=48+plen)
+        if(ver!=1||hlen!=48||reserved!=0||session==0||(flags&~0x001f)!=0||kind<1||kind>6||raw.length!=48+plen||
+           ((flags&FLAG_PLANE_WHITENED)!=0&&kind!=PLANE_CODED))
             throw new IllegalArgumentException("unsupported header");
         byte[] header=raw.clone();header[40]=header[41]=header[42]=header[43]=0;
         if(crc(header,0,48)!=hcrc)throw new IllegalArgumentException("header crc");
         if(crc(raw,48,plen)!=pcrc)throw new IllegalArgumentException("payload crc");
         byte[] payload=new byte[plen];System.arraycopy(raw,48,payload,0,plen);
-        if((flags&FLAG_PAIR_WHITENED)!=0)whitenPayloadPair(payload,0,plen,session,global);
+        if((flags&FLAG_PLANE_WHITENED)!=0)whitenPayloadGroup(payload,0,plen,session,sid);
+        else if((flags&FLAG_PAIR_WHITENED)!=0)whitenPayloadPair(payload,0,plen,session,global);
         else if((flags&FLAG_WHITENED)!=0)whitenPayload(payload,0,plen,session,global);
         return new Frame(kind,flags,session,window,global,wi,wc,sid,off,payload);
     }
     public static byte[] encodeFrame(int kind,int flags,long session,int window,long global,int wi,int wc,long sid,long off,byte[] plain) {
-        if(session==0||kind<1||kind>5||plain==null||plain.length>0xffff)throw new IllegalArgumentException("frame fields");
+        if(session==0||kind<1||kind>6||plain==null||plain.length>0xffff||
+           ((flags&FLAG_PLANE_WHITENED)!=0&&kind!=PLANE_CODED))throw new IllegalArgumentException("frame fields");
         byte[] raw=new byte[FRAME_HEADER+plain.length];ByteBuffer b=ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
         b.put("DQR1".getBytes(StandardCharsets.US_ASCII));b.put((byte)1);b.put((byte)kind);b.putShort((short)flags);
         b.putInt((int)session);b.putInt(window);b.putInt((int)global);b.putShort((short)wi);b.putShort((short)wc);
         b.putInt((int)sid);b.putInt((int)off);b.putShort((short)plain.length);b.putShort((short)FRAME_HEADER);
         b.putInt(0);b.putInt(0);b.putInt(0);System.arraycopy(plain,0,raw,FRAME_HEADER,plain.length);
-        if((flags&FLAG_PAIR_WHITENED)!=0)whitenPayloadPair(raw,FRAME_HEADER,plain.length,session,global);
+        if((flags&FLAG_PLANE_WHITENED)!=0)whitenPayloadGroup(raw,FRAME_HEADER,plain.length,session,sid);
+        else if((flags&FLAG_PAIR_WHITENED)!=0)whitenPayloadPair(raw,FRAME_HEADER,plain.length,session,global);
         else if((flags&FLAG_WHITENED)!=0)whitenPayload(raw,FRAME_HEADER,plain.length,session,global);
         b.putInt(36,(int)crc(raw,FRAME_HEADER,plain.length));b.putInt(40,0);b.putInt(40,(int)crc(raw,0,FRAME_HEADER));return raw;
     }
@@ -100,6 +104,26 @@ public final class Protocol {
         int end=offset+length;
         while(offset<end){left^=left<<13;left^=left>>>17;left^=left<<5;right^=right<<13;right^=right>>>17;right^=right<<5;
             int key=left^right;for(int i=0;i<4&&offset<end;i++,offset++){data[offset]^=(byte)key;key>>>=8;}}
+    }
+    static void whitenPayloadGroup(byte[] data,int offset,int length,long session,long groupIndex) {
+        int state=(int)(session^(groupIndex*0x9E3779B9L)^0xD05FE123L);
+        if(state==0)state=0xA5A5A5A5;int end=offset+length;
+        while(offset<end){state^=state<<13;state^=state>>>17;state^=state<<5;
+            int key=state;for(int i=0;i<4&&offset<end;i++,offset++){data[offset]^=(byte)key;key>>>=8;}}
+    }
+    /* Solves up to eight coefficient equations for the four basis payloads.
+       A non-null result contains basis vectors 1,2,4,8 in that order. */
+    public static byte[][] solvePlane4(int[] coefficients,byte[][] payloads) {
+        if(coefficients==null||payloads==null||coefficients.length!=payloads.length||coefficients.length<4)throw new IllegalArgumentException("plane equations");
+        int n=coefficients.length,len=-1,pivot=0;int[] row=coefficients.clone();byte[][] rhs=new byte[n][];
+        for(int i=0;i<n;i++){if((row[i]&~15)!=0||row[i]==0||payloads[i]==null)throw new IllegalArgumentException("plane row");
+            if(len<0)len=payloads[i].length;else if(payloads[i].length!=len)throw new IllegalArgumentException("plane length");rhs[i]=payloads[i].clone();}
+        for(int bit=0;bit<4;bit++){int p=pivot;while(p<n&&(row[p]&(1<<bit))==0)p++;if(p==n)return null;
+            int tr=row[p];row[p]=row[pivot];row[pivot]=tr;byte[] tv=rhs[p];rhs[p]=rhs[pivot];rhs[pivot]=tv;
+            for(int r=0;r<n;r++)if(r!=pivot&&(row[r]&(1<<bit))!=0){row[r]^=row[pivot];for(int j=0;j<len;j++)rhs[r][j]^=rhs[pivot][j];}
+            pivot++;}
+        byte[][] out=new byte[4][];for(int r=0;r<4;r++){int bit=Integer.numberOfTrailingZeros(row[r]);if(bit>3||row[r]!=(1<<bit))throw new IllegalArgumentException("plane reduction");out[bit]=rhs[r];}
+        return out;
     }
     public static Record parseRecord(byte[] raw) {
         if(raw==null||raw.length<24)throw new IllegalArgumentException("short record");

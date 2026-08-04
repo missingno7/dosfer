@@ -801,8 +801,7 @@ testable void addEccAndInterleave(uint8_t data[], int version, enum qrcodegen_Ec
 	}
 }
 
-bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t encodedRight[],
-		const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+static bool dosferApplyHeaderCorrectionV40L(const uint8_t protocolHeaderXor[48],uint8_t result[]) {
 	static uint8_t
 #ifdef __WATCOMC__
 		__near
@@ -831,14 +830,35 @@ bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t enc
 #ifdef DOSFER_PROFILE
 	profileNow=timer_ticks();dosferQrProfileTicks[1]+=profileNow-profileStart;profileStart=profileNow;
 #endif
-	for(i=0;i+4<=3706;i+=4)*(uint32_t *)(result+i)=*(const uint32_t *)(encodedLeft+i)^*(const uint32_t *)(encodedRight+i);
-	for(;i<3706;i++)result[i]=encodedLeft[i]^encodedRight[i];
 	for(i=0;i<52;i++)result[i*25]^=data[i];
 	for(i=0;i<30;i++)result[2956+i*25]^=ecc[i];
 #ifdef DOSFER_PROFILE
 	dosferQrProfileTicks[0]+=timer_ticks()-profileStart;
 #endif
 	return true;
+}
+
+bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t encodedRight[],
+		const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+	uint16_t i;
+	for(i=0;i+4<=3706;i+=4)*(uint32_t *)(result+i)=*(const uint32_t *)(encodedLeft+i)^*(const uint32_t *)(encodedRight+i);
+	for(;i<3706;i++)result[i]=encodedLeft[i]^encodedRight[i];
+	return dosferApplyHeaderCorrectionV40L(protocolHeaderXor,result);
+}
+
+bool qrcodegen_dosferDeriveXor4V40L(const uint8_t encodedA[],const uint8_t encodedB[],
+		const uint8_t encodedC[],const uint8_t encodedD[],
+		const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+	uint16_t i;
+	for(i=0;i+4<=3706;i+=4)*(uint32_t *)(result+i)=*(const uint32_t *)(encodedA+i)^*(const uint32_t *)(encodedB+i)^*(const uint32_t *)(encodedC+i)^*(const uint32_t *)(encodedD+i);
+	for(;i<3706;i++)result[i]=encodedA[i]^encodedB[i]^encodedC[i]^encodedD[i];
+	return dosferApplyHeaderCorrectionV40L(protocolHeaderXor,result);
+}
+
+bool qrcodegen_dosferHeaderCorrectionV40L(const uint8_t protocolHeaderXor[48],
+		uint8_t result[]) {
+	memset(result,0,3706);
+	return dosferApplyHeaderCorrectionV40L(protocolHeaderXor,result);
 }
 
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[],uint8_t result[]) {

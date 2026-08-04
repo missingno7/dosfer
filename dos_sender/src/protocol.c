@@ -99,3 +99,13 @@ u16 make_frame(u8 *out,u8 kind,u16 flags,u32 session,u32 window,u32 gi,
 #endif
     return (u16)(48+n);
 }
+u16 make_plane_frame(u8 *out,u32 session,u32 window,u32 group_global,
+                     u16 group_index,u16 window_count,u8 coefficient,
+                     const u8 far *payload,u16 payload_len) {
+    u32 pcrc;
+    if(!payload||!coefficient||coefficient>0x0F)return 0;
+    _fmemcpy(out+48,payload,payload_len);
+    pcrc=crc32_bytes(out+48,payload_len);
+    return write_frame_header(out,FK_PLANE_CODED,0,session,window,
+        coefficient,group_index,window_count,group_global,0,pcrc,payload_len);
+}

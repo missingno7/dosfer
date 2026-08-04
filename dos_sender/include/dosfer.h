@@ -16,7 +16,7 @@ typedef unsigned long u32;
 #define PATH_BYTES 128
 
 enum { FK_DATA=1, FK_END_WINDOW=2, FK_CALIBRATION=3, FK_CHAIN_XOR=4,
-       FK_BLOCK_XOR=5 };
+       FK_BLOCK_XOR=5, FK_PLANE_CODED=6 };
 enum { FF_REPEATED=0x0001, FF_PAIR_WHITENED=0x0004, FF_WHITENED=0x0008 };
 enum { RT_SESSION=1, RT_DIRECTORY=2, RT_FILE_BEGIN=3,
        RT_FILE_DATA=4, RT_FILE_END=5, RT_TRANSFER_END=6 };
@@ -33,6 +33,7 @@ typedef struct {
     u8 speaker;
     u8 redundancy;       /* 0=none, otherwise DATA frames per block parity */
     u8 chain_width;      /* 0=block parity, otherwise even overlap width */
+    u8 plane_width;      /* 0=off, 3=PLANE3, 4=PLANE4 */
 } Config;
 
 typedef struct {
@@ -75,5 +76,8 @@ u16 make_frame_header_crc(u8 *out, u8 kind, u16 flags, u32 session, u32 window,
                u32 global_index, u16 window_index, u16 window_count,
                u32 stream_id, u32 stream_offset, u32 payload_crc,
                u16 payload_len);
+u16 make_plane_frame(u8 *out,u32 session,u32 window,u32 group_global,
+                     u16 group_index,u16 window_count,u8 coefficient,
+                     const u8 far *payload,u16 payload_len);
 
 #endif

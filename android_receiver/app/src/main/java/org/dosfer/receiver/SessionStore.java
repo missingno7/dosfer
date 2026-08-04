@@ -23,9 +23,11 @@ public final class SessionStore {
     private File file(long index){return new File(dir(),String.format(Locale.US,"frame_%010d.dqr",index));}
     private File xorFile(long index){return new File(dir(),String.format(Locale.US,"xor_%010d.dqr",index));}
     private File parityFile(long index){return new File(dir(),String.format(Locale.US,"parity_%010d.dqr",index));}
+    private File planeFile(long group,int coefficient){return new File(dir(),String.format(Locale.US,"plane_%010d_%02x.dqr",group,coefficient));}
     private static boolean isDataName(String n){return n.startsWith("frame_")&&n.endsWith(".dqr");}
     private static boolean isXorName(String n){return n.startsWith("xor_")&&n.endsWith(".dqr");}
     private static boolean isParityName(String n){return n.startsWith("parity_")&&n.endsWith(".dqr");}
+    private static boolean isPlaneName(String n){return n.startsWith("plane_")&&n.endsWith(".dqr");}
     private void activate(long session){active=session;windowExpected.clear();windowSeen.clear();totalPayload=0;endIndex=-1;firstStoredNanos=0;context.getSharedPreferences("dosfer",0).edit().putLong("active",active).apply();}
     public synchronized Result accept(byte[] raw,long latencyNanos){
         Protocol.Frame f;
@@ -51,6 +53,18 @@ public final class SessionStore {
             if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
             if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverAvailable();return Result.STORED;
         }
+        if(f.kind==Protocol.PLANE_CODED){
+            int coefficient=(int)f.globalIndex,basis=-1;boolean valid=coefficient==1||coefficient==2||coefficient==4||coefficient==7||coefficient==8||coefficient==15;
+            int width=(coefficient==7?3:4);
+            if(!valid||f.flags!=0||f.streamOffset!=0||f.windowIndex+width>f.windowCount||f.streamId==0){invalid++;return Result.INVALID;}
+            if(coefficient==1)basis=0;else if(coefficient==2)basis=1;else if(coefficient==4)basis=2;else if(coefficient==8)basis=3;
+            if(basis>=0)try{record=Protocol.parseRecord(trimPlaneRecord(f.payload));}catch(RuntimeException e){invalid++;return Result.INVALID;}
+            windowExpected.put(f.window,f.windowCount);File target=planeFile(f.streamId,coefficient);
+            if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
+            if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}
+            if(basis>=0&&!storeRecovered(f,f.streamId+basis,f.windowIndex+basis,trimPlaneRecord(f.payload))){invalid++;return Result.INVALID;}
+            recoverAvailable();return Result.STORED;
+        }
         if(record!=null&&record.type==Protocol.TRANSFER_END)endIndex=f.globalIndex;
         windowExpected.put(f.window,f.windowCount);BitSet bits=windowSeen.computeIfAbsent(f.window,k->new BitSet());
         File target=file(f.globalIndex);
@@ -70,6 +84,13 @@ public final class SessionStore {
         try(FileOutputStream out=new FileOutputStream(temp)){out.write(raw);}catch(IOException e){temp.delete();return false;}
         if(!temp.renameTo(target)){temp.delete();return false;}return true;}
     private static long bodyU32(byte[] b,int p){return ((long)(b[p]&255)<<24)|((long)(b[p+1]&255)<<16)|((long)(b[p+2]&255)<<8)|(b[p+3]&255);}
+    private static byte[] trimPlaneRecord(byte[] payload) {
+        if(payload==null||payload.length<24)throw new IllegalArgumentException("plane record");
+        int n=24+(int)bodyU32(payload,16);if(n<24||n>payload.length)throw new IllegalArgumentException("plane size");
+        /* Plane symbols use deterministic nonzero filler after the embedded
+           record, so only the record length and CRC are authoritative. */
+        return Arrays.copyOf(payload,n);
+    }
     private boolean storeRecovered(Protocol.Frame chain,long index,int wi,byte[] payload) {
         Protocol.Record r=Protocol.parseRecord(payload);long sid=0,off=0;
         if(r.type==Protocol.FILE_BEGIN||r.type==Protocol.FILE_DATA||r.type==Protocol.FILE_END)sid=r.fileId;
@@ -101,11 +122,28 @@ public final class SessionStore {
             return storeRecovered(parity,index,parity.windowIndex+missing,recovered)?index:-1;
         }catch(Exception ignored){return -1;}
     }
+    private long recoverPlaneEquation(File eq) {
+        try{Protocol.Frame parity=Protocol.parseFrame(readAll(eq));int[] bases=parity.globalIndex==7?new int[]{1,2,4}:parity.globalIndex==15?new int[]{1,2,4,8}:null;
+            if(parity.kind!=Protocol.PLANE_CODED||bases==null||parity.flags!=0)return -1;
+            byte[] recovered=parity.payload;int missing=-1,missingCount=0;
+            for(int i=0;i<bases.length;i++){File source=planeFile(parity.streamId,bases[i]);if(!source.exists()){missing=i;missingCount++;continue;}
+                Protocol.Frame known=Protocol.parseFrame(readAll(source));
+                if(known.kind!=Protocol.PLANE_CODED||known.session!=parity.session||known.window!=parity.window||known.streamId!=parity.streamId||known.globalIndex!=bases[i])return -1;
+                if(known.payload.length!=recovered.length)return -1;
+                for(int j=0;j<recovered.length;j++)recovered[j]^=known.payload[j];
+            }
+            if(missingCount!=1)return -1;
+            byte[] plain=trimPlaneRecord(recovered);Protocol.parseRecord(plain);long index=parity.streamId+missing;
+            return storeRecovered(parity,index,parity.windowIndex+missing,plain)?index:-1;
+        }catch(Exception ignored){return -1;}
+    }
     private void recoverAvailable() {
         boolean changed;do{changed=false;File[] equations=dir().listFiles((d,n)->isXorName(n));
             if(equations!=null)for(File eq:equations)if(recoverEquation(eq)>=0)changed=true;
             equations=dir().listFiles((d,n)->isParityName(n));
             if(equations!=null)for(File eq:equations)if(recoverBlockEquation(eq)>=0)changed=true;
+            equations=dir().listFiles((d,n)->isPlaneName(n));
+            if(equations!=null)for(File eq:equations)if(recoverPlaneEquation(eq)>=0)changed=true;
         }while(changed);
     }
     private void reload(){if(active==0)return;File[] files=dir().listFiles((d,n)->isDataName(n));

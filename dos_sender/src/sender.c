@@ -53,6 +53,7 @@ static int chain_cache_valid;
 static u32 chain_cache_session,chain_cache_window,chain_cache_global;
 static u16 chain_cache_rawlen,chain_cache_index;
 static u8 chain_cache_mask;
+static int transmit(const Window *w,const Config *cfg,u32 session,const u8 *selected,u16 chosen,u16 rescue_round,int focus_first_plane_c1);
 
 static void producer_close(void) {
     if(producer.source){fclose(producer.source);producer.source=0;}
@@ -102,10 +103,14 @@ static int validate_config(const Config *cfg) {
        cfg->frame_payload<96||cfg->frame_payload>MAX_FRAME_PAYLOAD||
        cfg->window_frames<4||cfg->window_frames>MAX_WINDOW||
        cfg->repetitions<1||cfg->repetitions>20||
-       cfg->redundancy>MAX_WINDOW||
+       cfg->redundancy>MAX_WINDOW||cfg->plane_width>4||
        (cfg->chain_width&&(cfg->chain_width<2||cfg->chain_width>MAX_WINDOW||
         (cfg->chain_width&1)||cfg->chain_width/2>=cfg->window_frames))||!data_bytes) {
         puts("Invalid sender configuration values.");return 0;
+    }
+    if(cfg->plane_width && (cfg->qr_version!=40||cfg->ecc!=0||cfg->module_pixels!=1||
+        cfg->frame_payload!=2904)) {
+        puts("/RE:PLANE3 and /RE:PLANE4 require V40-L, /SCALE:1 and /PAYLOAD:2904.");return 0;
     }
     used_bits=raw_bytes*8UL;
     if(cfg->qr_version==40&&cfg->ecc==0&&cfg->module_pixels==1)used_bits+=32UL;
@@ -139,11 +144,12 @@ static void default_config(Config *c) {
     c->window_frames=32; c->speaker=1;c->redundancy=7;c->chain_width=0;
 }
 static u16 redundancy_group(const Config *c) {
-    return c->chain_width?0:c->redundancy;
+    return (c->chain_width||c->plane_width)?0:c->redundancy;
 }
 static const char *redundancy_name(const Config *c) {
     static char name[12];
-    if(c->chain_width)sprintf(name,"C%u",c->chain_width);
+    if(c->plane_width)sprintf(name,"PLANE%u",c->plane_width);
+    else if(c->chain_width)sprintf(name,"C%u",c->chain_width);
     else if(c->redundancy)sprintf(name,"%u",c->redundancy);
     else strcpy(name,"OFF");
     return name;
@@ -361,6 +367,102 @@ static int make_prepacked_data(const Window *w,u16 i,const Config *cfg,u32 sessi
     if(!qrcodegen_dosferEncodePrepackedV40L(qr_code,qr_temp))return 0;
     encoded_qr_mask=qr_mask;return n;
 }
+static int benchmark_xor3_symbol(const Config *cfg,const u8 *payload,u8 a,u8 b,u8 c,
+        int *codeword_ok,int *raster_ok,int *color_plane_enable_ok) {
+    u16 cw=qr_codeword_bytes(cfg),rawlen,j;u8 indices[3];int k;
+    indices[0]=a;indices[1]=b;indices[2]=c;
+    *codeword_ok=*raster_ok=*color_plane_enable_ok=0;
+    for(k=0;k<3;++k) {
+        rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,904UL+indices[k],indices[k],4,0,
+            (u32)(4+indices[k])*cfg->frame_payload,payload,cfg->frame_payload);
+        if(!k)_fmemcpy(qr_code+4,raw_frame,rawlen);
+        else for(j=0;j<rawlen;++j)qr_code[4+j]^=raw_frame[j];
+    }
+    if(!qr_encode(qr_code+4,rawlen,cfg,0))return 0;
+    *codeword_ok=1;
+    for(j=0;j<cw;++j)if(qr_temp[j]!=(u8)(producer.disk[0][(u32)a*cw+j]^producer.disk[0][(u32)b*cw+j]^producer.disk[0][(u32)c*cw+j])){
+        *codeword_ok=0;break;
+    }
+    *raster_ok=vga_verify_plane_xor3(qr_code,177,cfg->invert,
+        (u8)((1U<<a)|(1U<<b)|(1U<<c)),color_plane_enable_ok);
+    return 1;
+}
+/* Phase-1 PLANE_CODED proof: four ordinary, unwhitened wire frames plus a
+ * canonical coefficient-0F parity frame.  The payload XOR vanishes from the
+ * correction, leaving exactly the affine QR prefix/header delta handled by
+ * qrcodegen_dosferDeriveXor4V40L(). */
+static int benchmark_plane4_parity(const Config *cfg,int *codeword_ok,
+        int *direct_ok,u16 *changed_codewords,int *raster_ok,int *restored_ok,
+        int *color_plane_enable_ok) {
+    static const u8 coeffs[4]={1,2,4,8};
+    u8 headers[4][FRAME_HEADER_SIZE],header_delta[FRAME_HEADER_SIZE];
+    u16 cw=qr_codeword_bytes(cfg),rawlen,j,bi;u32 br,bu,bp;
+    int verified;
+    *codeword_ok=*direct_ok=*raster_ok=*restored_ok=*color_plane_enable_ok=0;
+    *changed_codewords=0;
+    memset(chain_payload,0,cfg->frame_payload);
+    qrcodegen_dosferSetCodewordsOnly(0);
+    for(bi=0;bi<4;++bi) {
+        for(j=0;j<cfg->frame_payload;++j)record_body[j]=(u8)(0x31U+bi*53U+j*17U);
+        for(j=0;j<cfg->frame_payload;++j)chain_payload[j]^=record_body[j];
+        rawlen=make_plane_frame(raw_frame,0x6A67C69DUL,3,700UL,0,4,
+            coeffs[bi],record_body,cfg->frame_payload);
+        if(rawlen!=(u16)(FRAME_HEADER_SIZE+cfg->frame_payload) ||
+           !qr_encode(raw_frame,rawlen,cfg,0))goto done;
+        if(!bi)_fmemcpy(producer.disk[1]+4096,qr_code,QR_BUFFER+1);
+        _fmemcpy(producer.disk[0]+(u32)bi*cw,qr_temp,cw);
+        memcpy(headers[bi],raw_frame,FRAME_HEADER_SIZE);
+        qrcodegen_dosferSetCodewordsOnly(1);
+    }
+    qrcodegen_dosferSetCodewordsOnly(0);
+    rawlen=make_plane_frame(raw_frame,0x6A67C69DUL,3,700UL,0,4,0x0F,
+        chain_payload,cfg->frame_payload);
+    if(!rawlen||!qr_encode(raw_frame,rawlen,cfg,0))goto done;
+    _fmemcpy(producer.disk[1],qr_temp,cw);
+    _fmemcpy(producer.disk[1]+8192,qr_code,QR_BUFFER+1);
+    for(j=0;j<FRAME_HEADER_SIZE;++j)
+        header_delta[j]=(u8)(raw_frame[j]^headers[0][j]^headers[1][j]^headers[2][j]^headers[3][j]);
+    if(!ensure_chain_cache())goto done;
+    qrcodegen_dosferDeriveXor4V40L(producer.disk[0],producer.disk[0]+cw,
+        producer.disk[0]+(u32)cw*2,producer.disk[0]+(u32)cw*3,
+        header_delta,qr_temp);
+    *codeword_ok=!memcmp(qr_temp,producer.disk[1],cw);
+    if(!*codeword_ok)goto done;
+    /* Form a canonical raster for Q(delta) only as an oracle input.  The
+     * actual parity path will synthesize this compact correction directly. */
+    memset(raw_frame,0,rawlen);memcpy(raw_frame,header_delta,FRAME_HEADER_SIZE);
+    if(!qr_encode(raw_frame,rawlen,cfg,0))goto done;
+    _fmemcpy(producer.disk[1]+12288,qr_code,QR_BUFFER+1);
+    if(!vga_benchmark_plane_batch4(producer.disk[1]+4096,producer.disk[0],cw,
+        177,cfg->invert,&br,&bu,&bp,&verified)||!verified)goto done;
+    memset(raw_frame,0,rawlen);
+    if(!qr_encode(raw_frame,rawlen,cfg,0))goto done;
+    _fmemcpy(chain_left_codewords,qr_temp,cw);
+    qrcodegen_dosferHeaderCorrectionV40L(header_delta,chain_right_codewords);
+    *direct_ok=vga_verify_affine_correction(qr_code,chain_left_codewords,
+        chain_right_codewords,producer.disk[1]+12288,cw,177,cfg->invert,changed_codewords);
+    if(!*direct_ok)goto done;
+    *raster_ok=vga_verify_plane_xor4_correction(producer.disk[1]+8192,producer.disk[1]+12288,177,cfg->invert,
+        restored_ok,color_plane_enable_ok);
+done:
+    qrcodegen_dosferSetCodewordsOnly(0);
+    return *codeword_ok;
+}
+static int benchmark_plane_startup_delta(const Config *cfg) {
+    u16 n,j;u32 delta_hash,full_hash;
+    /* Mirror the first group: fixed 2,904-byte payloads with short records
+     * at the beginning and zero padding afterwards. */
+    _fmemset(record_body,0,cfg->frame_payload);for(j=0;j<48;++j)record_body[j]=(u8)(0x31+j);
+    n=make_plane_frame(raw_frame,0x6A67C69DUL,1,100,0,32,1,record_body,cfg->frame_payload);
+    if(!n||!qr_encode(raw_frame,n,cfg,0)||!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,"Plane delta oracle","C1 full",0,0))return 0;
+    qr_delta_ready=vga_delta_ready();
+    _fmemset(record_body,0,cfg->frame_payload);for(j=0;j<48;++j)record_body[j]=(u8)(0x91+j);
+    n=make_plane_frame(raw_frame,0x6A67C69DUL,1,100,0,32,2,record_body,cfg->frame_payload);
+    if(!n||!qr_encode(raw_frame,n,cfg,1)||!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,"Plane delta oracle","C2 delta",1,1))return 0;
+    delta_hash=vga_screen_hash();
+    if(!qr_encode(raw_frame,n,cfg,0)||!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,"Plane delta oracle","C2 full",1,0))return 0;
+    full_hash=vga_screen_hash();qr_delta_ready=vga_delta_ready();return delta_hash==full_hash;
+}
 static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,int repeated,int waiting,u16 hold_ms,u8 display_mask) {
     char a[79],b[79];u16 n;u32 elapsed;int rescue=hold_ms!=cfg->hold_ms||display_mask!=qr_mask;
     int delta=can_delta(cfg,display_mask);
@@ -501,6 +603,31 @@ static int show_block_parity(const Window *w,u16 first,u16 count,const Config *c
         cfg->module_pixels,cfg->invert,a,b,(int)(base->global_index&1),delta))return 0;
     qr_delta_ready=vga_delta_ready();last_visible_tick=timer_ticks();return 1;
 }
+/* Functional PLANE3/4 wire schedule.  The current display backend still
+ * uses the proven canonical renderer for each symbol; the plane-store
+ * playback replacement is deliberately kept separate from this protocol
+ * path so a receiver can be exercised end-to-end now. */
+static int show_plane_symbol(const Window *w,u16 first,u8 width,u8 coefficient,
+        const Config *cfg,u32 session,u16 hold_ms) {
+    const PendingFrame *base=&w->frames[first];char a[79],b[79];u16 j,k,n,rawlen;
+    u32 elapsed;int delta=can_delta(cfg,qr_mask);
+    _fmemset(record_body,0,cfg->frame_payload);
+    if(coefficient==1||coefficient==2||coefficient==4||coefficient==8) {
+        k=coefficient==1?0:coefficient==2?1:coefficient==4?2:3;
+        if(k>=width)return 0;_fmemcpy(record_body,w->frames[first+k].payload,w->frames[first+k].payload_len);
+    } else {
+        for(k=0;k<width;++k)for(j=0;j<w->frames[first+k].payload_len;++j)record_body[j]^=w->frames[first+k].payload[j];
+    }
+    rawlen=make_plane_frame(raw_frame,session,w->id,base->global_index,first,w->count,
+        coefficient,record_body,cfg->frame_payload);
+    if(!rawlen||!qr_encode_mask(raw_frame,rawlen,cfg,delta,qr_mask))return 0;
+    sprintf(a,"PLANE%u G%u C%X",width,(unsigned)(first/width)+1,coefficient);
+    sprintf(b,"Hold %u  fixed payload %u",hold_ms,cfg->frame_payload);
+    if(last_visible_tick){elapsed=timer_elapsed_ms(last_visible_tick,timer_ticks());if(elapsed<hold_ms)timer_wait_ms((u16)(hold_ms-elapsed));}
+    if(!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,a,b,
+        (int)(base->global_index&1),delta))return 0;
+    qr_delta_ready=vga_delta_ready();last_visible_tick=timer_ticks();return 1;
+}
 static void flush_keys(void) {
     while(_bios_keybrd(_KEYBRD_READY))_bios_keybrd(_KEYBRD_READ);
 }
@@ -512,7 +639,7 @@ static int decision_key(void) {
     if(scan==0x01)return 27;if(scan==0x1C)return 13;
     return ascii;
 }
-static int transmit(const Window *w,const Config *cfg,u32 session,const u8 *selected,u16 chosen,u16 rescue_round) {
+static int transmit(const Window *w,const Config *cfg,u32 session,const u8 *selected,u16 chosen,u16 rescue_round,int focus_first_plane_c1) {
     u16 r,i,first,count,group=redundancy_group(cfg),half=(u16)(cfg->chain_width/2),hold_ms=cfg->hold_ms;
     u32 adjusted;u8 display_mask=qr_mask;int factor=1;
     if(selected&&chosen) {
@@ -524,6 +651,27 @@ static int transmit(const Window *w,const Config *cfg,u32 session,const u8 *sele
         display_mask=(u8)((qr_mask+1+(rescue_round?rescue_round-1:0)%7)&7);
     }
     for(r=0;r<cfg->repetitions;++r) {
+        if(!selected&&cfg->plane_width) {
+            i=0;
+            while(i<w->count) {
+                if(i+cfg->plane_width<=w->count) {
+                    u8 pw=cfg->plane_width;
+                    if(!show_plane_symbol(w,i,pw,1,cfg,session,hold_ms))return 0;
+                    if(focus_first_plane_c1&&r==0&&i==0) {
+                        int focus_key;
+                        flush_keys();do{focus_key=decision_key();}while(focus_key!=13&&focus_key!=27);
+                        if(focus_key==27)return -1;
+                        focus_first_plane_c1=0;
+                    }
+                    if(!show_plane_symbol(w,i,pw,2,cfg,session,hold_ms)||
+                             !show_plane_symbol(w,i,pw,4,cfg,session,hold_ms)||
+                             (pw==4&&!show_plane_symbol(w,i,pw,8,cfg,session,hold_ms))||
+                             !show_plane_symbol(w,i,pw,pw==3?7:15,cfg,session,hold_ms))return 0;
+                    i=(u16)(i+pw);
+                } else {if(!show_frame(w,i,cfg,session,r>0,0,hold_ms,display_mask))return 0;++i;}
+            }
+            continue;
+        }
         first=0;count=0;
         for(i=0;i<w->count;++i)if(!selected || selected[i]) {
             if(!show_frame(w,i,cfg,session,r>0,0,hold_ms,display_mask))return 0;
@@ -581,19 +729,24 @@ static void exit_to_dos(u8 status) {
 }
 static int run_transfer(FILE *mf,Config *cfg) {
     u32 session=(timer_ticks()^(u32)time(NULL)^selected_bytes)|1UL,window_id=0;
-    int key,have_selection=0;u16 chosen=0,rescue_round=0;u8 selected[MAX_WINDOW];char line[80];
+    int key,have_selection=0,focus_plane_c1=0;u16 chosen=0,rescue_round=0;u8 selected[MAX_WINDOW];char line[80];
     vga_use_320(cfg->qr_version==40&&cfg->module_pixels==1);producer_open(mf);if(!fill_window(&current_window,cfg,session,window_id))return 0;
     /* Reserve the next window before entering graphics mode. This prevents a
        large /WINDOW setting from failing only after the first batch is sent. */
     if(!producer.finished&&!reserve_window(&previous_window,cfg))return 0;
     if(cfg->chain_width==2&&cfg->qr_version==40&&cfg->ecc==0&&cfg->module_pixels==1)ensure_chain_cache();
     if(!vga_enter()){puts("Not enough memory for VGA buffer");return 0;}qr_delta_ready=0;
-    if(!show_frame(&current_window,0,cfg,session,0,1,cfg->hold_ms,qr_mask)){
-        vga_leave();puts("Could not build the first QR; reduce /WINDOW or /PAYLOAD.");return 0;}
-    flush_keys();do{key=decision_key();}while(key!=13&&key!=27);
-    if(key==27){vga_leave();return 0;}
+    focus_plane_c1=cfg->plane_width&&current_window.count>=cfg->plane_width;
+    if(!focus_plane_c1) {
+        if(!show_frame(&current_window,0,cfg,session,0,1,cfg->hold_ms,qr_mask)){
+            vga_leave();puts("Could not build the first QR; reduce /WINDOW or /PAYLOAD.");return 0;}
+        flush_keys();do{key=decision_key();}while(key!=13&&key!=27);
+        if(key==27){vga_leave();return 0;}
+    }
     for(;;) {
-        key=transmit(&current_window,cfg,session,0,0,0);
+        key=transmit(&current_window,cfg,session,0,0,0,focus_plane_c1);
+        focus_plane_c1=0;
+        if(key<0){vga_leave();return 0;}
         if(!key){vga_leave();puts("QR settings cannot fit the frame; reduce payload or increase version.");return 0;}
 wait_ack:
         /* A window is uninterrupted; controls are accepted only after this
@@ -602,7 +755,7 @@ wait_ack:
         show_eow(&current_window,cfg,session,have_selection);
         key=decision_key();
         if(key=='r'||key=='R')goto replay;
-        if(key=='b'||key=='B'){if(have_previous){transmit(&previous_window,cfg,session,0,0,0);goto wait_ack;}goto wait_ack;}
+        if(key=='b'||key=='B'){if(have_previous){transmit(&previous_window,cfg,session,0,0,0,0);goto wait_ack;}goto wait_ack;}
         if(key=='m'||key=='M'){
             vga_leave();printf("Missing frames in window %lu (example 1,3-5; blank = all): ",current_window.id+1);
             if(!fgets(line,sizeof(line),stdin))line[0]=0;
@@ -612,7 +765,7 @@ wait_ack:
                 if(!chosen){puts("No valid frame numbers entered. Press a key.");getch();if(!vga_enter())return 0;qr_delta_ready=0;goto wait_ack;}
                 have_selection=1;rescue_round=1;
             }
-            if(!vga_enter())return 0;qr_delta_ready=0;transmit(&current_window,cfg,session,have_selection?selected:0,chosen,rescue_round);goto wait_ack;
+            if(!vga_enter())return 0;qr_delta_ready=0;transmit(&current_window,cfg,session,have_selection?selected:0,chosen,rescue_round,0);goto wait_ack;
         }
         if(key=='+'||key=='='){if(cfg->hold_ms>=50)cfg->hold_ms-=50;else cfg->hold_ms=0;goto replay;}
         if(key=='-'){cfg->hold_ms+=50;goto replay;}
@@ -628,7 +781,7 @@ wait_ack:
         continue;
 replay:
         if(have_selection)rescue_round++;
-        transmit(&current_window,cfg,session,have_selection?selected:0,chosen,rescue_round);goto wait_ack;
+        transmit(&current_window,cfg,session,have_selection?selected:0,chosen,rescue_round,0);goto wait_ack;
     }
 }
 
@@ -764,8 +917,65 @@ static void benchmark(const char *path,Config *cfg) {
 #endif
         if(ok){dirty_hash=vga_screen_hash();display_ok=vga_display_matches();if(qr_encode(raw_frame,rawlen,cfg,0)&&vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),cfg->qr_version*4+17,cfg->module_pixels,cfg->invert,"Redraw verification","full redraw",0,0)){full_hash=vga_screen_hash();redraw_ok=dirty_hash==full_hash;
             if(qr_encode_mask(raw_frame,rawlen,cfg,0,alt_mask)&&vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),cfg->qr_version*4+17,cfg->module_pixels,cfg->invert,"Rescue verification","alternate mask",0,0)&&qr_encode_mask(raw_frame,rawlen,cfg,0,qr_mask)&&vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),cfg->qr_version*4+17,cfg->module_pixels,cfg->invert,"Redraw verification","full redraw",0,0)){switch_hash=vga_screen_hash();switch_ok=switch_hash==full_hash;}}}
-        if(ok){u32 du,dc,dt;vga_benchmark_delta(qr_temp,qr_codeword_bytes(cfg),cfg->qr_version*4+17,24,&du,&dc,&dt);
-            printf("Delta VGA: update %lu, retrace+partial copy %lu, status %lu ms/frame\n",du/24UL,dc/24UL,dt/24UL);}
+        if(ok){u32 du,dc,dt,ps,pb,pv;u16 step;int planes_ok;vga_benchmark_delta(qr_temp,qr_codeword_bytes(cfg),cfg->qr_version*4+17,24,&du,&dc,&dt);
+            printf("Delta VGA: update %lu, retrace+partial copy %lu, status %lu ms/frame\n",du/24UL,dc/24UL,dt/24UL);
+            vga_benchmark_planes(&ps,&pb,&pv,&step,&planes_ok);
+            printf("Mode 0Dh frame store: %s, 32 x 8K in %lu ms; CRTC step %u\n",planes_ok?"READBACK MATCH":"FAILED",ps,step);
+            printf("Mode 0Dh playback: 24 x 32 changes %lu ms burst, %lu ms vblank\n",pb,pv);}
+        if(ok&&cfg->qr_version==40&&cfg->ecc==0&&cfg->module_pixels==1) {
+            u16 cw=qr_codeword_bytes(cfg),bi;u32 br,bu,bp,ber=0,bt0;int bok=1,bverify=0,cok,rok,aok;
+            /* Four complete DATA QRs occupy 14,824 bytes here.  This is
+             * benchmark-only staging memory; the actual renderer test reads
+             * only from VGA after each plane has been written. */
+            for(bi=0;bi<cfg->frame_payload;++bi)record_body[bi]=(u8)(0x5A^(bi*29U));
+            for(bi=0;bi<4&&bok;++bi) {
+                rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,900UL+bi,bi,4,0,
+                    (u32)bi*cfg->frame_payload,record_body,cfg->frame_payload);
+                if(!qr_encode(raw_frame,rawlen,cfg,bi!=0))bok=0;
+                else {if(!bi)_fmemcpy(producer.disk[1],qr_code,QR_BUFFER+1);
+                    _fmemcpy(producer.disk[0]+(u32)bi*cw,qr_temp,cw);}
+            }
+            if(bok&&vga_benchmark_plane_batch4(producer.disk[1],producer.disk[0],cw,177,
+                                                cfg->invert,&br,&bu,&bp,&bverify))
+                printf("Mode 0Dh batch4: %s, render %lu + upload %lu ms; 24 x 4 playback %lu ms\n",
+                    bverify?"READBACK MATCH":"FAILED",br,bu,bp);
+            else puts("Mode 0Dh batch4: FAILED");
+            bt0=timer_ticks();
+            for(bi=0;bi<4&&bok;++bi) {
+                rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,904UL+bi,bi,4,0,
+                    (u32)(4+bi)*cfg->frame_payload,record_body,cfg->frame_payload);
+                if(!qr_encode(raw_frame,rawlen,cfg,1))bok=0;
+                else _fmemcpy(producer.disk[0]+(u32)bi*cw,qr_temp,cw);
+            }
+            ber=timer_elapsed_ms(bt0,timer_ticks());
+            if(bok&&vga_benchmark_plane_batch4_steady(producer.disk[0],cw,&br,&bu,&bp,&bverify))
+                printf("Mode 0Dh warm batch4: QR %lu + render %lu + upload %lu ms; 24 x 4 playback %lu ms\n",
+                    ber,br,bu,bp);
+            else puts("Mode 0Dh warm batch4: FAILED");
+            if(bok&&benchmark_xor3_symbol(cfg,record_body,0,1,2,&cok,&rok,&aok))
+                printf("Mode 0Dh XOR ABC: codewords %s, raster %s, Color Plane Enable %s\n",
+                    cok?"MATCH":"FAIL",rok?"MATCH":"FAIL",aok?"MATCH":"FAIL");
+            else puts("Mode 0Dh XOR ABC: FAILED");
+            if(bok&&benchmark_xor3_symbol(cfg,record_body,0,1,3,&cok,&rok,&aok))
+                printf("Mode 0Dh XOR ABD: codewords %s, raster %s, Color Plane Enable %s\n",
+                    cok?"MATCH":"FAIL",rok?"MATCH":"FAIL",aok?"MATCH":"FAIL");
+            else puts("Mode 0Dh XOR ABD: FAILED");
+            if(bok&&benchmark_xor3_symbol(cfg,record_body,0,2,3,&cok,&rok,&aok))
+                printf("Mode 0Dh XOR ACD: codewords %s, raster %s, Color Plane Enable %s\n",
+                    cok?"MATCH":"FAIL",rok?"MATCH":"FAIL",aok?"MATCH":"FAIL");
+            else puts("Mode 0Dh XOR ACD: FAILED");
+            if(bok&&benchmark_xor3_symbol(cfg,record_body,1,2,3,&cok,&rok,&aok))
+                printf("Mode 0Dh XOR BCD: codewords %s, raster %s, Color Plane Enable %s\n",
+                    cok?"MATCH":"FAIL",rok?"MATCH":"FAIL",aok?"MATCH":"FAIL");
+            else puts("Mode 0Dh XOR BCD: FAILED");
+            {u16 pchanged=0;int pdirect=0;
+            if(bok&&benchmark_plane4_parity(cfg,&cok,&pdirect,&pchanged,&rok,&aok,&display_ok))
+                printf("PLANE 4+1 affine parity: codewords %s, sparse raster %s (%u codewords), VGA raster %s, restore %s, Color Plane Enable %s\n",
+                    cok?"MATCH":"FAIL",pdirect?"MATCH":"FAIL",pchanged,rok?"MATCH":"FAIL",aok?"MATCH":"FAIL",display_ok?"MATCH":"FAIL");
+            else puts("PLANE 4+1 affine parity: FAILED");
+            }
+            qr_delta_ready=0;
+        }
         if(ok&&cfg->chain_width==2&&cfg->qr_version==40&&cfg->ecc==0&&cfg->module_pixels==1) {
             Config scfg=*cfg;u32 schedule_ms,schedule_hash,canonical_hash;u32 schedule_fps100;
             int schedule_ok=1,affine_screen_ok=0;u16 si;
@@ -838,6 +1048,7 @@ static void benchmark(const char *path,Config *cfg) {
             }
             if(group)display_count+=(u16)((data_count+group-1)/group);
             else if(half)display_count+=(u16)((data_count-1)/half);
+            else if(scfg.plane_width)display_count+=(u16)((data_count/scfg.plane_width));
             qr_delta_ready=0;last_visible_tick=0;
             if(!show_frame(&current_window,0,&scfg,0x6A67C69DUL,0,0,0,qr_mask))schedule_ok=0;
 #ifdef DOSFER_PROFILE
@@ -846,7 +1057,9 @@ static void benchmark(const char *path,Config *cfg) {
             memset(dosferVgaProfileTicks,0,sizeof(dosferVgaProfileTicks));
 #endif
             t0=timer_ticks();
-            for(si=0;si<data_count&&schedule_ok;++si) {
+            if(scfg.plane_width) {
+                if(!transmit(&current_window,&scfg,0x6A67C69DUL,0,0,0,0))schedule_ok=0;
+            } else for(si=0;si<data_count&&schedule_ok;++si) {
                 if(!show_frame(&current_window,si,&scfg,0x6A67C69DUL,0,0,0,qr_mask))schedule_ok=0;
                 if(group){if(!count)first=si;count++;
                     if(count==group||si+1==data_count){
@@ -883,7 +1096,8 @@ static void benchmark(const char *path,Config *cfg) {
             u32 fps100=rate_ms?(u32)(real_schedule_displays?real_schedule_displays:24)*100000UL/rate_ms:0;
             u32 state_fps100=steady_ms?2400000UL/steady_ms:0;
             u32 displayed=cfg->window_frames,effective;
-            if(cfg->chain_width)
+            if(cfg->plane_width) displayed+=(cfg->window_frames/cfg->plane_width);
+            else if(cfg->chain_width)
                 displayed=cfg->window_frames+(cfg->window_frames-1)/(cfg->chain_width/2)+
                     (chain_anchor?(cfg->window_frames-1)/chain_anchor:0);
             else {u16 group=redundancy_group(cfg);if(group)displayed+=(cfg->window_frames+group-1)/group;}
@@ -914,14 +1128,16 @@ static int option_number(const char *arg,const char *a,const char *b,long lo,lon
 static int redundancy_value(Config *cfg,const char *p) {
     char *end;long v;
     if(!p||!*p)return -1;
+    if(!stricmp(p,"PLANE3")){cfg->plane_width=3;cfg->chain_width=cfg->redundancy=0;return 1;}
+    if(!stricmp(p,"PLANE4")){cfg->plane_width=4;cfg->chain_width=cfg->redundancy=0;return 1;}
     if(toupper(*p)=='C') {
         v=strtol(p+1,&end,10);
         if(!p[1]||*end||v<2||v>MAX_WINDOW||(v&1))return -1;
-        cfg->chain_width=(u8)v;cfg->redundancy=0;return 1;
+        cfg->chain_width=(u8)v;cfg->redundancy=cfg->plane_width=0;return 1;
     }
     v=strtol(p,&end,10);
     if(*end||v<0||v>MAX_WINDOW)return -1;
-    cfg->redundancy=(u8)v;cfg->chain_width=0;return 1;
+    cfg->redundancy=(u8)v;cfg->chain_width=cfg->plane_width=0;return 1;
 }
 static int config_option(Config *cfg,const char *arg) {
     long v;int rc;const char *p;
@@ -952,6 +1168,7 @@ static void usage(const Config *cfg) {
     puts("");
     puts("Default: V40-L, 320x200, 2904-byte payload, hold 0, window 32, /RE:7");
     puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 7)");
+    puts("/RE:PLANE3|PLANE4   Experimental fixed V40-L plane-coded groups");
     puts("/RE:Ck or /RE Ck      Even chain width C2..C64; k/2 must be < window");
     puts("/ANCHOR:n            Repeat each nth data frame in chain mode; 0 disables");
     puts("Advanced diagnostics: /V:n /ECC:L|M|Q|H /SCALE:n /PAYLOAD:n");
