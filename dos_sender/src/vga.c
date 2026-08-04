@@ -29,11 +29,6 @@ static u8
     __near
 #endif
     screen_320[8000];
-/* The correction is only needed while a PLANE4 group is resident.  Keep it
- * out of DGROUP: Watcom's near data segment is already intentionally full. */
-static u8 far *plane_correction;
-static int plane_correction_ready,plane_correction_applied;
-static u32 plane_correction_restore_hash;
 static u16 delta_bits,delta_codewords;
 static int delta_n;
 static int prepare_delta(const u8 *codewords,u16 codeword_len,int n);
@@ -659,16 +654,12 @@ static u32 plane_hash(u8 slot,u8 plane) {
 int vga_plane_begin(u16 *page_step) {
     if(!active_320||!page_step)return 0;
     *page_step=plane_page_step();if(!*page_step)return 0;
-    if(!plane_correction&&!(plane_correction=(u8 far *)_fmalloc(8000)))return 0;
-    plane_correction_ready=plane_correction_applied=0;plane_correction_restore_hash=0;
     plane_mode_setup(0x0F);plane_palette(0x0F,1);attribute_plane_enable(0);
     return 1;
 }
 void vga_plane_end(void) {
-    plane_correction_ready=plane_correction_applied=0;plane_correction_restore_hash=0;
     attribute_plane_enable(0x0F);plane_palette_normal();plane_mode_setup(0x0F);
     page_initialized[0]=page_initialized[1]=0;
-    if(plane_correction){_ffree(plane_correction);plane_correction=0;}
 }
 int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
                        int qr_size,int invert,u8 plane,u8 slot,int delta_only) {
@@ -699,13 +690,12 @@ int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
 }
 int vga_plane_prepare_correction(const u8 *zero_qr,const u8 *zero_codewords,
                                  const u8 *correction_codewords,u16 codeword_len,
-                                 int qr_size,int invert) {
-    if(!active_320||!plane_correction||codeword_len>QR40_CODEWORDS)return 0;
+                                 int qr_size,int invert,u8 far *correction_raster) {
+    if(!active_320||!correction_raster||codeword_len>QR40_CODEWORDS)return 0;
     if(!build_qr_image_320(zero_qr,qr_size,invert)||
        !prepare_delta(zero_codewords,codeword_len,qr_size))return 0;
     update_delta(correction_codewords,screen_320);
-    _fmemcpy(plane_correction,screen_320,8000);
-    plane_correction_ready=1;plane_correction_applied=0;plane_correction_restore_hash=0;return 1;
+    _fmemcpy(correction_raster,screen_320,8000);return 1;
 }
 int vga_plane_show_mask(u16 start,u8 mask) {
 #ifdef DOSFER_PROFILE
@@ -718,32 +708,34 @@ int vga_plane_show_mask(u16 start,u8 mask) {
 #endif
     return (attribute_plane_enable_read()&0x0F)==mask;
 }
-int vga_plane_apply_correction(u8 slot,u8 plane) {
+int vga_plane_apply_correction(u8 slot,u8 plane,const u8 far *correction_raster,
+                               u32 *restore_hash) {
     u8 far *vram=(u8 far *)MK_FP(0xA000,0);u16 i,base=(u16)(slot<<13);
 #ifdef DOSFER_PROFILE
     u32 t=timer_ticks();
 #endif
-    if(!plane_correction_ready||plane_correction_applied||plane>3||slot>7)return 0;
-    plane_correction_restore_hash=plane_hash(slot,plane);plane_correction_applied=1;plane_mode_setup((u8)(1U<<plane));
-    for(i=0;i<8000;++i)vram[base+i]^=plane_correction[i];
+    if(!correction_raster||!restore_hash||plane>3||slot>7)return 0;
+    *restore_hash=plane_hash(slot,plane);plane_mode_setup((u8)(1U<<plane));
+    for(i=0;i<8000;++i)vram[base+i]^=correction_raster[i];
 #ifdef DOSFER_PROFILE
     dosferPlaneVgaProfileTicks[4]+=timer_ticks()-t;
 #endif
     return 1;
 }
-int vga_plane_restore_correction(u8 slot,u8 plane) {
+int vga_plane_restore_correction(u8 slot,u8 plane,const u8 far *correction_raster,
+                                 u32 restore_hash) {
     u8 far *vram=(u8 far *)MK_FP(0xA000,0);u16 i,base=(u16)(slot<<13);u32 after;
 #ifdef DOSFER_PROFILE
     u32 t=timer_ticks();
 #endif
-    if(!plane_correction_ready||!plane_correction_applied||plane>3||slot>7)return 0;
+    if(!correction_raster||plane>3||slot>7)return 0;
     plane_mode_setup((u8)(1U<<plane));
-    for(i=0;i<8000;++i)vram[base+i]^=plane_correction[i];
-    after=plane_hash(slot,plane);plane_correction_applied=0;
+    for(i=0;i<8000;++i)vram[base+i]^=correction_raster[i];
+    after=plane_hash(slot,plane);
 #ifdef DOSFER_PROFILE
     dosferPlaneVgaProfileTicks[5]+=timer_ticks()-t;
 #endif
-    return after==plane_correction_restore_hash;
+    return after==restore_hash;
 }
 int vga_verify_plane_xor3(const u8 *expected_qr,int qr_size,int invert,
                            u8 plane_mask,int *color_plane_enable_ok) {

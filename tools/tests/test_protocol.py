@@ -28,6 +28,11 @@ class ProtocolTest(unittest.TestCase):
     def test_header_size(self):
         self.assertEqual(len(Frame(DATA,0,1,0,0,0,1,0,0,b"").encode()),48)
         self.assertEqual(len(Record(FILE_END,0,1,b"").encode()),24)
+    def test_window_128_frame_indices_roundtrip(self):
+        first=Frame(DATA,FLAG_WHITENED,7,3,0,0,128,0,0,b"x")
+        last=Frame(DATA,FLAG_WHITENED,7,3,127,127,128,0,0,b"y")
+        self.assertEqual(Frame.decode(first.encode()).window_count,128)
+        self.assertEqual(Frame.decode(last.encode()).window_index,127)
     def test_chain_peels_forward_and_backward(self):
         payloads=[Record(SESSION,i,0,bytes([i])*n).encode() for i,n in ((1,9),(2,27),(3,13))]
         frames=[Frame(DATA,FLAG_WHITENED,7,0,i,i,3,0,0,p) for i,p in enumerate(payloads)]

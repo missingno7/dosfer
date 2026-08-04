@@ -18,9 +18,9 @@
 extern u32 dosferQrProfileTicks[6];
 extern u32 dosferProtocolProfileTicks[3];
 extern u32 dosferVgaProfileTicks[5];
-/* payload construction, total group preparation, register-only playback,
- * hold waiting, and preparation between groups (PIT ticks). */
-static u32 dosferPlaneProfileTicks[5];
+/* spool I/O, payload construction, group preparation, playback, useful hold
+ * work, idle hold time, correction preparation, replay preparation. */
+static u32 dosferPlaneProfileTicks[8];
 #endif
 
 #define MANIFEST_NAME "DOSFER.$$$"
@@ -39,7 +39,7 @@ typedef struct {
 } Producer;
 
 static Producer producer;
-static Window current_window, previous_window;
+static Window far current_window, previous_window;
 static int have_previous;
 static u8 qr_temp[QR_BUFFER+1], qr_code[QR_BUFFER+1], raw_frame[MAX_QR_BYTES];
 static u8 far record_body[MAX_FRAME_PAYLOAD];
@@ -60,21 +60,43 @@ static int transmit(const Window *w,const Config *cfg,u32 session,const u8 *sele
 static void flush_keys(void);
 static int decision_key(void);
 
+enum { PLANE_SLOT_FREE, PLANE_SLOT_PREPARING, PLANE_SLOT_READY, PLANE_SLOT_PLAYING };
 typedef struct {
-    u16 slot_start,page_step,first_window_index;
-    u8 slot,width,ready,parity_correction_applied;
-    u32 group_global;
+    u16 slot_start,first_window_index;
+    u32 window_id,group_global,correction_restore_hash;
+    u8 slot,width,valid_mask,state,prepare_stage,parity_correction_applied;
+    u8 far *correction_raster;
+    u32 prepare_started,ready_tick;
+} PlaneGroup;
+typedef struct {
     u8 headers[4][FRAME_HEADER_SIZE];
     u8 far *codewords[4];
     u8 far *zero_codewords,*correction_codewords;
-} PlaneGroup;
+} PlaneWork;
+typedef struct {
+    PlaneGroup slots[8];
+    PlaneWork work;
+    u16 page_step,next_first,total_groups,ready_count,min_ready;
+    u8 head,tail,preparing;
+    u32 starvation_count,max_chunk_ticks,intergroup_ticks,visible_ticks;
+    u16 visible_transitions;
+} PlaneQueue;
+static PlaneQueue far plane_queue;
+static u16 plane_last_min_ready;
+static u32 plane_last_starvation,plane_last_max_chunk,plane_last_intergroup,plane_last_visible;
+static u16 plane_last_visible_count;
 
 static void producer_close(void) {
     if(producer.source){fclose(producer.source);producer.source=0;}
 }
+static void window_close_spool(Window *w) {
+    if(w->spool){fclose(w->spool);w->spool=0;}
+    if(w->spool_name[0]){remove(w->spool_name);w->spool_name[0]=0;}
+}
 static void free_window(Window *w) {
     u16 i;
-    for(i=0;i<MAX_WINDOW;++i)if(w->frames[i].payload){
+    window_close_spool(w);
+    for(i=0;i<MAX_WINDOW;++i)if(w->frames[i].payload&&!w->frames[i].spooled){
         _ffree(w->frames[i].payload);w->frames[i].payload=0;
         w->frames[i].payload_capacity=w->frames[i].payload_len=0;
     }
@@ -122,6 +144,9 @@ static int validate_config(const Config *cfg) {
         (cfg->chain_width&1)||cfg->chain_width/2>=cfg->window_frames))||!data_bytes) {
         puts("Invalid sender configuration values.");return 0;
     }
+    if(!cfg->plane_width) {
+        puts("DOSFER production transfer requires /RE:PLANE3 or /RE:PLANE4.");return 0;
+    }
     if(cfg->plane_width && (cfg->qr_version!=40||cfg->ecc!=0||cfg->module_pixels!=1||
         cfg->frame_payload!=2904)) {
         puts("/RE:PLANE3 and /RE:PLANE4 require V40-L, /SCALE:1 and /PAYLOAD:2904.");return 0;
@@ -155,7 +180,7 @@ static int can_delta(const Config *cfg,u8 display_mask) {
 static void default_config(Config *c) {
     memset(c,0,sizeof(*c)); c->qr_version=40; c->ecc=0; c->module_pixels=1;
     c->repetitions=1; c->frame_payload=2904; c->hold_ms=0;
-    c->window_frames=32; c->speaker=1;c->redundancy=7;c->chain_width=0;
+    c->window_frames=32; c->speaker=1;c->plane_width=4;
 }
 static u16 redundancy_group(const Config *c) {
     return (c->chain_width||c->plane_width)?0:c->redundancy;
@@ -342,6 +367,47 @@ static int fill_window(Window *w,const Config *cfg,u32 session,u32 id) {
     }
     return w->count>0;
 }
+/* PLANE windows retain metadata in RAM and exact variable-length records in
+ * a sequential DOS spool.  This deliberately avoids two 128x2904 payload
+ * arrays in conventional memory while keeping current/previous replay exact. */
+static int fill_window_spooled(Window *w,const Config *cfg,u32 session,u32 id) {
+    PendingFrame work;PendingFrame *dst;int rc;u16 len;long off;
+    memset(&work,0,sizeof(work));window_close_spool(w);w->count=0;w->id=id;
+    sprintf(w->spool_name,"DFW%u.$$$",(unsigned)(id&1));remove(w->spool_name);
+    if(!(w->spool=fopen(w->spool_name,"w+b"))){puts("Cannot create PLANE replay spool.");return 0;}
+    while(w->count<cfg->window_frames) {
+        rc=producer_next(&work,cfg,session);
+        if(rc<0){if(work.payload)_ffree(work.payload);return 0;}
+        if(!rc)break;
+        off=ftell(w->spool);len=work.payload_len;
+        if(off<0||fwrite(&len,1,sizeof(len),w->spool)!=sizeof(len)||
+           fwrite(work.payload,1,len,w->spool)!=len){
+            puts("PLANE replay spool write failed.");if(work.payload)_ffree(work.payload);return 0;
+        }
+        dst=&w->frames[w->count++];memset(dst,0,sizeof(*dst));
+        dst->payload_len=len;dst->stream_id=work.stream_id;dst->stream_offset=work.stream_offset;
+        dst->global_index=work.global_index;dst->spool_offset=(u32)off;dst->spooled=1;
+    }
+    if(work.payload)_ffree(work.payload);
+    if(ferror(w->spool)||!w->count){window_close_spool(w);return 0;}
+    fflush(w->spool);return 1;
+}
+static int window_read_payload(const Window *w,u16 index,u8 far *out) {
+    const PendingFrame *f;
+    u16 len;
+#ifdef DOSFER_PROFILE
+    u32 t=timer_ticks();
+#endif
+    if(index>=w->count)return 0;f=&w->frames[index];
+    if(!f->spooled){if(f->payload)_fmemcpy(out,f->payload,f->payload_len);return f->payload!=0;}
+    if(!w->spool||fseek(w->spool,(long)f->spool_offset,SEEK_SET)||
+       fread(&len,1,sizeof(len),w->spool)!=sizeof(len)||len!=f->payload_len||
+       fread(out,1,len,w->spool)!=len)return 0;
+#ifdef DOSFER_PROFILE
+    dosferPlaneProfileTicks[0]+=timer_ticks()-t;
+#endif
+    return 1;
+}
 static int reserve_window(Window *w,const Config *cfg) {
     u16 i;
     for(i=0;i<cfg->window_frames;++i)if(w->frames[i].payload_capacity<cfg->frame_payload) {
@@ -481,6 +547,8 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,int re
     char a[79],b[79];u16 n;u32 elapsed;int rescue=hold_ms!=cfg->hold_ms||display_mask!=qr_mask;
     int delta=can_delta(cfg,display_mask);
     const PendingFrame *f=&w->frames[i];
+    const u8 far *payload=f->payload;
+    if(f->spooled) {if(!window_read_payload(w,i,record_body))return 0;payload=record_body;}
     if(delta&&!repeated&&chain_cache_valid&&chain_cache_session==session&&
        chain_cache_window==w->id&&chain_cache_global==f->global_index&&
        chain_cache_index==i&&chain_cache_mask==display_mask) {
@@ -490,12 +558,12 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,int re
         encoded_qr_mask=display_mask;
         chain_cache_valid=0;
     } else {
-        if(delta&&!repeated&&display_mask==qr_mask&&cfg->qr_version==40&&cfg->ecc==0&&
+        if(delta&&!f->spooled&&!repeated&&display_mask==qr_mask&&cfg->qr_version==40&&cfg->ecc==0&&
            cfg->module_pixels==1&&f->payload_len==2904) {
             n=(u16)make_prepacked_data(w,i,cfg,session);if(!n)return 0;
         } else {
             n=make_frame(raw_frame,FK_DATA,(repeated?FF_REPEATED:0)|FF_WHITENED,session,w->id,f->global_index,
-                i,w->count,f->stream_id,f->stream_offset,f->payload,f->payload_len);
+                i,w->count,f->stream_id,f->stream_offset,payload,f->payload_len);
             if(!qr_encode_mask(raw_frame,n,cfg,delta,display_mask))return 0;
         }
     }
@@ -623,9 +691,12 @@ static u16 make_plane_symbol(const Window *w,u16 first,u8 width,u8 coefficient,
     _fmemset(record_body,0,cfg->frame_payload);
     if(coefficient==1||coefficient==2||coefficient==4||coefficient==8) {
         k=coefficient==1?0:coefficient==2?1:coefficient==4?2:3;
-        if(k>=width)return 0;_fmemcpy(record_body,w->frames[first+k].payload,w->frames[first+k].payload_len);
+        if(k>=width||!window_read_payload(w,(u16)(first+k),record_body))return 0;
     } else {
-        for(k=0;k<width;++k)for(j=0;j<w->frames[first+k].payload_len;++j)record_body[j]^=w->frames[first+k].payload[j];
+        for(k=0;k<width;++k) {
+            if(!window_read_payload(w,(u16)(first+k),(u8 far *)chain_payload))return 0;
+            for(j=0;j<w->frames[first+k].payload_len;++j)record_body[j]^=chain_payload[j];
+        }
     }
     return make_plane_frame(raw_frame,session,w->id,base->global_index,first,w->count,
         width,coefficient,record_body,cfg->frame_payload);
@@ -646,111 +717,139 @@ static int show_plane_symbol(const Window *w,u16 first,u8 width,u8 coefficient,
         (int)(base->global_index&1),delta))return 0;
     qr_delta_ready=vga_delta_ready();last_visible_tick=timer_ticks();return 1;
 }
-static void plane_release_group(PlaneGroup *g);
-static int plane_group_alloc(PlaneGroup *g,const Config *cfg) {
-    u8 i;u16 cw=qr_codeword_bytes(cfg);
-    memset(g,0,sizeof(*g));
-    for(i=0;i<4;++i)if(!(g->codewords[i]=(u8 far *)_fmalloc(cw))){plane_release_group(g);return 0;}
-    if(!(g->zero_codewords=(u8 far *)_fmalloc(cw))||
-       !(g->correction_codewords=(u8 far *)_fmalloc(cw))){plane_release_group(g);return 0;}
+static void plane_queue_release(PlaneQueue *q) {
+    u8 i;for(i=0;i<8;++i)if(q->slots[i].correction_raster)_ffree(q->slots[i].correction_raster);
+    for(i=0;i<4;++i)if(q->work.codewords[i])_ffree(q->work.codewords[i]);
+    if(q->work.zero_codewords)_ffree(q->work.zero_codewords);
+    if(q->work.correction_codewords)_ffree(q->work.correction_codewords);
+    memset(q,0,sizeof(*q));
+}
+static int plane_queue_init(PlaneQueue *q,const Config *cfg,u16 page_step,u16 group_count) {
+    u8 i;u16 cw=qr_codeword_bytes(cfg);memset(q,0,sizeof(*q));
+    q->page_step=page_step;q->total_groups=group_count;q->preparing=0xFF;q->min_ready=8;
+    for(i=0;i<8;++i) {
+        q->slots[i].slot=i;q->slots[i].slot_start=(u16)((u16)i*page_step);
+        if(cfg->plane_width==4&&!(q->slots[i].correction_raster=(u8 far *)_fmalloc(8000))) {
+            plane_queue_release(q);return 0;
+        }
+    }
+    for(i=0;i<4;++i)if(!(q->work.codewords[i]=(u8 far *)_fmalloc(cw))){plane_queue_release(q);return 0;}
+    if(!(q->work.zero_codewords=(u8 far *)_fmalloc(cw))||
+       !(q->work.correction_codewords=(u8 far *)_fmalloc(cw))){plane_queue_release(q);return 0;}
     return 1;
 }
-static void plane_release_group(PlaneGroup *g) {
-    u8 i;for(i=0;i<4;++i)if(g->codewords[i])_ffree(g->codewords[i]);
-    if(g->zero_codewords)_ffree(g->zero_codewords);
-    if(g->correction_codewords)_ffree(g->correction_codewords);
-    memset(g,0,sizeof(*g));
+static int plane_queue_claim(PlaneQueue *q,const Window *w,const Config *cfg) {
+    PlaneGroup *g;
+    if(q->next_first+(u16)cfg->plane_width>w->count||q->slots[q->tail].state!=PLANE_SLOT_FREE)return 0;
+    g=&q->slots[q->tail];g->first_window_index=q->next_first;g->window_id=w->id;
+    g->group_global=w->frames[q->next_first].global_index;g->width=cfg->plane_width;
+    g->valid_mask=0;g->state=PLANE_SLOT_PREPARING;g->prepare_stage=0;g->parity_correction_applied=0;
+    g->prepare_started=timer_ticks();q->preparing=q->tail;q->tail=(u8)((q->tail+1)&7);
+    q->next_first=(u16)(q->next_first+cfg->plane_width);return 1;
 }
-static int plane_prepare_group(const Window *w,u16 first,const Config *cfg,u32 session,
-                               PlaneGroup *g) {
-    static const u8 coeffs[4]={1,2,4,8};u8 header_delta[FRAME_HEADER_SIZE];
-    u16 rawlen,cw=qr_codeword_bytes(cfg),j;u8 p,parity;
+/* One bounded producer chunk.  QR encoding itself is presently the longest
+ * indivisible chunk; the eight-slot queue absorbs it and records its cost. */
+static int plane_producer_step(PlaneQueue *q,const Window *w,const Config *cfg,u32 session) {
+    static const u8 coeffs[4]={1,2,4,8};PlaneGroup *g;PlaneWork *pw=&q->work;
+    u8 header_delta[FRAME_HEADER_SIZE],parity;u16 rawlen,cw=qr_codeword_bytes(cfg),j;u32 t=timer_ticks();
+    if(q->preparing==0xFF) {if(!plane_queue_claim(q,w,cfg))return 0;}
+    g=&q->slots[q->preparing];
+    if(g->prepare_stage<g->width) {
+        u8 p=g->prepare_stage;
 #ifdef DOSFER_PROFILE
-    u32 prep_start=timer_ticks(),payload_start;
+        u32 payload_t=timer_ticks();
 #endif
-    g->first_window_index=first;g->width=cfg->plane_width;g->group_global=w->frames[first].global_index;
-    g->slot_start=(u16)((u16)g->slot*g->page_step);
-    g->ready=0;g->parity_correction_applied=0;
-    for(p=0;p<g->width;++p) {
+        rawlen=make_plane_symbol(w,g->first_window_index,g->width,coeffs[p],cfg,session);
 #ifdef DOSFER_PROFILE
-        payload_start=timer_ticks();
+        dosferPlaneProfileTicks[1]+=timer_ticks()-payload_t;
 #endif
-        rawlen=make_plane_symbol(w,first,g->width,coeffs[p],cfg,session);
+        if(!rawlen||!qr_encode_mask(raw_frame,rawlen,cfg,p!=0,qr_mask))return -1;
+        _fmemcpy(pw->codewords[p],qr_temp,cw);memcpy(pw->headers[p],raw_frame,FRAME_HEADER_SIZE);
+        if(!vga_plane_store_qr(qr_code,qr_temp,cw,177,cfg->invert,p,g->slot,p!=0))return -1;
+        g->valid_mask|=(u8)(1U<<p);++g->prepare_stage;
+    } else {
+        parity=g->width==3?7:15;
+        rawlen=make_plane_symbol(w,g->first_window_index,g->width,parity,cfg,session);if(!rawlen)return -1;
+        if(g->width==4) {
 #ifdef DOSFER_PROFILE
-        dosferPlaneProfileTicks[0]+=timer_ticks()-payload_start;
+            u32 correction_t=timer_ticks();
 #endif
-        if(!rawlen||!qr_encode_mask(raw_frame,rawlen,cfg,p!=0,qr_mask))return 0;
-        _fmemcpy(g->codewords[p],qr_temp,cw);memcpy(g->headers[p],raw_frame,FRAME_HEADER_SIZE);
-        if(!vga_plane_store_qr(qr_code,qr_temp,cw,177,cfg->invert,p,g->slot,p!=0))return 0;
+            for(j=0;j<FRAME_HEADER_SIZE;++j)header_delta[j]=(u8)(raw_frame[j]^pw->headers[0][j]^pw->headers[1][j]^pw->headers[2][j]^pw->headers[3][j]);
+            if(!qrcodegen_dosferHeaderCorrectionV40L(header_delta,pw->correction_codewords))return -1;
+            memset(raw_frame,0,rawlen);if(!qr_encode_mask(raw_frame,rawlen,cfg,0,qr_mask))return -1;
+            _fmemcpy(pw->zero_codewords,qr_temp,cw);
+            if(!vga_plane_prepare_correction(qr_code,pw->zero_codewords,pw->correction_codewords,
+                                              cw,177,cfg->invert,g->correction_raster))return -1;
+#ifdef DOSFER_PROFILE
+            dosferPlaneProfileTicks[6]+=timer_ticks()-correction_t;
+#endif
+        }
+        g->state=PLANE_SLOT_READY;g->ready_tick=timer_ticks();q->preparing=0xFF;++q->ready_count;
+#ifdef DOSFER_PROFILE
+        dosferPlaneProfileTicks[2]+=g->ready_tick-g->prepare_started;
+#endif
+        if(q->ready_count<q->min_ready)q->min_ready=q->ready_count;
     }
-    parity=g->width==3?7:15;
-#ifdef DOSFER_PROFILE
-    payload_start=timer_ticks();
-#endif
-    rawlen=make_plane_symbol(w,first,g->width,parity,cfg,session);
-#ifdef DOSFER_PROFILE
-    dosferPlaneProfileTicks[0]+=timer_ticks()-payload_start;
-#endif
-    if(!rawlen)return 0;
-    if(g->width==4) {
-        for(j=0;j<FRAME_HEADER_SIZE;++j)
-            header_delta[j]=(u8)(raw_frame[j]^g->headers[0][j]^g->headers[1][j]^g->headers[2][j]^g->headers[3][j]);
-        if(!qrcodegen_dosferHeaderCorrectionV40L(header_delta,g->correction_codewords))return 0;
-        memset(raw_frame,0,rawlen);
-        if(!qr_encode_mask(raw_frame,rawlen,cfg,0,qr_mask))return 0;
-        _fmemcpy(g->zero_codewords,qr_temp,cw);
-        if(!vga_plane_prepare_correction(qr_code,g->zero_codewords,g->correction_codewords,
-                                         cw,177,cfg->invert))return 0;
-    }
-    g->ready=1;
-#ifdef DOSFER_PROFILE
-    dosferPlaneProfileTicks[1]+=timer_ticks()-prep_start;
-#endif
+    t=timer_ticks()-t;if(t>q->max_chunk_ticks)q->max_chunk_ticks=t;
     return 1;
 }
-static void plane_wait_visible(u16 hold_ms) {
-    u32 elapsed;
-    if(last_visible_tick){elapsed=timer_elapsed_ms(last_visible_tick,timer_ticks());
-        if(elapsed<hold_ms) {
-#ifdef DOSFER_PROFILE
-            u32 t=timer_ticks();
-#endif
-            timer_wait_ms((u16)(hold_ms-elapsed));
-#ifdef DOSFER_PROFILE
-            dosferPlaneProfileTicks[3]+=timer_ticks()-t;
-#endif
-        }}
+static int plane_produce_until_ready(PlaneQueue *q,const Window *w,const Config *cfg,u32 session,u16 target) {
+    int rc;while(q->ready_count<target&&(q->preparing!=0xFF||q->next_first+(u16)cfg->plane_width<=w->count)) {
+        rc=plane_producer_step(q,w,cfg,session);if(rc<=0)return rc;
+    }return 1;
 }
-static int plane_play_group(PlaneGroup *g,const Config *cfg,int pause_after_first_c1) {
-    u8 masks[5]={1,2,4,8,15},count=g->width==3?4:5,i;
+static int plane_hold_work(PlaneQueue *q,const Window *w,const Config *cfg,u32 session,u32 deadline) {
+    int rc;u32 t;while((long)(timer_ticks()-deadline)<0) {
+        t=timer_ticks();rc=plane_producer_step(q,w,cfg,session);if(rc<0)return 0;
 #ifdef DOSFER_PROFILE
-    u32 play_start=timer_ticks();
+        if(rc)dosferPlaneProfileTicks[4]+=timer_ticks()-t;
+        else dosferPlaneProfileTicks[5]+=timer_ticks()-t;
 #endif
-    if(!g->ready)return 0;
-    if(g->width==3)masks[3]=7;
-    for(i=0;i<count;++i) {
-        int key;
-        plane_wait_visible(cfg->hold_ms);
-        if(masks[i]==15) {
-            if(!vga_plane_apply_correction(g->slot,3))return 0;
-            g->parity_correction_applied=1;
+        if(!rc) { /* no free slot or all work complete: leave the CPU idle */ }
+    }return 1;
+}
+static int plane_show_group_symbol(PlaneGroup *g,u8 symbol) {
+    u8 mask=g->width==3?(symbol==3?7:(u8)(1U<<symbol)):(symbol==4?15:(u8)(1U<<symbol));u32 prior=last_visible_tick,now;
+    if(mask==15) {
+        if(!vga_plane_apply_correction(g->slot,3,g->correction_raster,&g->correction_restore_hash))return 0;
+        g->parity_correction_applied=1;
+    }
+    if(!vga_plane_show_mask(g->slot_start,mask))return 0;
+    now=timer_ticks();if(prior){plane_queue.visible_ticks+=now-prior;++plane_queue.visible_transitions;}
+    last_visible_tick=now;return 1;
+}
+static int plane_queue_play(const Window *w,const Config *cfg,u32 session,int pause_after_first_c1) {
+    PlaneQueue *q=&plane_queue;PlaneGroup *g;u8 symbol=0,count;u32 deadline;int key,rc;
+#ifdef DOSFER_PROFILE
+    u32 playback_t=timer_ticks();
+#endif
+    if((rc=plane_produce_until_ready(q,w,cfg,session,2))<=0||!q->ready_count)return rc;
+    g=&q->slots[q->head];g->state=PLANE_SLOT_PLAYING;--q->ready_count;
+    if(q->ready_count<q->min_ready)q->min_ready=q->ready_count;count=(u8)(g->width+1);
+    if(!plane_show_group_symbol(g,0))return 0;
+    if(pause_after_first_c1){flush_keys();do{key=decision_key();}while(key!=13&&key!=27);if(key==27)return -1;}
+    for(;;) {
+        deadline=last_visible_tick+(u32)cfg->hold_ms*74UL+((u32)cfg->hold_ms*574UL+999UL)/1000UL;
+        if(!plane_hold_work(q,w,cfg,session,deadline))return 0;
+        if(++symbol<count) {if(!plane_show_group_symbol(g,symbol))return 0;continue;}
+        /* Keep parity visible if the producer genuinely falls behind. */
+        if(!q->ready_count&&q->next_first+(u16)cfg->plane_width<=w->count) {
+            u32 gap_start=timer_ticks();++q->starvation_count;
+            while(!q->ready_count) {rc=plane_producer_step(q,w,cfg,session);if(rc<0)return 0;if(!rc)break;}
+            q->intergroup_ticks+=timer_ticks()-gap_start;
         }
-        if(!vga_plane_show_mask(g->slot_start,masks[i]))return 0;
-        last_visible_tick=timer_ticks();
-        if(i==0&&pause_after_first_c1) {
-            flush_keys();do{key=decision_key();}while(key!=13&&key!=27);
-            if(key==27)return -1;
+        if(g->parity_correction_applied) {
+            if(!vga_plane_restore_correction(g->slot,3,g->correction_raster,g->correction_restore_hash))return 0;
+            g->parity_correction_applied=0;
         }
-        if(i==count-1) {
-            plane_wait_visible(cfg->hold_ms);
-            if(g->parity_correction_applied) {
-                if(!vga_plane_restore_correction(g->slot,3))return 0;
-                g->parity_correction_applied=0;
-            }
-        }
+        g->state=PLANE_SLOT_FREE;q->head=(u8)((q->head+1)&7);
+        if(!q->ready_count)break;
+        g=&q->slots[q->head];g->state=PLANE_SLOT_PLAYING;--q->ready_count;
+        if(q->ready_count<q->min_ready)q->min_ready=q->ready_count;symbol=0;count=(u8)(g->width+1);
+        if(!plane_show_group_symbol(g,0))return 0;
     }
 #ifdef DOSFER_PROFILE
-    dosferPlaneProfileTicks[2]+=timer_ticks()-play_start;
+    dosferPlaneProfileTicks[3]+=timer_ticks()-playback_t;
 #endif
     return 1;
 }
@@ -780,35 +879,22 @@ static int transmit(const Window *w,const Config *cfg,u32 session,const u8 *sele
         /* A selective rescue is intentionally ordinary DATA: arbitrary
          * individual records do not form a resident PLANE basis group. */
         if(!selected&&cfg->plane_width) {
-            PlaneGroup plane_group;u16 plane_step=0;int plane_active=0,plane_result=1;
-            if(!plane_group_alloc(&plane_group,cfg)||!vga_plane_begin(&plane_step)) {
-                plane_release_group(&plane_group);return 0;
+            u16 plane_step=0,full=(u16)(w->count/cfg->plane_width);int plane_result;
+            if(!vga_plane_begin(&plane_step)||!plane_queue_init(&plane_queue,cfg,plane_step,full)) {
+                plane_queue_release(&plane_queue);vga_plane_end();return 0;
             }
-            /* The resident renderer has its own delta baseline.  Never let a
-             * later DATA tail/EOW treat its final raster as a generic frame. */
+            /* The queue owns screen_320's delta state; generic rendering is
+             * forbidden until all resident groups have been released. */
             qr_delta_ready=0;
-            plane_active=1;plane_group.slot=0;plane_group.page_step=plane_step;
-            i=0;
-            while(i<w->count) {
-                if(i+cfg->plane_width<=w->count) {
-                    plane_result=plane_prepare_group(w,i,cfg,session,&plane_group);
-                    if(plane_result)
-                        plane_result=plane_play_group(&plane_group,cfg,
-                            focus_first_plane_c1&&r==0&&i==0);
-                    if(plane_result<=0)break;
-                    i=(u16)(i+cfg->plane_width);
-                } else {
-                    /* The protocol has no synthetic partial PLANE group.  Tear
-                     * down the resident backend before the ordinary DATA tail. */
-                    if(plane_active){vga_plane_end();plane_active=0;}
-                    if(!show_frame(w,i,cfg,session,r>0,0,hold_ms,display_mask)) {plane_result=0;break;}
-                    ++i;
-                }
-            }
-            if(plane_active)vga_plane_end();
-            plane_release_group(&plane_group);
+            plane_result=plane_queue_play(w,cfg,session,focus_first_plane_c1&&r==0);
+            plane_last_min_ready=plane_queue.min_ready;plane_last_starvation=plane_queue.starvation_count;
+            plane_last_max_chunk=plane_queue.max_chunk_ticks;plane_last_intergroup=plane_queue.intergroup_ticks;
+            plane_last_visible=plane_queue.visible_ticks;plane_last_visible_count=plane_queue.visible_transitions;
+            vga_plane_end();plane_queue_release(&plane_queue);
             if(plane_result<0)return -1;
             if(!plane_result)return 0;
+            for(i=(u16)(full*cfg->plane_width);i<w->count;++i)
+                if(!show_frame(w,i,cfg,session,r>0,0,hold_ms,display_mask))return 0;
             continue;
         }
         first=0;count=0;
@@ -869,10 +955,8 @@ static void exit_to_dos(u8 status) {
 static int run_transfer(FILE *mf,Config *cfg) {
     u32 session=(timer_ticks()^(u32)time(NULL)^selected_bytes)|1UL,window_id=0;
     int key,have_selection=0,focus_plane_c1=0;u16 chosen=0,rescue_round=0;u8 selected[MAX_WINDOW];char line[80];
-    vga_use_320(cfg->qr_version==40&&cfg->module_pixels==1);producer_open(mf);if(!fill_window(&current_window,cfg,session,window_id))return 0;
-    /* Reserve the next window before entering graphics mode. This prevents a
-       large /WINDOW setting from failing only after the first batch is sent. */
-    if(!producer.finished&&!reserve_window(&previous_window,cfg))return 0;
+    vga_use_320(1);producer_open(mf);
+    if(!fill_window_spooled(&current_window,cfg,session,window_id))return 0;
     if(cfg->chain_width==2&&cfg->qr_version==40&&cfg->ecc==0&&cfg->module_pixels==1)ensure_chain_cache();
     if(!vga_enter()){puts("Not enough memory for VGA buffer");return 0;}qr_delta_ready=0;
     focus_plane_c1=cfg->plane_width&&current_window.count>=cfg->plane_width;
@@ -915,7 +999,7 @@ wait_ack:
         if(key!=13)goto wait_ack;
         {Window swap=previous_window;previous_window=current_window;current_window=swap;}
         have_previous=1;have_selection=0;chosen=0;rescue_round=0;window_id++;
-        if(!fill_window(&current_window,cfg,session,window_id)){vga_leave();
+        if(!fill_window_spooled(&current_window,cfg,session,window_id)){vga_leave();
             completed_session=session;completed_frames=producer.global_index;completed_bytes=producer.total_bytes;return 1;}
         continue;
 replay:
@@ -1225,15 +1309,19 @@ static void benchmark(const char *path,Config *cfg) {
 #ifdef DOSFER_PROFILE
                 if(scfg.plane_width) {
                     u16 pg=(u16)(data_count/scfg.plane_width);
-                    u32 prep_ms=timer_elapsed_ms(0,dosferPlaneProfileTicks[1]);
-                    u32 play_ms=timer_elapsed_ms(0,dosferPlaneProfileTicks[2]);
-                    u32 wait_ms=timer_elapsed_ms(0,dosferPlaneProfileTicks[3]);
-                    printf("  PLANE groups: payload %lu, prepare %lu (%lu/group), playback %lu, hold %lu ms\n",
-                        timer_elapsed_ms(0,dosferPlaneProfileTicks[0]),prep_ms,
-                        pg?prep_ms/pg:0,play_ms,wait_ms);
-                    printf("  PLANE timing: register overhead %lu ms/group, visible %lu ms/symbol, inter-group prepare %lu ms, effective %lu.%02lu symbols/s, useful %lu B/s\n",
-                        pg?(play_ms>wait_ms?(play_ms-wait_ms)/pg:0):0,
-                        display_count?wait_ms/display_count:0,pg?prep_ms/pg:0,
+                    u32 prep_ms=timer_elapsed_ms(0,dosferPlaneProfileTicks[2]);
+                    u32 play_ms=timer_elapsed_ms(0,dosferPlaneProfileTicks[3]);
+                    u32 useful_ms=timer_elapsed_ms(0,dosferPlaneProfileTicks[4]);
+                    printf("  PLANE groups: spool %lu, payload %lu, prepare %lu (%lu/group), correction %lu ms\n",
+                        timer_elapsed_ms(0,dosferPlaneProfileTicks[0]),timer_elapsed_ms(0,dosferPlaneProfileTicks[1]),
+                        prep_ms,pg?prep_ms/pg:0,timer_elapsed_ms(0,dosferPlaneProfileTicks[6]));
+                    printf("  PLANE timing: register/play overhead %lu ms/group, visible configured %u / actual %lu ms/symbol, useful hold work %lu, idle %lu ms\n",
+                        pg?play_ms/pg:0,scfg.hold_ms,
+                        plane_last_visible_count?timer_elapsed_ms(0,plane_last_visible)/plane_last_visible_count:0,
+                        useful_ms,timer_elapsed_ms(0,dosferPlaneProfileTicks[5]));
+                    printf("  PLANE queue: READY minimum %u, starvation %lu, inter-group gap %lu ms, longest producer chunk %lu ms, sustained %lu.%02lu symbols/s, useful %lu B/s\n",
+                        plane_last_min_ready,plane_last_starvation,timer_elapsed_ms(0,plane_last_intergroup),
+                        timer_elapsed_ms(0,plane_last_max_chunk),
                         fps100/100UL,fps100%100UL,
                         schedule_ms?(u32)data_count*scfg.frame_payload*1000UL/schedule_ms:0);
                     printf("  PLANE VGA: raster %lu, upload %lu, readback %lu, select+retrace %lu, correction apply %lu, restore %lu ms\n",
@@ -1329,14 +1417,10 @@ static void usage(const Config *cfg) {
     puts("DOSFER /CAL [options]");
     puts("DOSFER /BENCH file [options]");
     puts("");
-    puts("Default: V40-L, 320x200, 2904-byte payload, hold 0, window 32, /RE:7");
-    puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 7)");
-    puts("/RE:PLANE3|PLANE4   Experimental fixed V40-L plane-coded groups");
-    puts("/RE:Ck or /RE Ck      Even chain width C2..C64; k/2 must be < window");
-    puts("/ANCHOR:n            Repeat each nth data frame in chain mode; 0 disables");
-    puts("Advanced diagnostics: /V:n /ECC:L|M|Q|H /SCALE:n /PAYLOAD:n");
+    puts("Production backend: V40-L Mode 0Dh PLANE4, 320x200, 2904-byte payload");
+    puts("/RE:PLANE3|PLANE4   Resident VGA bitplane group width (default PLANE4)");
     puts("/HOLD:ms or /SPEED:ms  Minimum frame hold 0..60000 ms");
-    puts("/WINDOW:n or /W:n    Frames per acknowledged batch 4..64");
+    puts("/WINDOW:n or /W:n    Frames per acknowledged batch 4..128 (spooled)");
     puts("/REPEAT:n or /R:n    Full passes per batch 1..20");
     puts("/MASK:n              Fixed QR mask 0..7 (default 0; payload is whitened)");
     puts("/INVERT /NOINVERT    Select black/white polarity");
@@ -1345,7 +1429,7 @@ static void usage(const Config *cfg) {
         cfg->qr_version,"LMQH"[cfg->ecc],cfg->module_pixels,cfg->frame_payload,
         cfg->hold_ms,cfg->window_frames,cfg->repetitions,qr_mask,redundancy_name(cfg),
         cfg->invert?"/INVERT":"/NOINVERT",cfg->speaker?"/BEEP":"/NOBEEP");
-    puts("Example: DOSFER /HOLD:0 /W:32 /RE:C8 FILE.ZIP");
+    puts("Example: DOSFER /HOLD:50 /W:128 /RE:PLANE4 FILE.ZIP");
     puts("The first QR waits for Enter so you can focus the camera; Esc cancels.");
     puts("M rescues missing frames with adaptive hold/mask; R repeats that set.");
     puts("Enter a blank M list to clear it and replay the complete window.");

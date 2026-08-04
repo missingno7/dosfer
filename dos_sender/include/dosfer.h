@@ -12,7 +12,7 @@ typedef unsigned long u32;
 #define RECORD_HEADER_SIZE 24
 #define MAX_FRAME_PAYLOAD 2905
 #define MAX_QR_BYTES (FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD)
-#define MAX_WINDOW 64
+#define MAX_WINDOW 128
 #define PATH_BYTES 128
 
 enum { FK_DATA=1, FK_END_WINDOW=2, FK_CALIBRATION=3, FK_CHAIN_XOR=4,
@@ -54,12 +54,16 @@ typedef struct {
     u32 stream_id;
     u32 stream_offset;
     u32 global_index;
+    u32 spool_offset;   /* exact record in the PLANE replay spool */
+    u8 spooled;
 } PendingFrame;
 
 typedef struct {
     PendingFrame frames[MAX_WINDOW];
     u16 count;
     u32 id;
+    FILE *spool;
+    char spool_name[13];
 } Window;
 
 u32 crc32_update(u32 crc, const void *data, u16 len);

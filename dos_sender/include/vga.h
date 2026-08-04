@@ -23,10 +23,12 @@ int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
                        int qr_size,int invert,u8 plane,u8 slot,int delta_only);
 int vga_plane_prepare_correction(const u8 *zero_qr,const u8 *zero_codewords,
                                  const u8 *correction_codewords,u16 codeword_len,
-                                 int qr_size,int invert);
+                                 int qr_size,int invert,u8 far *correction_raster);
 int vga_plane_show_mask(u16 start,u8 mask);
-int vga_plane_apply_correction(u8 slot,u8 plane);
-int vga_plane_restore_correction(u8 slot,u8 plane);
+int vga_plane_apply_correction(u8 slot,u8 plane,const u8 far *correction_raster,
+                               u32 *restore_hash);
+int vga_plane_restore_correction(u8 slot,u8 plane,const u8 far *correction_raster,
+                                 u32 restore_hash);
 #ifdef DOSFER_PROFILE
 /* raster construction, upload, readback, selection+retrace, correction
  * apply, correction restore (all in PIT ticks). */

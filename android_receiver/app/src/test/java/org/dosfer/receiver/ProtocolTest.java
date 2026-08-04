@@ -13,6 +13,13 @@ public class ProtocolTest {
         assertEquals(0,plane3.streamId);assertEquals(3,plane3.streamOffset);assertTrue(SessionStore.isPlaneStart(plane3));
         assertEquals(0,plane4.streamId);assertEquals(4,plane4.streamOffset);assertTrue(SessionStore.isPlaneStart(plane4));
     }
+    @Test public void planeWindow128KeepsZeroFirstGroupAndExplicitWidth(){
+        byte[] payload=record(1,12);
+        Protocol.Frame first=Protocol.parseFrame(Protocol.encodeFrame(Protocol.PLANE_CODED,0,0x12345678L,9,1,0,128,0,4,payload));
+        Protocol.Frame finalBasis=Protocol.parseFrame(Protocol.encodeFrame(Protocol.PLANE_CODED,0,0x12345678L,9,4,124,128,124,4,payload));
+        assertEquals(128,first.windowCount);assertEquals(0,first.streamId);assertTrue(SessionStore.isPlaneStart(first));
+        assertEquals(128,finalBasis.windowCount);assertEquals(4,finalBasis.streamOffset);assertEquals(124,finalBasis.streamId);
+    }
     @Test public void planeCodedOddEquationsRoundTripAndSolve(){
         byte[][] basis={record(100,32),record(101,32),record(102,32),record(103,32)};int[] c={1,2,4,8,7,11,13,14};byte[][] equation=new byte[8][];
         for(int i=0;i<c.length;i++){equation[i]=new byte[basis[0].length];for(int bit=0;bit<4;bit++)if((c[i]&(1<<bit))!=0)for(int j=0;j<equation[i].length;j++)equation[i][j]^=basis[bit][j];}
