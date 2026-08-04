@@ -36,19 +36,19 @@ def main() -> None:
         put_bytes(
             fs,
             "RUN.BAT",
-            b"@ECHO OFF\r\nDOSFER.EXE /BULK /HOLD:100 SAMPLE.BIN\r\n",
+            b"@ECHO OFF\r\nDOSFER.EXE SAMPLE.BIN\r\n",
         )
         put_bytes(
             fs,
             "BENCH.BAT",
-            b"@ECHO OFF\r\nDOSFER.EXE /BENCH SAMPLE.BIN /BULK > BENCH.TXT\r\n"
+            b"@ECHO OFF\r\nDOSFER.EXE /BENCH SAMPLE.BIN > BENCH.TXT\r\n"
             b"TYPE BENCH.TXT\r\n",
         )
         put_bytes(
             fs,
             "README.TXT",
             b"DOSFER 86Box test disk\r\n\r\n"
-            b"RUN.BAT   - optical transfer, V40-M, 100 ms hold\r\n"
+            b"RUN.BAT   - optical transfer, default V40-L mode\r\n"
             b"BENCH.BAT - CPU, VGA and disk benchmark to BENCH.TXT\r\n"
             b"DOSFER.EXE /? shows every command-line option.\r\n",
         )

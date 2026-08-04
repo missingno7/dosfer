@@ -16,14 +16,18 @@ DOSfer's GF(256) lookup-table and cached-divisor speed path.
 
 Requirements: JDK 17+, Android SDK platform 36/build-tools 36, and internet for
 the first dependency resolution. The wrapper pins Gradle 8.11.1, the project
-pins Android Gradle Plugin 8.10.1 and ZXing core 3.5.3.
+pins Android Gradle Plugin 8.10.1 and the ZXing-C++ Android/JNI wrapper 3.1.0.
+The scanner feeds retained Camera2 Y planes directly to two native decode
+workers; no bitmap or RGB conversion is used.
 
 ```powershell
 cd android_receiver
-.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
 ```
 
 The installable debug APK is under `app/build/outputs/apk/debug`.
+The optimized release APK is under `app/build/outputs/apk/release`, but remains
+unsigned until a project-specific Android signing key is supplied.
 
 ## Everything
 

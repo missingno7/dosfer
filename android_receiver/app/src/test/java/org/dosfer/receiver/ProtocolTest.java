@@ -3,7 +3,6 @@ package org.dosfer.receiver;
 import org.junit.Test;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.zip.CRC32;
 import static org.junit.Assert.*;
 
 public class ProtocolTest {
@@ -31,12 +30,26 @@ public class ProtocolTest {
     private static byte[] record(int id,int size){byte[] body=new byte[size];for(int i=0;i<size;i++)body[i]=(byte)(id*37+i*11);byte[] raw=new byte[Protocol.RECORD_HEADER+size];ByteBuffer b=ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
         b.put("DQRC".getBytes());b.put((byte)1);b.put((byte)Protocol.SESSION);b.putShort((short)0);b.putInt(id);b.putInt(0);b.putInt(size);b.putInt((int)Protocol.crc(body,0,size));b.put(body);return raw;}
     private static Protocol.Frame chain(byte[] a,byte[] b,long left){byte[] x=new byte[Math.max(a.length,b.length)];for(int i=0;i<x.length;i++)x[i]=(byte)((i<a.length?a[i]:0)^(i<b.length?b[i]:0));long lengths=((long)a.length<<16)|b.length;
-        return Protocol.parseFrame(Protocol.encodeFrame(Protocol.CHAIN_XOR,Protocol.FLAG_WHITENED,0x12345678L,2,left,3,8,lengths,0,x));}
+        return Protocol.parseFrame(Protocol.encodeFrame(Protocol.CHAIN_XOR,Protocol.FLAG_PAIR_WHITENED,0x12345678L,2,left,3,8,lengths,0,x));}
+    @Test public void pairedWhiteningMatchesRawDataXor(){byte[] a=record(30,24),b=record(31,24),x=new byte[a.length];for(int i=0;i<x.length;i++)x[i]=(byte)(a[i]^b[i]);
+        byte[] ra=Protocol.encodeFrame(Protocol.DATA,Protocol.FLAG_WHITENED,0x12345678L,2,30,0,2,0,0,a);
+        byte[] rb=Protocol.encodeFrame(Protocol.DATA,Protocol.FLAG_WHITENED,0x12345678L,2,31,1,2,0,0,b);
+        byte[] rx=Protocol.encodeFrame(Protocol.CHAIN_XOR,Protocol.FLAG_PAIR_WHITENED,0x12345678L,2,30,0,2,((long)a.length<<16)|b.length,0,x);
+        for(int i=Protocol.FRAME_HEADER;i<rx.length;i++)assertEquals((byte)(ra[i]^rb[i]),rx[i]);
+        assertArrayEquals(x,Protocol.parseFrame(rx).payload);}
     @Test public void chainRecoversInBothDirections(){byte[] a=record(10,17),b=record(11,31);Protocol.Frame x=chain(a,b,10);
         assertArrayEquals(b,Protocol.recoverChain(x,a,true));assertArrayEquals(a,Protocol.recoverChain(x,b,false));}
     @Test public void chainPeelsForwardAndBackward(){byte[] a=record(20,9),b=record(21,27),c=record(22,13);Protocol.Frame ab=chain(a,b,20),bc=chain(b,c,21);
         byte[] forwardB=Protocol.recoverChain(ab,a,true);assertArrayEquals(c,Protocol.recoverChain(bc,forwardB,true));
         byte[] backwardB=Protocol.recoverChain(bc,c,false);assertArrayEquals(a,Protocol.recoverChain(ab,backwardB,false));}
+    @Test public void blockParityRecoversEveryUnequalMember(){int[] sizes={3,29,7,51,1,18,37};byte[][] payloads=new byte[sizes.length][];int max=0;
+        for(int i=0;i<sizes.length;i++){payloads[i]=record(i+1,sizes[i]);max=Math.max(max,payloads[i].length);}
+        byte[] parityPayload=new byte[max];for(byte[] payload:payloads)for(int j=0;j<payload.length;j++)parityPayload[j]^=payload[j];
+        byte[] wire=Protocol.encodeFrame(Protocol.BLOCK_XOR,Protocol.FLAG_WHITENED,0x6A67C69DL,4,80,0,7,7,0,parityPayload);
+        Protocol.Frame parity=Protocol.parseFrame(wire);
+        for(int missing=0;missing<payloads.length;missing++){byte[][] members=payloads.clone();members[missing]=null;
+            assertArrayEquals(payloads[missing],Protocol.recoverBlock(parity,members,missing));}
+    }
     @Test(expected=IllegalArgumentException.class)public void corruptionRejected(){byte[] b=hex(VECTOR);b[b.length-1]^=1;Protocol.parseFrame(b);}
     @Test public void pathRules(){assertEquals("A/B.TXT",Protocol.safePath("A/B.TXT".getBytes(),0,7));for(String p:new String[]{"../X","/X","C:/X","A//B","A\\B"})try{Protocol.safePath(p.getBytes(),0,p.length());fail(p);}catch(IllegalArgumentException expected){}}
 }

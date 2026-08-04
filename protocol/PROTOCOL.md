@@ -13,8 +13,8 @@ Every QR contains one binary byte-mode segment: a 48-byte header followed by
 |---:|---:|---|
 | 0 | 4 | ASCII magic `DQR1` |
 | 4 | 1 | protocol version, `1` |
-| 5 | 1 | kind: `1` DATA, `2` END_WINDOW, `3` CALIBRATION, `4` CHAIN_XOR |
-| 6 | 2 | flags (bit 0 repeated, bit 1 continuous, bit 2 inverted, bit 3 payload whitened, other bits zero) |
+| 5 | 1 | kind: `1` DATA, `2` END_WINDOW, `3` CALIBRATION, `4` CHAIN_XOR, `5` BLOCK_XOR |
+| 6 | 2 | flags (bit 0 repeated, bit 2 paired whitening, bit 3 payload whitening, other bits zero) |
 | 8 | 4 | session ID (non-zero random/time-derived value) |
 | 12 | 4 | zero-based window ID |
 | 16 | 4 | zero-based global DATA frame index |
@@ -55,10 +55,25 @@ is the XOR of their complete, dewhitened `DQRC` payloads, padding the shorter
 one with zero bytes. `global_index` and `window_index` identify the left frame;
 the right indices are each one greater. `stream_id` packs the left payload
 length in its high 16 bits and right length in its low 16 bits. `window_count`
-still counts DATA frames only. The chain payload itself is normally whitened
-and CRC-protected like DATA. If either adjacent DATA payload is known, a
+still counts DATA frames only. Bit 2 uses the XOR of the left and right DATA
+whitening streams. For equal-length frames this makes the transmitted chain
+payload exactly the XOR of the two transmitted DATA payloads, while decoding
+still yields the XOR of their plain payloads. CRCs always cover transmitted
+bytes. If either adjacent DATA payload is known, a
 receiver XORs it with the equation, truncates to the missing length, validates
 the recovered `DQRC` CRC, and may continue peeling forward or backward.
+
+`BLOCK_XOR` protects one contiguous group of 1..64 DATA frames in the same
+window. `global_index` and `window_index` identify the first member and
+`stream_id` contains the member count; `stream_offset` is zero. Its payload is
+the XOR of all complete, dewhitened `DQRC` payloads, padding shorter members
+with zero bytes, and uses normal flag-bit-3 whitening based on the first global
+index. `window_count` still counts DATA frames only.
+
+When exactly one member is absent, a receiver XORs every available member into
+the equation. It reads the missing record's true length from the recovered
+`DQRC` header, requires all remaining padding bytes to be zero, truncates to
+that length, and validates the normal record CRC.
 
 ## Container record (`DQRC`)
 
@@ -111,6 +126,19 @@ Receivers keep valid frames across replays/restarts, ignore other sessions while
 one is active, and report missing in-window indices. Frames may arrive out of
 order. Unsupported versions and all invalid frames increment diagnostics only.
 
-The optional chained schedule is `D0, X01, D1, X12, D2...`. Duplicate DATA
-anchors periodically break long camera-loss propagation. Manual `M` rescue
-remains DATA-only and therefore works with receivers that ignore kind 4.
+The default `/RE:7` schedule is `D0..D6, P0-6, D7..D13, P7-13...`, so one lost
+DATA frame in each seven-frame group is recovered without replay. `/RE:n`
+selects any independent group size from 1 through 64; `/RE:0` disables parity.
+
+`/RE:Ck` selects an even chain width from C2 through C64, with `k/2` smaller
+than the configured window size. Let `h=k/2`. For
+starts `s=0,h,2h...` where `s+h < window_count`, the sender displays the first
+half's DATA frames and then an equation covering DATA
+`s..min(s+k,window_count)-1`. Thus C4 is
+`D0,D1,P0-3,D2,D3,P2-5,D4,D5...`, while C6 begins
+`D0,D1,D2,P0-5,D3,D4,D5,P3-8...`. These overlapping equations are repeatedly
+reconsidered by the receiver: whenever an equation has exactly one unknown,
+that DATA frame is recovered and may make neighboring equations solvable.
+C2 retains the specialized `CHAIN_XOR` representation and fast DOS encoder;
+C4 and longer use `BLOCK_XOR`. Manual `M` rescue remains DATA-only and works
+independently of either recovery schedule.

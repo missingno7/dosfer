@@ -22,8 +22,10 @@ public final class SessionStore {
     private File dir(){File d=new File(context.getFilesDir(),"sessions/"+Long.toUnsignedString(active,16));d.mkdirs();return d;}
     private File file(long index){return new File(dir(),String.format(Locale.US,"frame_%010d.dqr",index));}
     private File xorFile(long index){return new File(dir(),String.format(Locale.US,"xor_%010d.dqr",index));}
+    private File parityFile(long index){return new File(dir(),String.format(Locale.US,"parity_%010d.dqr",index));}
     private static boolean isDataName(String n){return n.startsWith("frame_")&&n.endsWith(".dqr");}
     private static boolean isXorName(String n){return n.startsWith("xor_")&&n.endsWith(".dqr");}
+    private static boolean isParityName(String n){return n.startsWith("parity_")&&n.endsWith(".dqr");}
     private void activate(long session){active=session;windowExpected.clear();windowSeen.clear();totalPayload=0;endIndex=-1;firstStoredNanos=0;context.getSharedPreferences("dosfer",0).edit().putLong("active",active).apply();}
     public synchronized Result accept(byte[] raw,long latencyNanos){
         Protocol.Frame f;
@@ -41,7 +43,13 @@ public final class SessionStore {
         if(f.kind==Protocol.CHAIN_XOR){
             windowExpected.put(f.window,f.windowCount);File target=xorFile(f.globalIndex);
             if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
-            if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverFrom(f.globalIndex);return Result.STORED;
+            if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverAvailable();return Result.STORED;
+        }
+        if(f.kind==Protocol.BLOCK_XOR){int count=(int)f.streamId;
+            if(count<1||count>64||f.flags!=Protocol.FLAG_WHITENED||f.streamOffset!=0||f.windowIndex+count>f.windowCount){invalid++;return Result.INVALID;}
+            windowExpected.put(f.window,f.windowCount);File target=parityFile(f.globalIndex);
+            if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
+            if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverAvailable();return Result.STORED;
         }
         if(record!=null&&record.type==Protocol.TRANSFER_END)endIndex=f.globalIndex;
         windowExpected.put(f.window,f.windowCount);BitSet bits=windowSeen.computeIfAbsent(f.window,k->new BitSet());
@@ -52,7 +60,8 @@ public final class SessionStore {
             invalid++;return Result.INVALID;
         }
         if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}
-        bits.set(f.windowIndex);if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=f.payloadLength;recoverFrom(f.globalIndex-1,f.globalIndex);return Result.STORED;
+        bits.set(f.windowIndex);if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=f.payloadLength;
+        recoverAvailable();return Result.STORED;
     }
     private void noteDecode(int bytes,long latency){long now=System.nanoTime();decodeTimes.addLast(now);while(!decodeTimes.isEmpty()&&now-decodeTimes.peekFirst()>5_000_000_000L)decodeTimes.removeFirst();latencySum+=latency/1e6;latencyCount++;}
     private void noteCalibration(Protocol.Frame f){calUnique++;if(calLast>=0){if(f.globalIndex==calLast)calDuplicates++;else if(f.globalIndex>calLast+1)calMissed+=f.globalIndex-calLast-1;}if(f.globalIndex>calLast)calLast=f.globalIndex;}
@@ -78,17 +87,29 @@ public final class SessionStore {
             long index=haveLeft?chain.globalIndex+1:chain.globalIndex;return storeRecovered(chain,index,haveLeft?chain.windowIndex+1:chain.windowIndex,recovered)?index:-1;
         }catch(Exception ignored){return -1;}
     }
-    private void recoverFrom(long... roots) {ArrayDeque<Long> queue=new ArrayDeque<>();for(long root:roots)if(root>=0)queue.add(root);
-        while(!queue.isEmpty()){long left=queue.removeFirst();File eq=xorFile(left);if(!eq.exists())continue;long recovered=recoverEquation(eq);
-            if(recovered>=0){if(recovered>0)queue.add(recovered-1);queue.add(recovered);}}
+    private long recoverBlockEquation(File eq) {
+        try{Protocol.Frame parity=Protocol.parseFrame(readAll(eq));int count=(int)parity.streamId;
+            if(parity.kind!=Protocol.BLOCK_XOR||count<1||count>64||parity.streamOffset!=0||parity.windowIndex+count>parity.windowCount)return -1;
+            byte[][] members=new byte[count][];int missing=-1,missingCount=0;
+            for(int i=0;i<count;i++){File source=file(parity.globalIndex+i);if(!source.exists()){missing=i;missingCount++;continue;}
+                Protocol.Frame known=Protocol.parseFrame(readAll(source));
+                if(known.kind!=Protocol.DATA||known.session!=parity.session||known.window!=parity.window||
+                   known.globalIndex!=parity.globalIndex+i||known.windowIndex!=parity.windowIndex+i)return -1;
+                members[i]=known.payload;}
+            if(missingCount!=1)return -1;
+            byte[] recovered=Protocol.recoverBlock(parity,members,missing);long index=parity.globalIndex+missing;
+            return storeRecovered(parity,index,parity.windowIndex+missing,recovered)?index:-1;
+        }catch(Exception ignored){return -1;}
     }
     private void recoverAvailable() {
-        boolean changed;do{changed=false;File[] equations=dir().listFiles((d,n)->isXorName(n));if(equations==null)return;
-            for(File eq:equations)if(recoverEquation(eq)>=0)changed=true;
+        boolean changed;do{changed=false;File[] equations=dir().listFiles((d,n)->isXorName(n));
+            if(equations!=null)for(File eq:equations)if(recoverEquation(eq)>=0)changed=true;
+            equations=dir().listFiles((d,n)->isParityName(n));
+            if(equations!=null)for(File eq:equations)if(recoverBlockEquation(eq)>=0)changed=true;
         }while(changed);
     }
-    private void reload(){if(active==0)return;File[] files=dir().listFiles((d,n)->isDataName(n));if(files==null)return;
-        for(File file:files)try{byte[] raw=readAll(file);Protocol.Frame f=Protocol.parseFrame(raw);Protocol.Record r=Protocol.parseRecord(f.payload);
+    private void reload(){if(active==0)return;File[] files=dir().listFiles((d,n)->isDataName(n));
+        if(files!=null)for(File file:files)try{byte[] raw=readAll(file);Protocol.Frame f=Protocol.parseFrame(raw);Protocol.Record r=Protocol.parseRecord(f.payload);
             windowExpected.put(f.window,f.windowCount);windowSeen.computeIfAbsent(f.window,k->new BitSet()).set(f.windowIndex);if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=f.payloadLength;if(r.type==Protocol.TRANSFER_END)endIndex=f.globalIndex;
         }catch(Exception ignored){} recoverAvailable(); }
     public synchronized Stats stats(){Stats s=new Stats();s.session=active;s.uniqueTotal=countFrames();s.duplicates=(int)duplicates;s.invalid=(int)invalid;s.other=(int)other;s.totalPayload=totalPayload;

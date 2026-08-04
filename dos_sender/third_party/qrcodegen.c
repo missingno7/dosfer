@@ -131,6 +131,24 @@ testable const int8_t ECC_CODEWORDS_PER_BLOCK[4][41] = {
 #define DOSFER_RS_STRIDE 32  /* Power-of-two rows make factor lookup one shift on a 386. */
 
 #ifdef __WATCOMC__
+/* V40-L interleaves each block at a constant 25-byte destination stride.
+ * Keeping this tiny copy loop in registers avoids two C loop tests and a
+ * special-case branch for every one of its 3,706 codewords. */
+static void dosferStrideCopy(const uint8_t __far *src,uint16_t len,
+		uint8_t __far *dest,uint16_t stride);
+#pragma aux dosferStrideCopy = \
+	"test cx,cx" \
+	"jz stride_done" \
+	"stride_loop:" \
+	"mov al,fs:[si]" \
+	"mov es:[di],al" \
+	"inc si" \
+	"add di,dx" \
+	"dec cx" \
+	"jnz stride_loop" \
+	"stride_done:" \
+	parm [fs si] [cx] [es di] [dx] modify [ax cx si di];
+
 static void dosferRs28Asm(const uint8_t __far *data,uint16_t len,
 		const uint8_t __near *table,uint8_t __near *ecc);
 #pragma aux dosferRs28Asm = \
@@ -347,6 +365,7 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 	"rs30p_done:" \
 	"pop bp" \
 	parm [es si] [cx] [bx] [di] modify [ax dx si];
+
 #endif
 
 /* DOSfer 386 fast path: 768 bytes avoid eight shift/XOR rounds for every
@@ -356,9 +375,23 @@ static uint8_t dosferGfExp[512];
 static uint8_t dosferGfLog[256];
 static bool dosferGfReady = false;
 static bool dosferCodewordsOnly = false;
+static bool dosferAlignedFast = true;
+static uint8_t dosferRsDiv[qrcodegen_REED_SOLOMON_DEGREE_MAX];
+static uint8_t dosferRsDivLog[qrcodegen_REED_SOLOMON_DEGREE_MAX];
+static uint8_t
+#ifdef __WATCOMC__
+	__near
+#endif
+	dosferRsStep[256U * DOSFER_RS_STRIDE];
+static int dosferRsDegree;
 void qrcodegen_dosferSetCodewordsOnly(bool enabled) { dosferCodewordsOnly = enabled; }
+void qrcodegen_dosferSetAlignedFast(bool enabled) { dosferAlignedFast = enabled; }
 int qrcodegen_dosferCodewordBytes(int version) {
 	return version >= 1 && version <= 40 ? getNumRawDataModules(version) / 8 : 0;
+}
+int qrcodegen_dosferDataCodewordBytes(int version, enum qrcodegen_Ecc ecl) {
+	if(version < 1 || version > 40 || (int)ecl < 0 || (int)ecl > 3)return 0;
+	return getNumDataCodewords(version,ecl);
 }
 static void dosferInitGf(void) {
 	unsigned int x = 1;
@@ -372,6 +405,18 @@ static void dosferInitGf(void) {
 	for (int i = 255; i < 512; i++)
 		dosferGfExp[i] = dosferGfExp[i - 255];
 	dosferGfReady = true;
+}
+static void dosferPrepareRs(int degree) {
+	if(dosferRsDegree==degree)return;
+	reedSolomonComputeDivisor(degree,dosferRsDiv);
+	if(!dosferGfReady)dosferInitGf();
+	for(int j=0;j<degree;j++)dosferRsDivLog[j]=dosferRsDiv[j]?dosferGfLog[dosferRsDiv[j]]:0;
+	for(int factor=0;factor<256;factor++){
+		uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
+		if(factor==0)memset(row,0,DOSFER_RS_STRIDE);
+		else{int factorLog=dosferGfLog[factor];for(int j=0;j<degree;j++)row[j]=dosferGfExp[dosferRsDivLog[j]+factorLog];}
+	}
+	dosferRsDegree=degree;
 }
 
 // For generating error correction codes.
@@ -448,6 +493,20 @@ bool qrcodegen_encodeBinary(uint8_t dataAndTemp[], size_t dataLen, uint8_t qrcod
 	return qrcodegen_encodeSegmentsAdvanced(&seg, 1, ecl, minVersion, maxVersion, mask, boostEcl, dataAndTemp, qrcode);
 }
 
+bool qrcodegen_encodeBinaryAligned(uint8_t dataAndTemp[], size_t dataLen, uint8_t qrcode[],
+		enum qrcodegen_Ecc ecl, int minVersion, int maxVersion, enum qrcodegen_Mask mask, bool boostEcl) {
+	uint8_t eciData[1];
+	struct qrcodegen_Segment segs[2];
+	segs[0] = qrcodegen_makeEci(3, eciData);
+	segs[1].mode = qrcodegen_Mode_BYTE;
+	segs[1].bitLength = calcSegmentBitLength(segs[1].mode, dataLen);
+	if (segs[1].bitLength == LENGTH_OVERFLOW) { qrcode[0] = 0; return false; }
+	segs[1].numChars = (int)dataLen;
+	segs[1].data = dataAndTemp;
+	return qrcodegen_encodeSegmentsAdvanced(segs, 2, ecl, minVersion, maxVersion,
+		mask, boostEcl, dataAndTemp, qrcode);
+}
+
 
 // Appends the given number of low-order bits of the given value to the given byte-based
 // bit buffer, increasing the bit length. Requires 0 <= numBits <= 16 and val < 2^numBits.
@@ -500,7 +559,16 @@ bool qrcodegen_encodeSegmentsAdvanced(const struct qrcodegen_Segment segs[], siz
 	// Concatenate all segments to create the data bit string
 	memset(qrcode, 0, (size_t)qrcodegen_BUFFER_LEN_FOR_VERSION(version) * sizeof(qrcode[0]));
 	int bitLen = 0;
-	if (len == 1 && segs[0].mode == qrcodegen_Mode_BYTE) {
+	if (dosferAlignedFast && len == 2 && version >= 10 &&
+			segs[0].mode == qrcodegen_Mode_ECI && segs[0].bitLength == 8 &&
+			segs[0].data[0] == 3 && segs[1].mode == qrcodegen_Mode_BYTE) {
+		const struct qrcodegen_Segment *seg = &segs[1];
+		int n = seg->numChars;
+		qrcode[0] = 0x70; qrcode[1] = 0x34;
+		qrcode[2] = (uint8_t)((unsigned)n >> 8); qrcode[3] = (uint8_t)n;
+		if (n > 0) memcpy(qrcode + 4, seg->data, (size_t)n);
+		bitLen = 32 + n * 8;
+	} else if (len == 1 && segs[0].mode == qrcodegen_Mode_BYTE) {
 		/* Fixed-version DOSfer frames are one byte segment. Their 4-bit mode and
 		 * 16-bit length leave a constant nibble shift, so pack whole bytes instead
 		 * of calling the one-bit appender roughly 3,300 times per frame. */
@@ -629,29 +697,12 @@ testable void addEccAndInterleave(uint8_t data[], int version, enum qrcodegen_Ec
 	
 	// Split data into blocks, calculate ECC, and interleave
 	// (not concatenate) the bytes into a single sequence
-	static uint8_t rsdiv[qrcodegen_REED_SOLOMON_DEGREE_MAX];
-	static uint8_t rsdivLog[qrcodegen_REED_SOLOMON_DEGREE_MAX];
-	/* Keep the complete feedback table in DGROUP. In the 16-bit large model,
-	 * malloc-backed/far accesses in the RS inner loop are disproportionately
-	 * expensive; this table is only 7.5 KiB and leaves ample DGROUP headroom. */
-	static uint8_t
+	dosferPrepareRs(blockEccLen);
+	uint8_t
 #ifdef __WATCOMC__
 		__near
 #endif
-		rsStep[256U * DOSFER_RS_STRIDE];
-	static int rsdivDegree = 0;
-	if (rsdivDegree != blockEccLen) {
-		reedSolomonComputeDivisor(blockEccLen, rsdiv);
-		if (!dosferGfReady) dosferInitGf();
-		for (int j = 0; j < blockEccLen; j++)
-			rsdivLog[j] = rsdiv[j] ? dosferGfLog[rsdiv[j]] : 0;
-		for (int factor = 0; factor < 256; factor++) {
-			uint8_t *row = rsStep + (unsigned)factor * DOSFER_RS_STRIDE;
-			if (factor == 0) memset(row, 0, DOSFER_RS_STRIDE);
-			else {int factorLog=dosferGfLog[factor];for(int j=0;j<blockEccLen;j++)row[j]=dosferGfExp[rsdivLog[j]+factorLog];}
-		}
-		rsdivDegree = blockEccLen;
-	}
+		*rsStep=dosferRsStep;
 	const uint8_t *dat = data;
 	for (int i = 0; i < numBlocks; i++) {
 		int datLen = shortBlockDataLen + (i < numShortBlocks ? 0 : 1);
@@ -724,6 +775,21 @@ testable void addEccAndInterleave(uint8_t data[], int version, enum qrcodegen_Ec
 				ecc[blockEccLen-1]=row[blockEccLen-1];
 			}
 		}
+		#ifdef __WATCOMC__
+		if(version==40&&ecl==qrcodegen_Ecc_LOW&&numBlocks==25&&shortBlockDataLen==118) {
+			dosferStrideCopy(dat,118,result+i,25);
+			if(i>=19)result[2950+i-19]=dat[118];
+			dosferStrideCopy(ecc,30,result+dataLen+i,25);
+			dat+=datLen;continue;
+		}
+		#endif
+		/* Portable equivalent of the assembly fast path, also used by the
+		 * host-side QR oracle. */
+		if(version==40&&ecl==qrcodegen_Ecc_LOW&&numBlocks==25&&shortBlockDataLen==118) {
+			int k=i;
+			for(int j=0;j<118;j++,k+=25)result[k]=dat[j];
+			if(i>=19)result[2950+i-19]=dat[118];
+		} else
 		for (int j = 0, k = i; j < datLen; j++, k += numBlocks) {  // Copy data
 			if (j == shortBlockDataLen)
 				k -= numShortBlocks;
@@ -733,6 +799,59 @@ testable void addEccAndInterleave(uint8_t data[], int version, enum qrcodegen_Ec
 			result[k] = ecc[j];
 		dat += datLen;
 	}
+}
+
+bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t encodedRight[],
+		const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+	static uint8_t
+#ifdef __WATCOMC__
+		__near
+#endif
+		data[118];
+	static uint8_t
+#ifdef __WATCOMC__
+		__near
+#endif
+		 ecc[31];
+	uint16_t i;
+#ifdef DOSFER_PROFILE
+	u32 profileStart=timer_ticks(),profileNow;
+#endif
+	memset(data,0,sizeof(data));memset(ecc,0,sizeof(ecc));
+	/* ECI 3 + Byte mode + 16-bit length 2952, followed by the affine
+	 * protocol-header correction. The remaining 2904 input bytes are zero. */
+	data[0]=0x70;data[1]=0x34;data[2]=0x0B;data[3]=0x88;
+	memcpy(data+4,protocolHeaderXor,48);dosferPrepareRs(30);
+#ifdef __WATCOMC__
+	dosferRs30PairAsm(data,118,dosferRsStep,ecc);
+#else
+	for(i=0;i<118;i++){uint8_t factor=data[i]^ecc[0];const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
+		ecc[30]=0;for(int j=0;j<30;j++)ecc[j]=ecc[j+1]^row[j];}
+#endif
+#ifdef DOSFER_PROFILE
+	profileNow=timer_ticks();dosferQrProfileTicks[1]+=profileNow-profileStart;profileStart=profileNow;
+#endif
+	for(i=0;i+4<=3706;i+=4)*(uint32_t *)(result+i)=*(const uint32_t *)(encodedLeft+i)^*(const uint32_t *)(encodedRight+i);
+	for(;i<3706;i++)result[i]=encodedLeft[i]^encodedRight[i];
+	for(i=0;i<52;i++)result[i*25]^=data[i];
+	for(i=0;i<30;i++)result[2956+i*25]^=ecc[i];
+#ifdef DOSFER_PROFILE
+	dosferQrProfileTicks[0]+=timer_ticks()-profileStart;
+#endif
+	return true;
+}
+
+bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[],uint8_t result[]) {
+	/* V40-L has exactly 2956 data codewords. The caller supplies the fixed
+	 * ECI-3/Byte header followed by a complete 2952-byte DOSfer frame. */
+#ifdef DOSFER_PROFILE
+	u32 profileStart=timer_ticks();
+#endif
+	addEccAndInterleave(dataCodewords,40,qrcodegen_Ecc_LOW,result);
+#ifdef DOSFER_PROFILE
+	dosferQrProfileTicks[1]+=timer_ticks()-profileStart;
+#endif
+	return true;
 }
 
 

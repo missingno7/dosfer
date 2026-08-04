@@ -34,5 +34,36 @@ class ProtocolTest(unittest.TestCase):
         ab,bc=chain_frame(frames[0],frames[1]),chain_frame(frames[1],frames[2])
         b=recover_chain(ab,payloads[0],True);self.assertEqual(recover_chain(bc,b,True),payloads[2])
         b=recover_chain(bc,payloads[2],False);self.assertEqual(recover_chain(ab,b,False),payloads[0])
+    def test_paired_whitening_is_wire_data_xor(self):
+        a=bytes(range(64));b=bytes((i*37)&255 for i in range(64));session=0x12345678
+        left=Frame(DATA,FLAG_WHITENED,session,2,30,0,2,0,0,a)
+        right=Frame(DATA,FLAG_WHITENED,session,2,31,1,2,0,0,b)
+        chain=chain_frame(left,right)
+        aw=left.encode()[FRAME_HEADER:];bw=right.encode()[FRAME_HEADER:];xw=chain.encode()[FRAME_HEADER:]
+        self.assertEqual(xw,bytes(x^y for x,y in zip(aw,bw)))
+        self.assertEqual(Frame.decode(chain.encode()).payload,bytes(x^y for x,y in zip(a,b)))
+    def test_block_parity_recovers_each_unequal_member(self):
+        payloads=[Record(SESSION,i+1,0,bytes([i+1])*n).encode() for i,n in enumerate((3,29,7,51,1,18,37))]
+        frames=[Frame(DATA,FLAG_WHITENED,0x6A67C69D,4,80+i,i,7,0,0,p) for i,p in enumerate(payloads)]
+        parity=Frame.decode(block_frame(frames).encode())
+        self.assertEqual(parity.kind,BLOCK_XOR);self.assertEqual(parity.stream_id,7)
+        for missing in range(7):
+            members=list(payloads);members[missing]=None
+            self.assertEqual(recover_block(parity,members,missing),payloads[missing])
+    def test_c4_schedule_and_fixed_point_peeling(self):
+        payloads=[Record(SESSION,i+1,0,bytes([i+1])*(5+i)).encode() for i in range(8)]
+        frames=[Frame(DATA,FLAG_WHITENED,9,3,40+i,i,8,0,0,p) for i,p in enumerate(payloads)]
+        equations=chain_blocks(frames,4)
+        self.assertEqual([(e.window_index,e.stream_id) for e in equations],[(0,4),(2,4),(4,4)])
+        known=list(payloads);known[1]=known[2]=None
+        changed=True
+        while changed:
+            changed=False
+            for equation in equations:
+                start=equation.window_index;members=known[start:start+equation.stream_id]
+                missing=[i for i,payload in enumerate(members) if payload is None]
+                if len(missing)==1:
+                    known[start+missing[0]]=recover_block(equation,members,missing[0]);changed=True
+        self.assertEqual(known,payloads)
 
 if __name__=="__main__": unittest.main()

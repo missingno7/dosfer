@@ -13,9 +13,11 @@
 6. When all frames exist, tap **Reconstruct**. A green `VALID` result is the
    only completion signal. Do not treat `.partial` files as recovered files.
 
-Start conservatively: QR v15-M, 4-pixel modules, 364-byte record payload, 750
-ms hold, 32 frames/window, one repetition. Run `DOSFER /CAL` before valuable
-data and shorten the hold only after the phone reports **RELIABLE**.
+The default is the optimized 386 path: V40-L, one-pixel modules in 320x200,
+2,904-byte records, zero artificial hold, 32-frame windows, and `/RE:7`.
+Run `DOSFER /CAL` before valuable data. Add `/HOLD:n` only if the phone reports
+misses; generation and rendering already keep each QR visible for substantial
+time on a 386.
 
 When `M` selects only part of a window, rescue frames are automatically held
 2-4 times longer and displayed with another standard QR mask. Each subsequent
@@ -23,20 +25,22 @@ When `M` selects only part of a window, rescue frames are automatically held
 after `M` clears the selection and replays the complete window. Normal transfer
 timing is unchanged.
 
-All transfer settings can be supplied without calibration, for example:
-`DOSFER /V:15 /ECC:M /SCALE:4 /PAYLOAD:364 /HOLD:750 /W:32 /R:1 FILE.DAT`.
-Run `DOSFER /?` for ranges, aliases, polarity, and beep options. Regardless of
-these settings, DOSfer always waits for an explicit decision between batches.
+A typical explicit command is `DOSFER /HOLD:0 /W:32 /RE:C8 FILE.DAT`.
+Run `DOSFER /?` for ranges, advanced diagnostic overrides, polarity, and beep
+options. DOSfer always waits for an explicit decision between batches.
 
-Use `DOSFER /FPS FILE.DAT` for the measured v12-M 10+ FPS preset, or
-`DOSFER /BULK FILE.DAT` for v40-M maximum generated payload throughput. Both
-use zero additional hold; add `/HOLD:n` after the preset when the camera needs
-more exposure time (for example `/FPS /HOLD:100 FILE.DAT`).
+`/RE:7` is the default and sends seven DATA frames followed by one XOR parity
+frame. It recovers any one missing DATA frame in each group. Use `/RE:15` for
+lower overhead, `/RE:3` for more protection, or `/RE:0` for none. `/RE:C2`
+selects adjacent chaining. Longer even chains overlap by half their width:
+`/RE:C4`, `/RE:C6`, `/RE:C8`, up to C64. The spaced forms such as `/RE C4`
+are also accepted. A chain's half-width must be smaller than `/WINDOW`.
 
-Use `DOSFER /TURBO FILE.DAT` with the current receiver for the optimized 386
-mode: v25-L, 1,225-byte DATA payloads, adjacent-frame XOR recovery, and an
-anchor every 16 DATA frames. It measured 9.93 displayed FPS at 3000 DOSBox-X
-cycles. `/NOCHAIN` after the preset disables recovery frames for compatibility.
+At 3000 DOSBox-X cycles the default 7+1 schedule measured 8.64 displayed FPS,
+7.47 DATA frames/s, and about 21.5 KB/s before optical losses. `/RE:C8`
+measured 8.59 displayed FPS and 20.3 KB/s. `/RE:C2` uses the specialized affine
+encoder and reaches a higher display rate, at the cost of almost one parity QR
+per DATA QR.
 
 ## Local optical test
 

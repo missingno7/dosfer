@@ -226,6 +226,11 @@ bool qrcodegen_encodeText(const char *text, uint8_t tempBuffer[], uint8_t qrcode
 bool qrcodegen_encodeBinary(uint8_t dataAndTemp[], size_t dataLen, uint8_t qrcode[],
 	enum qrcodegen_Ecc ecl, int minVersion, int maxVersion, enum qrcodegen_Mask mask, bool boostEcl);
 
+/* Encodes ECI assignment 3 followed by a byte segment. For version 10+, the
+ * combined headers are byte-aligned, avoiding cross-byte payload shifts. */
+bool qrcodegen_encodeBinaryAligned(uint8_t dataAndTemp[], size_t dataLen, uint8_t qrcode[],
+	enum qrcodegen_Ecc ecl, int minVersion, int maxVersion, enum qrcodegen_Mask mask, bool boostEcl);
+
 
 /*---- Functions (low level) to generate QR Codes ----*/
 
@@ -382,11 +387,16 @@ bool qrcodegen_getModule(const uint8_t qrcode[], int x, int y);
 /* DOSfer fixed-mask streaming hooks. These expose the already-built placement
  * cache so a persistent VGA framebuffer can apply codeword deltas directly. */
 void qrcodegen_dosferSetCodewordsOnly(bool enabled);
+void qrcodegen_dosferSetAlignedFast(bool enabled);
 const uint16_t *qrcodegen_dosferPlacementBytes(void);
 const uint8_t *qrcodegen_dosferPlacementMasks(void);
 int qrcodegen_dosferPlacementBits(void);
 int qrcodegen_dosferCodewordBytes(int version);
+int qrcodegen_dosferDataCodewordBytes(int version, enum qrcodegen_Ecc ecl);
 void qrcodegen_dosferReleaseMatrixCache(void);
+bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[], const uint8_t encodedRight[],
+		const uint8_t protocolHeaderXor[48], uint8_t result[]);
+bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[], uint8_t result[]);
 
 
 #ifdef __cplusplus

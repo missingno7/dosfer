@@ -11,6 +11,7 @@ int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,
                 int qr_size,int module_pixels,int invert,const char *line1,
                 const char *line2,int marker,int delta_only);
 int vga_delta_ready(void);
+void vga_delta_stats(u16 *groups,u16 *types,int *rotation);
 u32 vga_screen_hash(void);
 int vga_display_matches(void);
 void speaker_beep(void);

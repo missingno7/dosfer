@@ -21,7 +21,7 @@ Run `run_386sx16.bat` for the conservative childhood-PC baseline:
 
 At the FreeDOS prompt:
 
-- `RUN.BAT` starts a V40-M transfer of the 4 MB deterministic sample.
+- `RUN.BAT` starts a default V40-L transfer of the 4 MB deterministic sample.
 - `BENCH.BAT` runs the DOSFER benchmark and writes `BENCH.TXT`.
 - `DOSFER.EXE /?` shows all sender options.
 

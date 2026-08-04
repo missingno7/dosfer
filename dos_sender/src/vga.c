@@ -8,8 +8,11 @@
 #include "timing.h"
 
 static u8 far *screen;
+static u8 far *font8;
 static int screen_invert=-1;
 static int use_320,active_320,screen_stride=80,screen_height=480,display_page,write_page;
+static u8 page_initialized[2],page_invert[2];
+static int vga_active;
 static u32 screen_bytes=80UL*480UL;
 #define QR40_CODEWORDS 3706
 #define QR40_DATA_BITS (QR40_CODEWORDS*8)
@@ -28,8 +31,23 @@ static u8
     screen_320[8000];
 static u16 delta_bits,delta_codewords;
 static int delta_n;
+#ifdef DOSFER_PROFILE
+/* render, VGA upload/setup, retrace wait, page flip, BIOS status drawing */
+u32 dosferVgaProfileTicks[5];
+#endif
 
 #ifdef __WATCOMC__
+static u8 far *dosferFont8(void);
+#pragma aux dosferFont8 = \
+    "push bp" \
+    "mov ax,1130h" \
+    "mov bh,3" \
+    "int 10h" \
+    "mov dx,es" \
+    "mov ax,bp" \
+    "pop bp" \
+    value [dx ax] modify [bx];
+
 static void dosferDelta386(const u8 far *codewords,u16 len,u8 *previous,
         const u16 far *offsets,const u8 *selectors,u8 far *pixels);
 #pragma aux dosferDelta386 = \
@@ -313,6 +331,30 @@ static void dosferCopyNear320(const u8 far *src,u8 far *dest);
     "loop copy320_loop" \
     parm [fs si] [es di] modify [ax cx si di];
 
+static void dosferCopyPartial320(const u8 far *src,u8 far *dest);
+#pragma aux dosferCopyPartial320 = \
+    "mov cx,185" \
+    "copy320_rows:" \
+    "mov eax,fs:[si+8]"  "mov es:[di+8],eax" \
+    "mov eax,fs:[si+12]" "mov es:[di+12],eax" \
+    "mov eax,fs:[si+16]" "mov es:[di+16],eax" \
+    "mov eax,fs:[si+20]" "mov es:[di+20],eax" \
+    "mov eax,fs:[si+24]" "mov es:[di+24],eax" \
+    "mov eax,fs:[si+28]" "mov es:[di+28],eax" \
+    "add si,40" \
+    "add di,40" \
+    "loop copy320_rows" \
+    "add si,280" \
+    "add di,280" \
+    "mov cx,80" \
+    "copy320_status:" \
+    "mov eax,fs:[si]" \
+    "mov es:[di],eax" \
+    "add si,4" \
+    "add di,4" \
+    "loop copy320_status" \
+    parm [fs si] [es di] modify [ax cx si di];
+
 static void dosferDelta320Near(const u8 far *codewords,u16 len,u8 __near *previous,
         const u16 far *offsets,const u8 far *masks);
 #pragma aux dosferDelta320Near = \
@@ -332,56 +374,56 @@ static void dosferDelta320Near(const u8 far *codewords,u16 len,u8 __near *previo
     "jz short dn0" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn0: add bx,2" \
     "inc dx" \
     "test al,40h" \
     "jz short dn1" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn1: add bx,2" \
     "inc dx" \
     "test al,20h" \
     "jz short dn2" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn2: add bx,2" \
     "inc dx" \
     "test al,10h" \
     "jz short dn3" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn3: add bx,2" \
     "inc dx" \
     "test al,08h" \
     "jz short dn4" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn4: add bx,2" \
     "inc dx" \
     "test al,04h" \
     "jz short dn5" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn5: add bx,2" \
     "inc dx" \
     "test al,02h" \
     "jz short dn6" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn6: add bx,2" \
     "inc dx" \
     "test al,01h" \
     "jz short dn7" \
     "mov bp,fs:[bx]" \
     "mov ah,gs:[edx]" \
-    "xor [bp],ah" \
+    "xor ds:[bp],ah" \
     "dn7: add bx,2" \
     "inc dx" \
     "dec cx" \
@@ -407,12 +449,15 @@ int vga_enter(void) {
     active_320=use_320;screen_stride=active_320?40:80;screen_height=active_320?200:480;screen_bytes=(u32)screen_stride*screen_height;
     screen=active_320?0:(u8 far *)_fmalloc(screen_bytes);
     if (!active_320&&!screen) return 0;
-    bios_mode(active_320?0x0D:0x12);display_page=0;write_page=active_320?1:0;screen_invert=-1;return 1;
+    bios_mode(active_320?0x0D:0x12);vga_active=1;display_page=0;write_page=active_320?1:0;screen_invert=-1;font8=0;
+    page_initialized[0]=page_initialized[1]=0;
+    if(active_320)font8=dosferFont8();
+    return 1;
 }
 void vga_use_320(int enabled){use_320=enabled!=0;}
 void vga_leave(void) {
     free_delta();if(screen){_ffree(screen);screen=0;}screen_invert=-1;
-    bios_mode(3);bios_mode(3);
+    if(vga_active){bios_mode(3);bios_mode(3);vga_active=0;}
 }
 void vga_wait_retrace(void) {
     while (inp(0x3DA)&8) ;
@@ -430,6 +475,13 @@ static void status_text(int row,const char *s) {
     union REGS r; int i;
     r.h.ah=2;r.h.bh=(u8)display_page;r.h.dh=(u8)row;r.h.dl=0;int86(0x10,&r,&r);
     for(i=0;s[i]&&i<(active_320?40:76);++i){r.h.ah=0x0E;r.h.al=s[i];r.h.bh=(u8)display_page;r.h.bl=15;int86(0x10,&r,&r);}
+}
+static void status_text_320(const char *s) {
+    int x,y;u8 far *glyph;u8 bg=screen_invert?0x00:0xFF;
+    for(y=192;y<200;++y)memset(screen_320+y*40,bg,40);
+    if(!font8)return;
+    for(x=0;s[x]&&x<40;++x){glyph=font8+(u16)(u8)s[x]*8;
+        for(y=0;y<8;++y)screen_320[(192+y)*40+x]=screen_invert?glyph[y]:(u8)~glyph[y];}
 }
 static int build_qr_image(const u8 *qr,int n,int scale,int invert,int marker) {
     int total=(n+8)*scale,x0=(640-total)/2,y0=8,mx,my,xx,yy,dark,index,px;
@@ -509,10 +561,26 @@ static void copy_320_flip(void) {
      * 0x2000. Uploading page 1 at 8000 made alternate frames start 192 bytes
      * before the address selected by INT 10h/AH=05. */
     u8 far *vram=(u8 far *)MK_FP(0xA000,0);union REGS r;u16 base=(u16)(write_page<<13);
+#ifdef DOSFER_PROFILE
+    u32 profile_start=timer_ticks(),profile_now;
+#endif
     outp(0x3C4,2);outp(0x3C5,0x0F);outp(0x3CE,0);outp(0x3CF,0);outp(0x3CE,1);outp(0x3CF,0);
     outp(0x3CE,3);outp(0x3CF,0);outp(0x3CE,5);outp(0x3CF,0);outp(0x3CE,8);outp(0x3CF,0xFF);
-    dosferCopyNear320(screen_320,vram+base);
-    vga_wait_retrace();memset(&r,0,sizeof(r));r.h.ah=5;r.h.al=(u8)write_page;int86(0x10,&r,&r);
+    if(!page_initialized[write_page]||page_invert[write_page]!=(u8)screen_invert)
+        dosferCopyNear320(screen_320,vram+base);
+    else dosferCopyPartial320(screen_320,vram+base);
+    page_initialized[write_page]=1;page_invert[write_page]=(u8)screen_invert;
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[1]+=profile_now-profile_start;profile_start=profile_now;
+#endif
+    vga_wait_retrace();
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[2]+=profile_now-profile_start;profile_start=profile_now;
+#endif
+    memset(&r,0,sizeof(r));r.h.ah=5;r.h.al=(u8)write_page;int86(0x10,&r,&r);
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[3]+=profile_now-profile_start;
+#endif
     display_page=write_page;write_page^=1;
 }
 static int prepare_delta(const u8 *codewords,u16 codeword_len,int n) {
@@ -522,25 +590,44 @@ static int prepare_delta(const u8 *codewords,u16 codeword_len,int n) {
     if(!bytes||!masks||bits<=0||bits!=(int)codeword_len*8)return 0;
     free_delta();delta_offset=(u16 far *)_fmalloc((u32)bits*sizeof(u16));
     if(active_320)delta_mask=(u8 far *)_fmalloc((u32)bits);
-    if(!delta_offset||(active_320&&!delta_mask)||bits>QR40_DATA_BITS||codeword_len>sizeof(previous_codewords)){free_delta();return 0;}
+    if(!delta_offset||(active_320&&!delta_mask)||bits>QR40_DATA_BITS||codeword_len>QR40_CODEWORDS){free_delta();return 0;}
     if(!active_320)memset(delta_select,0,(size_t)(bits+3)/4);
     for(i=0;i<bits;++i){m=masks[i];bit=0;while(((u8)1<<bit)!=m)bit++;
         linear=(u16)(((bytes[i]-1)<<3)+bit);y=linear/n;x=linear-y*n;
-        if(active_320){px=(320-(n+8))/2+4+x;delta_offset[i]=(u16)((y+4)*40+(px>>3));delta_mask[i]=(u8)(0x80>>(px&7));}
+        if(active_320){px=(320-(n+8))/2+4+x;
+            delta_offset[i]=(u16)((y+4)*40+(px>>3));delta_mask[i]=(u8)(0x80>>(px&7));
+        }
         else{/* Keep offsets relative: screen[off] already adds the far pointer base. */
             off=(u16)((y0+(y+4)*2)*80+data_byte+(x>>2));delta_offset[i]=off;delta_select[i>>2]|=(u8)((x&3)<<((i&3)*2));}}
     _fmemcpy(previous_codewords,codewords,codeword_len);delta_bits=(u16)bits;
     delta_codewords=codeword_len;delta_n=n;qrcodegen_dosferReleaseMatrixCache();return 1;
 }
 static void update_delta(const u8 *codewords,u8 far *pixels) {
-    if(active_320){const u16 far *offset=delta_offset;const u8 far *masks=delta_mask;u16 i,off;u8 changed;
+    if(active_320){const u16 far *offset=delta_offset;
+        const u8 far *masks=delta_mask;
+        u16 i,off;
+        u8 changed;
         (void)pixels;
-        for(i=0;i<delta_codewords;++i,offset+=8,masks+=8){changed=(u8)(codewords[i]^previous_codewords[i]);previous_codewords[i]=codewords[i];
-            #define DOSFER_TOGGLE_320(k,b) if(changed&(b)){off=offset[k];screen_320[off]^=masks[k];}
-            DOSFER_TOGGLE_320(0,0x80)DOSFER_TOGGLE_320(1,0x40)DOSFER_TOGGLE_320(2,0x20)DOSFER_TOGGLE_320(3,0x10)
-            DOSFER_TOGGLE_320(4,0x08)DOSFER_TOGGLE_320(5,0x04)DOSFER_TOGGLE_320(6,0x02)DOSFER_TOGGLE_320(7,0x01)
-            #undef DOSFER_TOGGLE_320
-        }return;}
+        /* V40 has an even 3,706 codewords. Dispatching two bytes per loop
+           keeps the proven sparse offset/mask layout while halving loop and
+           far-pointer update overhead without changing the map layout. */
+        for(i=0;i+1<delta_codewords;i+=2,offset+=16,masks+=16){
+            changed=(u8)(codewords[i]^previous_codewords[i]);previous_codewords[i]=codewords[i];
+            #define DOSFER_TOGGLE_320_2(k,b) if(changed&(b)){off=offset[k];screen_320[off]^=masks[k];}
+            DOSFER_TOGGLE_320_2(0,0x80)DOSFER_TOGGLE_320_2(1,0x40)DOSFER_TOGGLE_320_2(2,0x20)DOSFER_TOGGLE_320_2(3,0x10)
+            DOSFER_TOGGLE_320_2(4,0x08)DOSFER_TOGGLE_320_2(5,0x04)DOSFER_TOGGLE_320_2(6,0x02)DOSFER_TOGGLE_320_2(7,0x01)
+            changed=(u8)(codewords[i+1]^previous_codewords[i+1]);previous_codewords[i+1]=codewords[i+1];
+            DOSFER_TOGGLE_320_2(8,0x80)DOSFER_TOGGLE_320_2(9,0x40)DOSFER_TOGGLE_320_2(10,0x20)DOSFER_TOGGLE_320_2(11,0x10)
+            DOSFER_TOGGLE_320_2(12,0x08)DOSFER_TOGGLE_320_2(13,0x04)DOSFER_TOGGLE_320_2(14,0x02)DOSFER_TOGGLE_320_2(15,0x01)
+            #undef DOSFER_TOGGLE_320_2
+        }
+        if(i<delta_codewords){changed=(u8)(codewords[i]^previous_codewords[i]);previous_codewords[i]=codewords[i];
+            #define DOSFER_TOGGLE_320_TAIL(k,b) if(changed&(b)){off=offset[k];screen_320[off]^=masks[k];}
+            DOSFER_TOGGLE_320_TAIL(0,0x80)DOSFER_TOGGLE_320_TAIL(1,0x40)DOSFER_TOGGLE_320_TAIL(2,0x20)DOSFER_TOGGLE_320_TAIL(3,0x10)
+            DOSFER_TOGGLE_320_TAIL(4,0x08)DOSFER_TOGGLE_320_TAIL(5,0x04)DOSFER_TOGGLE_320_TAIL(6,0x02)DOSFER_TOGGLE_320_TAIL(7,0x01)
+            #undef DOSFER_TOGGLE_320_TAIL
+        }
+        return;}
 #ifdef DOSFER_ASM_DELTA
     dosferDelta386(codewords,delta_codewords,previous_codewords,delta_offset,delta_select,pixels);
 #else
@@ -557,10 +644,18 @@ static void update_delta(const u8 *codewords,u8 far *pixels) {
     }
 #endif
 }
-int vga_delta_ready(void){return delta_offset!=0;}
+int vga_delta_ready(void){
+    return delta_offset!=0;
+}
+void vga_delta_stats(u16 *groups,u16 *types,int *rotation) {
+    *groups=delta_bits;*types=0;
+    *rotation=0;
+}
 u32 vga_screen_hash(void) {
     u32 i,h=2166136261UL;if(!active_320&&!screen)return 0;
-    if(active_320)for(i=0;i<8000;++i){h^=screen_320[i];h*=16777619UL;}
+    /* Status text intentionally differs between a streamed frame and its
+       canonical redraw; hash the complete QR/quiet-zone area (rows 0..191). */
+    if(active_320)for(i=0;i<7680;++i){h^=screen_320[i];h*=16777619UL;}
     else for(i=0;i<screen_bytes;++i){h^=screen[i];h*=16777619UL;}
     return h;
 }
@@ -569,15 +664,32 @@ int vga_display_matches(void) {
     if(!active_320)return 1;
     outp(0x3CE,4);outp(0x3CF,0); /* Read plane 0; all four QR planes are identical. */
     vram=(u8 far *)MK_FP(0xA000,(u16)(display_page<<13));
-    for(i=0;i<7680;++i)if(vram[i]!=screen_320[i])return 0; /* Rows 0..191 exclude BIOS status text. */
+    for(i=0;i<8000;++i)if(vram[i]!=screen_320[i])return 0;
     return 1;
 }
 int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,int n,int scale,int invert,const char *a,const char *b,int marker,int delta_only){
     int total=(n+8)*scale,x0=(640-total)/2,y0=8;
+#ifdef DOSFER_PROFILE
+    u32 profile_start,profile_now;
+#endif
     if(active_320){(void)b;(void)marker;if(scale!=1)return 0;
+#ifdef DOSFER_PROFILE
+        profile_start=timer_ticks();
+#endif
         if(delta_only){if(!delta_offset||delta_n!=n||delta_codewords!=codeword_len||screen_invert!=invert)return 0;update_delta(codewords,screen);}
         else{if(!build_qr_image_320(qr,n,invert))return 0;prepare_delta(codewords,codeword_len,n);}
-        copy_320_flip();status_text(24,a);return 1;}
+#ifdef DOSFER_PROFILE
+        profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;
+#endif
+#ifdef DOSFER_PROFILE
+        profile_start=timer_ticks();
+#endif
+        status_text_320(a);
+#ifdef DOSFER_PROFILE
+        profile_now=timer_ticks();dosferVgaProfileTicks[4]+=profile_now-profile_start;
+#endif
+        copy_320_flip();
+        return 1;}
     if(scale==2||scale==4)x0=(((x0+4*scale+4)/8)*8)-4*scale;
     if(delta_only){if(!delta_offset||delta_n!=n||delta_codewords!=codeword_len||screen_invert!=invert)return 0;update_delta(codewords,screen);
         fill_rect(x0-12,y0+total+4,24,4,!invert);fill_rect(x0+total-12,y0+total+4,24,4,!invert);fill_rect(marker?x0-12:x0+total-12,y0+total+4,24,4,invert);
@@ -585,7 +697,7 @@ int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,int n,i
     if(delta_only)copy_qr_delta_image(n,scale);else copy_qr_image();status_text(26,a);status_text(28,b);return 1;
 }
 int vga_show_qr(const u8 *qr,int n,int scale,int invert,const char *a,const char *b,int marker) {
-    if(active_320){(void)b;(void)marker;if(scale!=1||!build_qr_image_320(qr,n,invert))return 0;copy_320_flip();status_text(24,a);return 1;}
+    if(active_320){(void)b;(void)marker;if(scale!=1||!build_qr_image_320(qr,n,invert))return 0;status_text_320(a);copy_320_flip();return 1;}
     if(!build_qr_image(qr,n,scale,invert,marker))return 0;
     copy_qr_image();
     status_text(26,a); status_text(28,b);
@@ -595,18 +707,21 @@ void vga_benchmark_qr(const u8 *qr,int n,int scale,int loops,u32 *build_ms,u32 *
     int i;u32 a,b;
     if(active_320){a=timer_ticks();for(i=0;i<loops;++i)build_qr_image_320(qr,n,0);b=timer_ticks();*build_ms=timer_elapsed_ms(a,b);
         a=timer_ticks();for(i=0;i<loops;++i)copy_320_flip();b=timer_ticks();*copy_ms=timer_elapsed_ms(a,b);
-        a=timer_ticks();for(i=0;i<loops;++i)status_text(24,"DOSfer 320x200 status benchmark");b=timer_ticks();*text_ms=timer_elapsed_ms(a,b);return;}
+        a=timer_ticks();for(i=0;i<loops;++i)status_text_320("DOSfer 320x200 status benchmark");b=timer_ticks();*text_ms=timer_elapsed_ms(a,b);return;}
     a=timer_ticks();for(i=0;i<loops;++i)build_qr_image(qr,n,scale,0,i&1);b=timer_ticks();*build_ms=timer_elapsed_ms(a,b);
     a=timer_ticks();for(i=0;i<loops;++i)copy_qr_image();b=timer_ticks();*copy_ms=timer_elapsed_ms(a,b);
     a=timer_ticks();for(i=0;i<loops;++i){status_text(26,"DOSfer VGA status benchmark");status_text(28,"0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ");}b=timer_ticks();*text_ms=timer_elapsed_ms(a,b);
 }
 void vga_benchmark_delta(const u8 *codewords,u16 codeword_len,int n,int loops,u32 *update_ms,u32 *copy_ms,u32 *text_ms) {
-    u8 far *alternate=(u8 far *)_fmalloc(codeword_len);int i;u32 a,b;
+    u8 far *alternate=(u8 far *)_fmalloc(codeword_len);int i;u32 a,b,state=0x6A67C69DUL;
     if(!alternate||!delta_offset){*update_ms=*copy_ms=*text_ms=0;if(alternate)_ffree(alternate);return;}
-    for(i=0;i<codeword_len;++i)alternate[i]=(u8)~codewords[i];
+    /* Representative DATA/XOR traffic changes about half the bits. The old
+     * complement pattern changed all eight bits and overstated real redraw
+     * cost by roughly 2x. Keep this deterministic for comparisons. */
+    for(i=0;i<codeword_len;++i){state^=state<<13;state^=state>>17;state^=state<<5;alternate[i]=(u8)(codewords[i]^(u8)state);}
     a=timer_ticks();for(i=0;i<loops;++i)update_delta((i&1)?codewords:alternate,screen);b=timer_ticks();*update_ms=timer_elapsed_ms(a,b);
     a=timer_ticks();for(i=0;i<loops;++i){if(active_320)copy_320_flip();else copy_qr_delta_image(n,2);}b=timer_ticks();*copy_ms=timer_elapsed_ms(a,b);
-    a=timer_ticks();for(i=0;i<loops;++i){if(active_320)status_text(24,"DOSfer 320 delta benchmark");else{status_text(26,"DOSfer delta status benchmark");status_text(28,"0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ");}}b=timer_ticks();*text_ms=timer_elapsed_ms(a,b);
+    a=timer_ticks();for(i=0;i<loops;++i){if(active_320)status_text_320("DOSfer 320 delta benchmark");else{status_text(26,"DOSfer delta status benchmark");status_text(28,"0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ");}}b=timer_ticks();*text_ms=timer_elapsed_ms(a,b);
     _ffree(alternate);
 }
 void speaker_beep(void) {
