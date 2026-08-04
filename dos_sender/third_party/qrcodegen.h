@@ -396,6 +396,15 @@ int qrcodegen_dosferDataCodewordBytes(int version, enum qrcodegen_Ecc ecl);
 void qrcodegen_dosferReleaseMatrixCache(void);
 bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[], const uint8_t encodedRight[],
 		const uint8_t protocolHeaderXor[48], uint8_t result[]);
+/* Four-way version used by the PLANE_CODED 4+1 parity proof.  The supplied
+ * header delta is the desired parity header XOR all four basis headers. */
+bool qrcodegen_dosferDeriveXor4V40L(const uint8_t encodedA[], const uint8_t encodedB[],
+		const uint8_t encodedC[], const uint8_t encodedD[],
+		const uint8_t protocolHeaderXor[48], uint8_t result[]);
+/* Encoded Q(delta) correction alone: prefix plus a 48-byte protocol-header
+ * delta, with zero payload. */
+bool qrcodegen_dosferHeaderCorrectionV40L(const uint8_t protocolHeaderXor[48],
+		uint8_t result[]);
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[], uint8_t result[]);
 
 

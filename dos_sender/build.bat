@@ -14,3 +14,4 @@ wcl -q -bt=dos -ml -3 -ot -ol -oi -or -oh -s -za99 -Iinclude -Ithird_party ^
   src\sender.c src\protocol.c src\vga.c src\timing.c third_party\qrcodegen.c
 if errorlevel 1 exit /b 1
 echo Built build\DOSFER.EXE
+certutil -hashfile build\DOSFER.EXE SHA256

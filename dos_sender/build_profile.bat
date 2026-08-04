@@ -11,3 +11,4 @@ wcl -q -bt=dos -ml -3 -ot -ol -oi -or -oh -s -za99 -dDOSFER_PROFILE %EXTRA_CFLAG
   src\sender.c src\protocol.c src\vga.c src\timing.c third_party\qrcodegen.c
 if errorlevel 1 exit /b 1
 echo Built build\%DOSFER_PROFILE_EXE%.EXE
+certutil -hashfile build\%DOSFER_PROFILE_EXE%.EXE SHA256

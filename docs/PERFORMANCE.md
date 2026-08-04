@@ -27,6 +27,98 @@ only 16,802 file-data B/s because nearly half its displays are equations. A
 block parity QR currently uses a full QR parity/interleave pass; optimizing a
 multi-input affine parity construction is a possible future improvement.
 
+### Mode 0Dh 32-frame bitplane store experiment (2026-08-04)
+
+Mode 0Dh has four independent 64 KiB planes. Its 8 KiB display-page stride
+gives eight slots per plane, so it can hold a complete 32-frame monochrome
+window as `8 slots x 4 planes`, with frame A/B/C/D at the same offset in
+planes 0/1/2/3. The Sequencer Map Mask writes one plane at a time. For
+playback, the CRTC start address selects a slot and the DAC palette exposes
+one selected plane, so no bitmap upload occurs between already-stored frames.
+
+At fixed 3000 DOSBox-X cycles, the experiment wrote all 32 8,000-byte images
+to VGA (256,000 bytes) in **54 ms** and read every plane/slot back exactly.
+The actual CRTC page increment was verified as **8,192 bytes**. A controller-
+only sequence of 24 x 32 frame selections took **114 ms** (about 6,700
+selections/s); the same 32 selections synchronised to vertical retrace took
+**456 ms**, or about **70.2 stable FPS**. Thus 20+ FPS burst playback is
+comfortably possible once frames are staged.
+
+This is a storage/playback mechanism, not a free sustained-throughput gain:
+every QR must still be encoded, rendered, and staged once. For the normal
+`/RE:7` 32-DATA window there are 37 displayed frames, so it also needs either
+two playback batches or a 28-DATA window (exactly 32 displays). The current
+sparse delta map remains necessary to construct QR pixels efficiently; VGA
+storage can remove only the 8 KiB RAM shadow after a direct-to-plane renderer
+has been proven faster and bit-exact. Therefore this experiment is retained
+as a verified benchmark, not yet the default transfer path.
+
+The corresponding four-frame batch test used four distinct, valid V40-L DATA
+symbols. Its cold batch took 1,101 ms because it also built the placement map.
+The relevant warm batch took **223 ms** to construct four QR codeword streams,
+**200 ms** to advance the existing sparse renderer four times, and **4 ms** to
+write the four 8 KiB plane images: **427 ms per four-frame batch (9.37
+frames/s)**. Each stored plane read back exactly. Controller-only playback of
+24 x 4 selections took 14 ms, but a 20 FPS producer would need to prepare the
+next four frames in at most 200 ms. It is currently more than twice that
+budget, before display holding. The batch therefore improves timing stability
+and permits a fast pre-rendered burst, but cannot sustain 20 FPS or improve
+long-run throughput on its own.
+
+The fixed QR geometry is already shared in the current design: the matrix
+template/placement map is built once, then reused by the sparse delta
+renderer. A future four-wide renderer can avoid repeating its placement-map
+walk, but it must beat the 200 ms four-frame render cost substantially; it
+also cannot remove the 223 ms QR-codeword construction measured above.
+
+#### Four-plane odd-XOR symbols: logical 64-symbol window proof
+
+For a fixed V40-L mask, a QR raster is an affine function of its encoded
+codewords. Therefore an odd XOR of complete QR rasters retains the one fixed
+template, while an even XOR cancels it. One 8 KiB VGA slot can consequently
+store four basis frames `A`, `B`, `C`, and `D` in planes 0..3 and display the
+eight valid symbols `A`, `B`, `C`, `D`, `ABC`, `ABD`, `ACD`, and `BCD`. Across
+eight slots this is **32 independent basis frames plus 32 derived equations**,
+or 64 displayed symbols; it is explicitly not 64 independent DATA frames.
+
+The DOSBox-X proof generated four distinct V40-L frames and all four
+three-way combinations. Every combination had **matching QR codewords and a
+bit-exact 8,000-byte canonical raster**, including function patterns, format,
+version and fixed-mask geometry. The display experiment programmed the DAC
+once with an odd-parity black/white palette and changed only Attribute
+Controller Color Plane Enable (index 12h) plus CRTC start address. All four
+Color Plane Enable masks read back correctly. Register-only playback of 24 x
+32 selections dropped from 114 ms with a DAC rewrite per frame to **18 ms**;
+24 x 4 selections dropped from 14 ms to **2 ms**. Vertical-retrace playback
+remains bounded by the approximately 70 Hz display refresh, as expected.
+
+This establishes the VGA half of a possible logical `/WINDOW:64` mode, but
+not a protocol change yet. The present DOSfer header/CRC is not affine as a
+*valid parsed record*: a three-way raw-frame XOR encodes and rasterizes
+perfectly, but its existing kind, fields and checksums are not an accepted
+receiver record. A new single coded-symbol wire format must make the shared
+fields identical, carry a four-bit coefficient vector, use fixed lengths, and
+validate the equation with affine CRC corrections. The Android receiver must
+then solve the four-variable GF(2) system. The eight symbols form a systematic
+binary [8,4,4] code (basis frames plus the four three-way equations), so they
+provide useful erasure recovery but impose 100% displayed-symbol overhead.
+
+The alternative template-plus-three-basis layout also has eight subsets, but
+only three independent payload vectors. It offers no capacity advantage over
+the four-basis odd-XOR layout and is not the preferred next implementation.
+
+#### Rejected temporary Chain-4 upload
+
+A temporary Chain-4 prototype was also tested rather than assumed. Its
+32-bit packed store appeared fast in DOSBox-X—24 four-plane uploads took
+80 ms versus 325 ms using four Map-Mask copies—but independent readback of
+every plane failed for both slots 0–1 through the 64 KiB aperture and slots
+2–3 through the 128 KiB aperture. In other words, the VGA-compatible path
+did not treat the bytes of one 32-bit CPU store as four independent
+Chain-4-addressed transactions. The prototype was removed. Even if it had
+worked, Chain-4 exposes only two 8 KiB slots through a 64 KiB aperture and
+four through the 128 KiB aperture, not a full 32-frame window.
+
 ## Foundation and timer audit (2026-08-04)
 
 Before further renderer experiments, the transfer lifecycle and benchmark

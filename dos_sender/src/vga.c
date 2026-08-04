@@ -31,6 +31,8 @@ static u8
     screen_320[8000];
 static u16 delta_bits,delta_codewords;
 static int delta_n;
+static int prepare_delta(const u8 *codewords,u16 codeword_len,int n);
+static void update_delta(const u8 *codewords,u8 far *pixels);
 #ifdef DOSFER_PROFILE
 /* render, VGA upload/setup, retrace wait, page flip, BIOS status drawing */
 u32 dosferVgaProfileTicks[5];
@@ -582,6 +584,225 @@ static void copy_320_flip(void) {
     profile_now=timer_ticks();dosferVgaProfileTicks[3]+=profile_now-profile_start;
 #endif
     display_page=write_page;write_page^=1;
+}
+
+/* Mode 0Dh is four independent 64 KiB bitplanes.  An 8 KiB display page
+ * leaves exactly eight slots per plane: 4 planes x 8 slots = 32 1-bit frames.
+ * The DAC maps the resulting four-bit pixel index to a color, so selecting a
+ * source plane needs no VRAM copy. */
+static void plane_mode_setup(u8 map_mask) {
+    outp(0x3C4,2);outp(0x3C5,map_mask);
+    outp(0x3CE,0);outp(0x3CF,0);
+    outp(0x3CE,1);outp(0x3CF,0);
+    outp(0x3CE,3);outp(0x3CF,0);
+    outp(0x3CE,5);outp(0x3CF,0);
+    outp(0x3CE,8);outp(0x3CF,0xFF);
+}
+static void plane_palette(u8 select_mask,int parity) {
+    u8 i,v,bits;
+    outp(0x3C8,0);
+    for(i=0;i<16;++i) {
+        bits=(u8)(i&select_mask);
+        v=parity?(u8)((bits^(bits>>1)^(bits>>2)^(bits>>3))&1):(u8)(bits!=0);
+        v=v?63:0;outp(0x3C9,v);outp(0x3C9,v);outp(0x3C9,v);
+    }
+}
+static void plane_palette_normal(void) {
+    u8 i,v;outp(0x3C8,0);
+    for(i=0;i<16;++i){v=i==15?63:0;outp(0x3C9,v);outp(0x3C9,v);outp(0x3C9,v);}
+}
+static u16 crtc_start(void) {
+    u8 hi,lo;
+    outp(0x3D4,0x0C);hi=inp(0x3D5);
+    outp(0x3D4,0x0D);lo=inp(0x3D5);
+    return (u16)(((u16)hi<<8)|lo);
+}
+static void crtc_set_start(u16 start) {
+    outp(0x3D4,0x0C);outp(0x3D5,(u8)(start>>8));
+    outp(0x3D4,0x0D);outp(0x3D5,(u8)start);
+}
+static u16 plane_page_step(void) {
+    union REGS r;u16 first,second;
+    memset(&r,0,sizeof(r));r.h.ah=5;r.h.al=0;int86(0x10,&r,&r);first=crtc_start();
+    memset(&r,0,sizeof(r));r.h.ah=5;r.h.al=1;int86(0x10,&r,&r);second=crtc_start();
+    memset(&r,0,sizeof(r));r.h.ah=5;r.h.al=0;int86(0x10,&r,&r);
+    return (u16)(second-first);
+}
+static void attribute_plane_enable(u8 mask);
+static void plane_show(u16 start,u8 plane) {
+    crtc_set_start(start);
+    attribute_plane_enable((u8)(1U<<plane));
+}
+static void attribute_plane_enable(u8 mask) {
+    /* Attribute Controller index 12h masks plane bits before palette lookup.
+     * Bit 5 in the address write keeps video output enabled. */
+    inp(0x3DA);outp(0x3C0,0x32);outp(0x3C0,mask);outp(0x3C0,0x20);
+}
+static u8 attribute_plane_enable_read(void) {
+    inp(0x3DA);outp(0x3C0,0x32);return inp(0x3C1);
+}
+int vga_verify_plane_xor3(const u8 *expected_qr,int qr_size,int invert,
+                           u8 plane_mask,int *color_plane_enable_ok) {
+    u8 far *vram=(u8 far *)MK_FP(0xA000,0);u8 plane,value;
+    u16 i;
+    *color_plane_enable_ok=0;
+    if(!active_320||(plane_mask&0x0F)!=plane_mask)return 0;
+    /* Fixed parity palette + Color Plane Enable is the display path under
+     * test.  The readback below independently reconstructs the same XOR. */
+    plane_palette(0x0F,1);attribute_plane_enable(plane_mask);crtc_set_start(0);
+    *color_plane_enable_ok=(attribute_plane_enable_read()&0x0F)==plane_mask;
+    if(!build_qr_image_320(expected_qr,qr_size,invert))goto fail;
+    for(i=0;i<8000;++i) {
+        value=0;
+        for(plane=0;plane<4;++plane)if(plane_mask&(1U<<plane)){
+            outp(0x3CE,4);outp(0x3CF,plane);value^=vram[i];}
+        if(value!=screen_320[i])goto fail;
+    }
+    attribute_plane_enable(0x0F);plane_palette_normal();plane_mode_setup(0x0F);
+    page_initialized[0]=page_initialized[1]=0;return 1;
+fail:
+    attribute_plane_enable(0x0F);plane_palette_normal();plane_mode_setup(0x0F);
+    page_initialized[0]=page_initialized[1]=0;return 0;
+}
+int vga_verify_plane_xor4_correction(const u8 *expected_qr,const u8 *correction_qr,
+                                     int qr_size,int invert,int *restored_ok,
+                                     int *color_plane_enable_ok) {
+    u8 far *vram=(u8 far *)MK_FP(0xA000,0);u8 before,after,value,plane;
+    u16 i;u32 initial_hash=0,final_hash=0;
+    *restored_ok=*color_plane_enable_ok=0;
+    if(!active_320)return 0;
+    /* Render Q(delta) once for this proof.  Production will use the same
+     * sparse correction geometry directly, not a fifth generic QR render. */
+    if(!build_qr_image_320(correction_qr,qr_size,invert))return 0;
+    outp(0x3CE,4);outp(0x3CF,3);
+    for(i=0;i<8000;++i)initial_hash=(initial_hash*33U)^vram[i];
+    plane_mode_setup(0x08);outp(0x3CE,4);outp(0x3CF,3);
+    for(i=0;i<8000;++i)vram[i]^=screen_320[i];
+    plane_palette(0x0F,1);attribute_plane_enable(0x0F);crtc_set_start(0);
+    *color_plane_enable_ok=(attribute_plane_enable_read()&0x0F)==0x0F;
+    if(!build_qr_image_320(expected_qr,qr_size,invert))goto fail;
+    for(i=0;i<8000;++i) {
+        value=0;
+        for(plane=0;plane<4;++plane){outp(0x3CE,4);outp(0x3CF,plane);value^=vram[i];}
+        if(value!=screen_320[i])goto fail;
+    }
+    if(!build_qr_image_320(correction_qr,qr_size,invert))goto fail;
+    plane_mode_setup(0x08);outp(0x3CE,4);outp(0x3CF,3);
+    for(i=0;i<8000;++i)vram[i]^=screen_320[i];
+    outp(0x3CE,4);outp(0x3CF,3);
+    for(i=0;i<8000;++i)final_hash=(final_hash*33U)^vram[i];
+    *restored_ok=initial_hash==final_hash;
+    attribute_plane_enable(0x0F);plane_palette_normal();plane_mode_setup(0x0F);
+    page_initialized[0]=page_initialized[1]=0;return *restored_ok;
+fail:
+    attribute_plane_enable(0x0F);plane_palette_normal();plane_mode_setup(0x0F);
+    page_initialized[0]=page_initialized[1]=0;return 0;
+}
+int vga_verify_affine_correction(const u8 *zero_qr,const u8 *zero_codewords,
+                                 const u8 *correction_codewords,const u8 *expected_qr,
+                                 u16 codeword_len,int qr_size,int invert,u16 *changed_codewords) {
+    u16 i;u32 got=0,want=0;
+    *changed_codewords=0;
+    if(!active_320||codeword_len>QR40_CODEWORDS)return 0;
+    for(i=0;i<codeword_len;++i)if(zero_codewords[i]!=correction_codewords[i])++*changed_codewords;
+    if(!build_qr_image_320(zero_qr,qr_size,invert)||
+       !prepare_delta(zero_codewords,codeword_len,qr_size))return 0;
+    update_delta(correction_codewords,screen_320);
+    for(i=0;i<8000;++i)got=(got*33U)^screen_320[i];
+    if(!build_qr_image_320(expected_qr,qr_size,invert))return 0;
+    for(i=0;i<8000;++i)want=(want*33U)^screen_320[i];
+    return got==want;
+}
+void vga_benchmark_planes(u32 *store_ms,u32 *burst_ms,u32 *vblank_ms,
+                          u16 *page_step,int *verified) {
+    u8 far *vram=(u8 far *)MK_FP(0xA000,0);u8 plane,slot,round;
+    u16 i,start;u32 a,b;
+    *store_ms=*burst_ms=*vblank_ms=0;*page_step=0;*verified=0;
+    if(!active_320)return;
+    *page_step=plane_page_step();
+    if(!*page_step)return;
+    /* Stage a complete 32-frame window without consuming conventional RAM.
+     * The same canonical screen is sufficient to measure real write traffic;
+     * the readback loop checks every plane and every page slot. */
+    a=timer_ticks();
+    for(plane=0;plane<4;++plane){plane_mode_setup((u8)(1U<<plane));
+        for(slot=0;slot<8;++slot)_fmemcpy(vram+((u16)slot<<13),screen_320,8000);}
+    b=timer_ticks();*store_ms=timer_elapsed_ms(a,b);
+    for(plane=0;plane<4;++plane){outp(0x3CE,4);outp(0x3CF,plane);
+        for(slot=0;slot<8;++slot)for(i=0;i<8000;++i)
+            if(vram[((u16)slot<<13)+i]!=screen_320[i])goto done;}
+    *verified=1;
+    /* CRTC start selects one of eight page slots; palette selection selects
+     * one of four stored frames in that slot.  Repeat so the DOS timer can
+     * measure controller-only burst rate with useful resolution. */
+    plane_palette(0x0F,1);attribute_plane_enable(0x01);
+    a=timer_ticks();for(round=0;round<24;++round)for(slot=0;slot<8;++slot)
+        for(plane=0;plane<4;++plane)plane_show((u16)(slot*(*page_step)),plane);
+    b=timer_ticks();*burst_ms=timer_elapsed_ms(a,b);
+    a=timer_ticks();for(slot=0;slot<8;++slot)for(plane=0;plane<4;++plane){
+        vga_wait_retrace();plane_show((u16)(slot*(*page_step)),plane);}
+    b=timer_ticks();*vblank_ms=timer_elapsed_ms(a,b);
+done:
+    plane_palette_normal();plane_mode_setup(0x0F);crtc_set_start(0);
+    page_initialized[0]=page_initialized[1]=0;
+}
+int vga_benchmark_plane_batch4(const u8 *first_qr,const u8 *codewords,
+                                u16 codeword_len,int qr_size,int invert,
+                                u32 *render_ms,u32 *upload_ms,
+                                u32 *playback_ms,int *verified) {
+    u8 far *vram=(u8 far *)MK_FP(0xA000,0);u8 plane;
+    u16 i;u32 a,b;
+    *render_ms=*upload_ms=*playback_ms=0;*verified=0;
+    if(!active_320||codeword_len>QR40_CODEWORDS)return 0;
+    /* This is the honest four-frame staging baseline.  A is built once from
+     * the fixed QR template; B/C/D reuse the prepared placement map and
+     * advance the same RAM delta renderer before each plane upload. */
+    a=timer_ticks();
+    if(!build_qr_image_320(first_qr,qr_size,invert)||
+       !prepare_delta(codewords,codeword_len,qr_size))return 0;
+    b=timer_ticks();*render_ms=timer_elapsed_ms(a,b);
+    for(plane=0;plane<4;++plane) {
+        if(plane) {a=timer_ticks();update_delta(codewords+(u32)plane*codeword_len,screen_320);
+            b=timer_ticks();*render_ms+=timer_elapsed_ms(a,b);}
+        a=timer_ticks();plane_mode_setup((u8)(1U<<plane));
+        _fmemcpy(vram,screen_320,8000);b=timer_ticks();*upload_ms+=timer_elapsed_ms(a,b);
+        outp(0x3CE,4);outp(0x3CF,plane);
+        for(i=0;i<8000;++i)if(vram[i]!=screen_320[i])goto done;
+    }
+    *verified=1;
+    plane_palette(0x0F,1);attribute_plane_enable(0x01);
+    a=timer_ticks();for(i=0;i<24;++i)for(plane=0;plane<4;++plane)
+        plane_show(0,plane);b=timer_ticks();*playback_ms=timer_elapsed_ms(a,b);
+done:
+    plane_palette_normal();plane_mode_setup(0x0F);crtc_set_start(0);
+    page_initialized[0]=page_initialized[1]=0;
+    return *verified;
+}
+int vga_benchmark_plane_batch4_steady(const u8 *codewords,u16 codeword_len,
+                                       u32 *render_ms,u32 *upload_ms,
+                                       u32 *playback_ms,int *verified) {
+    u8 far *vram=(u8 far *)MK_FP(0xA000,0);u8 plane;
+    u16 i;u32 a,b;
+    *render_ms=*upload_ms=*playback_ms=0;*verified=0;
+    if(!active_320||!delta_offset||codeword_len!=delta_codewords)return 0;
+    /* Warm batch: the delta placement map and the preceding frame already
+     * exist.  This is the relevant sustained cost, not the cold map build. */
+    for(plane=0;plane<4;++plane) {
+        a=timer_ticks();update_delta(codewords+(u32)plane*codeword_len,screen_320);
+        b=timer_ticks();*render_ms+=timer_elapsed_ms(a,b);
+        a=timer_ticks();plane_mode_setup((u8)(1U<<plane));
+        _fmemcpy(vram,screen_320,8000);b=timer_ticks();*upload_ms+=timer_elapsed_ms(a,b);
+        outp(0x3CE,4);outp(0x3CF,plane);
+        for(i=0;i<8000;++i)if(vram[i]!=screen_320[i])goto done;
+    }
+    *verified=1;
+    plane_palette(0x0F,1);attribute_plane_enable(0x01);
+    a=timer_ticks();for(i=0;i<24;++i)for(plane=0;plane<4;++plane)
+        plane_show(0,plane);b=timer_ticks();*playback_ms=timer_elapsed_ms(a,b);
+done:
+    plane_palette_normal();plane_mode_setup(0x0F);crtc_set_start(0);
+    page_initialized[0]=page_initialized[1]=0;
+    return *verified;
 }
 static int prepare_delta(const u8 *codewords,u16 codeword_len,int n) {
     const u16 *bytes=qrcodegen_dosferPlacementBytes();const u8 *masks=qrcodegen_dosferPlacementMasks();

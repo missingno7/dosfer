@@ -12,6 +12,7 @@ try { & .\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRel
 $out = "$root\build\artifacts"
 New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item "$root\dos_sender\build\DOSFER.EXE" "$out\DOSFER.EXE" -Force
+Get-FileHash "$out\DOSFER.EXE" -Algorithm SHA256 | Select-Object -ExpandProperty Hash | Set-Content "$out\DOSFER.EXE.sha256"
 Copy-Item "$root\android_receiver\app\build\outputs\apk\debug\app-debug.apk" "$out\DOSFER-Receiver-debug.apk" -Force
 Copy-Item "$root\android_receiver\app\build\outputs\apk\release\app-release-unsigned.apk" "$out\DOSFER-Receiver-release-unsigned.apk" -Force
 Copy-Item "$root\test_vectors\SAMPLE.TXT" "$out\SAMPLE.TXT" -Force
