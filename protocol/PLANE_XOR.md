@@ -37,7 +37,9 @@ after the temporary correction.  It does not yet claim an optical capture
 test.
 
 The receiver identifies a group by `(session, window, groupGlobal)` and keeps
-the coefficient.  It must never treat coefficient `0xF` as an ordinary file
+the coefficient. `streamOffset` carries the explicit group width (`3` or `4`),
+because basis coefficients `0x1`, `0x2`, and `0x4` are shared by both modes.
+Group-global index zero is valid for the first group. It must never treat coefficient `0xF` as an ordinary file
 record.  Once three bases and the parity are known it reconstructs the fourth
 by XOR, validates its record and CRC, then supplies only validated bases to
 the existing file reconstruction path.

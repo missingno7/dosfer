@@ -6,6 +6,7 @@ import java.util.*;
 
 public final class SessionStore {
     public enum Result { STORED, DUPLICATE, INVALID, OTHER_SESSION, CALIBRATION }
+    private enum Recovered { STORED, DUPLICATE, CONFLICT }
     public static final class Stats {
         public long session;public int window,expected,uniqueWindow,duplicates,invalid,other;
         public long uniqueTotal,totalPayload,calibrationUnique,calibrationMissed;public double decodedFps,usefulBps,avgLatencyMs;
@@ -39,8 +40,9 @@ public final class SessionStore {
         /* An end-window marker can remain visible while the user presses Reset.
            It must not claim the next empty session. A valid data frame from a
            different session may replace an empty stale session automatically. */
-        if(active==0){if(f.kind==Protocol.END_WINDOW)return Result.OTHER_SESSION;activate(f.session);}
-        if(active!=f.session){if(f.kind==Protocol.DATA&&countFrames()==0)activate(f.session);else{other++;return Result.OTHER_SESSION;}}
+        boolean planeStart=isPlaneStart(f);
+        if(active==0){if(f.kind==Protocol.END_WINDOW||!(f.kind==Protocol.DATA||planeStart)){other++;return Result.OTHER_SESSION;}activate(f.session);}
+        if(active!=f.session){if((f.kind==Protocol.DATA||planeStart)&&countFrames()==0)activate(f.session);else{other++;return Result.OTHER_SESSION;}}
         if(f.kind==Protocol.END_WINDOW){windowExpected.put(f.window,f.windowCount);return Result.STORED;}
         if(f.kind==Protocol.CHAIN_XOR){
             windowExpected.put(f.window,f.windowCount);File target=xorFile(f.globalIndex);
@@ -54,15 +56,16 @@ public final class SessionStore {
             if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverAvailable();return Result.STORED;
         }
         if(f.kind==Protocol.PLANE_CODED){
-            int coefficient=(int)f.globalIndex,basis=-1;boolean valid=coefficient==1||coefficient==2||coefficient==4||coefficient==7||coefficient==8||coefficient==15;
-            int width=(coefficient==7?3:4);
-            if(!valid||f.flags!=0||f.streamOffset!=0||f.windowIndex+width>f.windowCount||f.streamId==0){invalid++;return Result.INVALID;}
+            int coefficient=(int)f.globalIndex,basis=-1,width=(int)f.streamOffset;boolean valid=coefficient==1||coefficient==2||coefficient==4||coefficient==7||coefficient==8||coefficient==15;
+            if(!valid||f.flags!=0||(width!=3&&width!=4)||(coefficient==7&&width!=3)||(coefficient==15&&width!=4)||(coefficient==8&&width!=4)||f.windowIndex+width>f.windowCount){invalid++;return Result.INVALID;}
             if(coefficient==1)basis=0;else if(coefficient==2)basis=1;else if(coefficient==4)basis=2;else if(coefficient==8)basis=3;
             if(basis>=0)try{record=Protocol.parseRecord(trimPlaneRecord(f.payload));}catch(RuntimeException e){invalid++;return Result.INVALID;}
             windowExpected.put(f.window,f.windowCount);File target=planeFile(f.streamId,coefficient);
             if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
             if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}
-            if(basis>=0&&!storeRecovered(f,f.streamId+basis,f.windowIndex+basis,trimPlaneRecord(f.payload))){invalid++;return Result.INVALID;}
+            if(basis>=0){Recovered recovered=storeRecovered(f,f.streamId+basis,f.windowIndex+basis,trimPlaneRecord(f.payload));
+                if(recovered==Recovered.CONFLICT){invalid++;return Result.INVALID;}
+                if(recovered==Recovered.DUPLICATE){duplicates++;return Result.DUPLICATE;}}
             recoverAvailable();return Result.STORED;
         }
         if(record!=null&&record.type==Protocol.TRANSFER_END)endIndex=f.globalIndex;
@@ -91,21 +94,28 @@ public final class SessionStore {
            record, so only the record length and CRC are authoritative. */
         return Arrays.copyOf(payload,n);
     }
-    private boolean storeRecovered(Protocol.Frame chain,long index,int wi,byte[] payload) {
+    static boolean isPlaneStart(Protocol.Frame f) {
+        int width=(int)f.streamOffset;
+        if(f.kind!=Protocol.PLANE_CODED||f.flags!=0||f.globalIndex!=1||(width!=3&&width!=4)||f.windowIndex+width>f.windowCount)return false;
+        try{Protocol.parseRecord(trimPlaneRecord(f.payload));return true;}catch(RuntimeException e){return false;}
+    }
+    private Recovered storeRecovered(Protocol.Frame chain,long index,int wi,byte[] payload) {
         Protocol.Record r=Protocol.parseRecord(payload);long sid=0,off=0;
         if(r.type==Protocol.FILE_BEGIN||r.type==Protocol.FILE_DATA||r.type==Protocol.FILE_END)sid=r.fileId;
         if(r.type==Protocol.FILE_DATA){if(r.body.length<4)throw new IllegalArgumentException("file data");off=bodyU32(r.body,0);}
         byte[] raw=Protocol.encodeFrame(Protocol.DATA,Protocol.FLAG_WHITENED,chain.session,chain.window,index,wi,chain.windowCount,sid,off,payload);
-        if(!storeRaw(file(index),raw))return false;
+        File target=file(index);
+        if(target.exists())try{Protocol.Frame old=Protocol.parseFrame(readAll(target));return Arrays.equals(old.payload,payload)?Recovered.DUPLICATE:Recovered.CONFLICT;}catch(Exception e){return Recovered.CONFLICT;}
+        if(!storeRaw(target,raw))return Recovered.CONFLICT;
         windowExpected.put(chain.window,chain.windowCount);windowSeen.computeIfAbsent(chain.window,k->new BitSet()).set(wi);
         if(firstStoredNanos==0)firstStoredNanos=System.nanoTime();totalPayload+=payload.length;
-        if(r.type==Protocol.TRANSFER_END)endIndex=index;return true;
+        if(r.type==Protocol.TRANSFER_END)endIndex=index;return Recovered.STORED;
     }
     private long recoverEquation(File eq) {
         try{Protocol.Frame chain=Protocol.parseFrame(readAll(eq));if(chain.kind!=Protocol.CHAIN_XOR||chain.windowIndex+1>=chain.windowCount)return -1;
             File left=file(chain.globalIndex),right=file(chain.globalIndex+1);boolean haveLeft=left.exists(),haveRight=right.exists();if(haveLeft==haveRight)return -1;
             Protocol.Frame known=Protocol.parseFrame(readAll(haveLeft?left:right));byte[] recovered=Protocol.recoverChain(chain,known.payload,haveLeft);
-            long index=haveLeft?chain.globalIndex+1:chain.globalIndex;return storeRecovered(chain,index,haveLeft?chain.windowIndex+1:chain.windowIndex,recovered)?index:-1;
+            long index=haveLeft?chain.globalIndex+1:chain.globalIndex;return storeRecovered(chain,index,haveLeft?chain.windowIndex+1:chain.windowIndex,recovered)==Recovered.STORED?index:-1;
         }catch(Exception ignored){return -1;}
     }
     private long recoverBlockEquation(File eq) {
@@ -119,22 +129,22 @@ public final class SessionStore {
                 members[i]=known.payload;}
             if(missingCount!=1)return -1;
             byte[] recovered=Protocol.recoverBlock(parity,members,missing);long index=parity.globalIndex+missing;
-            return storeRecovered(parity,index,parity.windowIndex+missing,recovered)?index:-1;
+            return storeRecovered(parity,index,parity.windowIndex+missing,recovered)==Recovered.STORED?index:-1;
         }catch(Exception ignored){return -1;}
     }
     private long recoverPlaneEquation(File eq) {
-        try{Protocol.Frame parity=Protocol.parseFrame(readAll(eq));int[] bases=parity.globalIndex==7?new int[]{1,2,4}:parity.globalIndex==15?new int[]{1,2,4,8}:null;
-            if(parity.kind!=Protocol.PLANE_CODED||bases==null||parity.flags!=0)return -1;
+        try{Protocol.Frame parity=Protocol.parseFrame(readAll(eq));int width=(int)parity.streamOffset;int[] bases=parity.globalIndex==7?new int[]{1,2,4}:parity.globalIndex==15?new int[]{1,2,4,8}:null;
+            if(parity.kind!=Protocol.PLANE_CODED||bases==null||parity.flags!=0||(parity.globalIndex==7&&width!=3)||(parity.globalIndex==15&&width!=4)||parity.windowIndex+width>parity.windowCount)return -1;
             byte[] recovered=parity.payload;int missing=-1,missingCount=0;
             for(int i=0;i<bases.length;i++){File source=planeFile(parity.streamId,bases[i]);if(!source.exists()){missing=i;missingCount++;continue;}
                 Protocol.Frame known=Protocol.parseFrame(readAll(source));
-                if(known.kind!=Protocol.PLANE_CODED||known.session!=parity.session||known.window!=parity.window||known.streamId!=parity.streamId||known.globalIndex!=bases[i])return -1;
+                if(known.kind!=Protocol.PLANE_CODED||known.session!=parity.session||known.window!=parity.window||known.streamId!=parity.streamId||known.streamOffset!=width||known.globalIndex!=bases[i])return -1;
                 if(known.payload.length!=recovered.length)return -1;
                 for(int j=0;j<recovered.length;j++)recovered[j]^=known.payload[j];
             }
             if(missingCount!=1)return -1;
             byte[] plain=trimPlaneRecord(recovered);Protocol.parseRecord(plain);long index=parity.streamId+missing;
-            return storeRecovered(parity,index,parity.windowIndex+missing,plain)?index:-1;
+            return storeRecovered(parity,index,parity.windowIndex+missing,plain)==Recovered.STORED?index:-1;
         }catch(Exception ignored){return -1;}
     }
     private void recoverAvailable() {

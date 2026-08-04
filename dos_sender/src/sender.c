@@ -405,7 +405,7 @@ static int benchmark_plane4_parity(const Config *cfg,int *codeword_ok,
     for(bi=0;bi<4;++bi) {
         for(j=0;j<cfg->frame_payload;++j)record_body[j]=(u8)(0x31U+bi*53U+j*17U);
         for(j=0;j<cfg->frame_payload;++j)chain_payload[j]^=record_body[j];
-        rawlen=make_plane_frame(raw_frame,0x6A67C69DUL,3,700UL,0,4,
+        rawlen=make_plane_frame(raw_frame,0x6A67C69DUL,3,700UL,0,4,4,
             coeffs[bi],record_body,cfg->frame_payload);
         if(rawlen!=(u16)(FRAME_HEADER_SIZE+cfg->frame_payload) ||
            !qr_encode(raw_frame,rawlen,cfg,0))goto done;
@@ -415,7 +415,7 @@ static int benchmark_plane4_parity(const Config *cfg,int *codeword_ok,
         qrcodegen_dosferSetCodewordsOnly(1);
     }
     qrcodegen_dosferSetCodewordsOnly(0);
-    rawlen=make_plane_frame(raw_frame,0x6A67C69DUL,3,700UL,0,4,0x0F,
+    rawlen=make_plane_frame(raw_frame,0x6A67C69DUL,3,700UL,0,4,4,0x0F,
         chain_payload,cfg->frame_payload);
     if(!rawlen||!qr_encode(raw_frame,rawlen,cfg,0))goto done;
     _fmemcpy(producer.disk[1],qr_temp,cw);
@@ -453,11 +453,11 @@ static int benchmark_plane_startup_delta(const Config *cfg) {
     /* Mirror the first group: fixed 2,904-byte payloads with short records
      * at the beginning and zero padding afterwards. */
     _fmemset(record_body,0,cfg->frame_payload);for(j=0;j<48;++j)record_body[j]=(u8)(0x31+j);
-    n=make_plane_frame(raw_frame,0x6A67C69DUL,1,100,0,32,1,record_body,cfg->frame_payload);
+    n=make_plane_frame(raw_frame,0x6A67C69DUL,1,100,0,32,3,1,record_body,cfg->frame_payload);
     if(!n||!qr_encode(raw_frame,n,cfg,0)||!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,"Plane delta oracle","C1 full",0,0))return 0;
     qr_delta_ready=vga_delta_ready();
     _fmemset(record_body,0,cfg->frame_payload);for(j=0;j<48;++j)record_body[j]=(u8)(0x91+j);
-    n=make_plane_frame(raw_frame,0x6A67C69DUL,1,100,0,32,2,record_body,cfg->frame_payload);
+    n=make_plane_frame(raw_frame,0x6A67C69DUL,1,100,0,32,3,2,record_body,cfg->frame_payload);
     if(!n||!qr_encode(raw_frame,n,cfg,1)||!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,"Plane delta oracle","C2 delta",1,1))return 0;
     delta_hash=vga_screen_hash();
     if(!qr_encode(raw_frame,n,cfg,0)||!vga_show_qr_stream(qr_code,qr_temp,qr_codeword_bytes(cfg),177,1,cfg->invert,"Plane delta oracle","C2 full",1,0))return 0;
@@ -619,7 +619,7 @@ static int show_plane_symbol(const Window *w,u16 first,u8 width,u8 coefficient,
         for(k=0;k<width;++k)for(j=0;j<w->frames[first+k].payload_len;++j)record_body[j]^=w->frames[first+k].payload[j];
     }
     rawlen=make_plane_frame(raw_frame,session,w->id,base->global_index,first,w->count,
-        coefficient,record_body,cfg->frame_payload);
+        width,coefficient,record_body,cfg->frame_payload);
     if(!rawlen||!qr_encode_mask(raw_frame,rawlen,cfg,delta,qr_mask))return 0;
     sprintf(a,"PLANE%u G%u C%X",width,(unsigned)(first/width)+1,coefficient);
     sprintf(b,"Hold %u  fixed payload %u",hold_ms,cfg->frame_payload);

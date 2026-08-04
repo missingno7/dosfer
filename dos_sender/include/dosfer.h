@@ -77,7 +77,7 @@ u16 make_frame_header_crc(u8 *out, u8 kind, u16 flags, u32 session, u32 window,
                u32 stream_id, u32 stream_offset, u32 payload_crc,
                u16 payload_len);
 u16 make_plane_frame(u8 *out,u32 session,u32 window,u32 group_global,
-                     u16 group_index,u16 window_count,u8 coefficient,
+                     u16 group_index,u16 window_count,u8 group_width,u8 coefficient,
                      const u8 far *payload,u16 payload_len);
 
 #endif
