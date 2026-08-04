@@ -15,8 +15,23 @@ int vga_delta_ready(void);
 void vga_delta_stats(u16 *groups,u16 *types,int *rotation);
 u32 vga_screen_hash(void);
 int vga_display_matches(void);
-/* Store one canonical V40-L raster in a physical VGA plane, then replay it
- * through Color Plane Enable.  No QR encode/render occurs during playback. */
+/* Resident Mode-0Dh plane backend. Preparation may render and upload; once a
+ * group is resident, vga_plane_show_mask() changes registers only. */
+int vga_plane_begin(u16 *page_step);
+void vga_plane_end(void);
+int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
+                       int qr_size,int invert,u8 plane,u8 slot,int delta_only);
+int vga_plane_prepare_correction(const u8 *zero_qr,const u8 *zero_codewords,
+                                 const u8 *correction_codewords,u16 codeword_len,
+                                 int qr_size,int invert);
+int vga_plane_show_mask(u16 start,u8 mask);
+int vga_plane_apply_correction(u8 slot,u8 plane);
+int vga_plane_restore_correction(u8 slot,u8 plane);
+#ifdef DOSFER_PROFILE
+/* raster construction, upload, readback, selection+retrace, correction
+ * apply, correction restore (all in PIT ticks). */
+extern u32 dosferPlaneVgaProfileTicks[6];
+#endif
 void speaker_beep(void);
 void vga_benchmark_qr(const u8 *qr, int qr_size, int module_pixels,
                       int loops, u32 *build_ms, u32 *copy_ms, u32 *text_ms);
