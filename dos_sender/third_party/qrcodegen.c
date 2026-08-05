@@ -1138,22 +1138,9 @@ const uint8_t *qrcodegen_test_rs_step(void) { return dosferRsStep; }
 bool qrcodegen_dosferBuildMatrixV40L(const uint8_t codewords[], uint8_t qrcode[],
 		enum qrcodegen_Mask mask) {
 	if (!dosferPrepareMatrixCache(40, qrcodegen_Ecc_LOW, mask)) return false;
-#if defined(DOSFER32)
-	/* The cached XOR path bakes mask 0 into the template.  On DOSFER32 that
-	 * left late-placement codeword bits untouched (mask-only checkerboard on
-	 * the left columns).  Use the generic draw/mask path instead; the cache
-	 * is still required for delta placement tables. */
-	initializeFunctionModules(40, qrcode);
-	drawCodewords(codewords, 3706, qrcode);
-	drawLightFunctionModules(qrcode, 40);
-	initializeFunctionModules(40, dosfer32FuncTemplate);
-	applyMask(dosfer32FuncTemplate, qrcode, mask);
-	drawFormatBits(qrcodegen_Ecc_LOW, mask, qrcode);
-#else
 	DOSFER_QR_MEMCPY(qrcode, dosferFunctionTemplate,
 		(size_t)qrcodegen_BUFFER_LEN_FOR_VERSION(40));
 	dosferDrawCodewordsCached(codewords, 3706, qrcode);
-#endif
 	return true;
 }
 

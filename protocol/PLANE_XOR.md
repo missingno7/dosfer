@@ -15,10 +15,17 @@ The four basis symbols are ordinary valid `DQR1` frames of kind
 group identity; only their coefficient differs.  The parity has the same
 layout and coefficient `0xF`.  It recovers any one missing basis payload.
 
-## Phase 1: ordinary unwhitened bases
+## Group whitening
 
-The initial contract intentionally uses flags `0`.  For complete equal-length
-groups this makes
+PLANE bases carry flag bit 4 (`PLANE_WHITENED`) and use one whitening stream
+keyed by `(session, groupGlobal)`, rather than a separate stream per
+coefficient.  This removes the highly regular QR produced by short records
+followed by fixed padding while preserving the XOR equation.  PLANE3's parity
+also has bit 4 because it is an odd three-way equation.  PLANE4's `0xF` parity
+has flags `0`: the four identical basis streams cancel, so whitening it again
+would make the affine correction dense.
+
+For complete PLANE4 groups this makes
 
 ```text
 delta = parityRaw XOR rawA XOR rawB XOR rawC XOR rawD
@@ -46,10 +53,8 @@ the existing file reconstruction path.
 
 ## Whitening follow-up
 
-Normal per-frame whitening is deliberately excluded from Phase 1: an even
-four-way XOR cancels a common whitening stream and makes the parity correction
-dense.  A later revision may add coefficient-linear whitening with a new
-explicit flag after its affine and recovery tests pass.
+The Android parser reverses the group stream before record validation, and
+stores/reconstructs equations in the same dewhitened payload domain.
 
 ## Storage and timing
 

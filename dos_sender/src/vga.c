@@ -18,7 +18,9 @@ static u32 screen_bytes=80UL*480UL;
 #define QR40_DATA_BITS (QR40_CODEWORDS*8)
 static u16 far *delta_offset;
 static u8 far *delta_mask;
-static u8 delta_select[(QR40_DATA_BITS+3)/4];
+static u16 far delta_offset_storage[QR40_DATA_BITS];
+static u8 far delta_mask_storage[QR40_DATA_BITS];
+static u8 __far delta_select[(QR40_DATA_BITS+3)/4];
 static u8
 #ifdef __WATCOMC__
     __near
@@ -29,9 +31,13 @@ static u8
     __near
 #endif
     screen_320[8000];
+static u8 far *plane_zero_raster;
+static u8 far plane_zero_raster_storage[8000];
+static int plane_zero_raster_ready;
 static u16 delta_bits,delta_codewords;
 static int delta_n;
 static int prepare_delta(const u8 *codewords,u16 codeword_len,int n);
+static int reset_delta_baseline(const u8 *codewords,u16 codeword_len,int n);
 static void update_delta(const u8 *codewords,u8 far *pixels);
 #ifdef DOSFER_PROFILE
 /* render, VGA upload/setup, retrace wait, page flip, BIOS status drawing */
@@ -40,6 +46,13 @@ u32 dosferPlaneVgaProfileTicks[6];
 #endif
 
 #ifdef __WATCOMC__
+/* Far codeword/delta-map accesses can leave DS off DGROUP; near previous and
+ * selector tables require it, matching the QR RS asm contract. */
+static void dosferLoadDgroup(void);
+#pragma aux dosferLoadDgroup = \
+    "push ss" \
+    "pop ds" \
+    parm caller [];
 static u8 far *dosferFont8(void);
 #pragma aux dosferFont8 = \
     "push bp" \
@@ -54,7 +67,10 @@ static u8 far *dosferFont8(void);
 static void dosferDelta386(const u8 far *codewords,u16 len,u8 *previous,
         const u16 far *offsets,const u8 *selectors,u8 far *pixels);
 #pragma aux dosferDelta386 = \
+    "push ds" \
     "push bp" \
+    "push ss" \
+    "pop ds" \
     "movzx edx,dx" \
     "movzx ecx,cx" \
     "shl ecx,16" \
@@ -179,6 +195,7 @@ static void dosferDelta386(const u8 far *codewords,u16 len,u8 *previous,
     "jmp delta_loop" \
     "delta_done:" \
     "pop bp" \
+    "pop ds" \
     parm [es si] [cx] [di] [fs bx] [dx] [gs ax] \
     modify [ax bx cx si di];
 
@@ -188,7 +205,10 @@ static void dosferDelta386(const u8 far *codewords,u16 len,u8 *previous,
 static void dosferDelta320(const u8 far *codewords,u16 len,u8 *previous,
         const u16 far *entries,u8 far *pixels);
 #pragma aux dosferDelta320 = \
+    "push ds" \
     "push bp" \
+    "push ss" \
+    "pop ds" \
     "movzx ecx,cx" \
     "shl ecx,16" \
     "movzx edx,dx" \
@@ -320,6 +340,7 @@ static void dosferDelta320(const u8 far *codewords,u16 len,u8 *previous,
     "jnz d320_loop" \
     "d320_done:" \
     "pop bp" \
+    "pop ds" \
     parm [es si] [cx] [di] [fs bx] [gs dx] \
     modify [ax bx cx dx si di];
 
@@ -361,7 +382,10 @@ static void dosferCopyPartial320(const u8 far *src,u8 far *dest);
 static void dosferDelta320Near(const u8 far *codewords,u16 len,u8 __near *previous,
         const u16 far *offsets,const u8 far *masks);
 #pragma aux dosferDelta320Near = \
+    "push ds" \
     "push bp" \
+    "push ss" \
+    "pop ds" \
     "movzx edx,dx" \
     "test cx,cx" \
     "jnz short dn_begin" \
@@ -434,13 +458,16 @@ static void dosferDelta320Near(const u8 far *codewords,u16 len,u8 __near *previo
     "jmp dn_loop" \
     "dn_done:" \
     "pop bp" \
+    "pop ds" \
     parm [es si] [cx] [di] [fs bx] [gs dx] modify [ax bx cx dx si di];
 
 #endif
 
+#ifndef __WATCOMC__
+static void dosferLoadDgroup(void) { }
+#endif
+
 static void free_delta(void) {
-    if(delta_offset)_ffree(delta_offset);
-    if(delta_mask)_ffree(delta_mask);
     delta_offset=0;delta_mask=0;delta_bits=delta_codewords=0;delta_n=0;
 }
 
@@ -463,8 +490,10 @@ void vga_leave(void) {
     if(vga_active){bios_mode(3);bios_mode(3);vga_active=0;}
 }
 void vga_wait_retrace(void) {
-    while (inp(0x3DA)&8) ;
-    while (!(inp(0x3DA)&8)) ;
+    u32 guard=65535UL;
+    while ((inp(0x3DA)&8)&&guard--) ;
+    guard=65535UL;
+    while (!(inp(0x3DA)&8)&&guard--) ;
 }
 static void bit_set(int x,int y,int white) {
     u8 far *p=screen+(u32)y*screen_stride+(x>>3); u8 m=(u8)(0x80>>(x&7));
@@ -608,6 +637,16 @@ static void plane_palette(u8 select_mask,int parity) {
         v=v?63:0;outp(0x3C9,v);outp(0x3C9,v);outp(0x3C9,v);
     }
 }
+static void plane_attribute_palette_identity(void) {
+    /* BIOS mode setup is allowed to leave the Attribute palette mapped to
+     * arbitrary DAC entries.  Plane playback uses values 0..15 directly, so
+     * force that mapping once before installing the monochrome DAC palette. */
+    u8 i;
+    for(i=0;i<16;++i) {
+        inp(0x3DA);outp(0x3C0,i);outp(0x3C0,i);
+    }
+    inp(0x3DA);outp(0x3C0,0x20);
+}
 static void plane_palette_normal(void) {
     u8 i,v;outp(0x3C8,0);
     for(i=0;i<16;++i){v=i==15?63:0;outp(0x3C9,v);outp(0x3C9,v);outp(0x3C9,v);}
@@ -654,12 +693,17 @@ static u32 plane_hash(u8 slot,u8 plane) {
 int vga_plane_begin(u16 *page_step) {
     if(!active_320||!page_step)return 0;
     *page_step=plane_page_step();if(!*page_step)return 0;
-    plane_mode_setup(0x0F);plane_palette(0x0F,1);attribute_plane_enable(0);
+    plane_zero_raster=plane_zero_raster_storage;
+    plane_zero_raster_ready=0;
+    plane_mode_setup(0x0F);plane_attribute_palette_identity();
+    plane_palette(0x0F,1);attribute_plane_enable(0);
     return 1;
 }
 void vga_plane_end(void) {
     attribute_plane_enable(0x0F);plane_palette_normal();plane_mode_setup(0x0F);
     page_initialized[0]=page_initialized[1]=0;
+    plane_zero_raster=0;
+    plane_zero_raster_ready=0;
 }
 int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
                        int qr_size,int invert,u8 plane,u8 slot,int delta_only) {
@@ -672,7 +716,7 @@ int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
         if(!delta_offset||delta_n!=qr_size||delta_codewords!=codeword_len||screen_invert!=invert)return 0;
         update_delta(codewords,screen_320);
     } else {
-        if(!build_qr_image_320(qr,qr_size,invert)||!prepare_delta(codewords,codeword_len,qr_size))return 0;
+        if(!build_qr_image_320(qr,qr_size,invert)||!reset_delta_baseline(codewords,codeword_len,qr_size))return 0;
     }
  #ifdef DOSFER_PROFILE
     now=timer_ticks();dosferPlaneVgaProfileTicks[0]+=now-t;t=now;
@@ -690,12 +734,29 @@ int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
 }
 int vga_plane_prepare_correction(const u8 *zero_qr,const u8 *zero_codewords,
                                  const u8 *correction_codewords,u16 codeword_len,
-                                 int qr_size,int invert,u8 far *correction_raster) {
-    if(!active_320||!correction_raster||codeword_len>QR40_CODEWORDS)return 0;
-    if(!build_qr_image_320(zero_qr,qr_size,invert)||
-       !prepare_delta(zero_codewords,codeword_len,qr_size))return 0;
+                                 int qr_size,int invert,u16 far *patch_offset,
+                                 u8 far *patch_xor,u16 *patch_count) {
+    u16 i,count=0;
+    if(!active_320||!plane_zero_raster||!patch_offset||!patch_xor||!patch_count||codeword_len>QR40_CODEWORDS)return 0;
+    if(!plane_zero_raster_ready) {
+        if(!build_qr_image_320(zero_qr,qr_size,invert)||
+           !reset_delta_baseline(zero_codewords,codeword_len,qr_size))return 0;
+        _fmemcpy(plane_zero_raster,screen_320,8000);plane_zero_raster_ready=1;
+    } else {
+        _fmemcpy(screen_320,plane_zero_raster,8000);
+        if(!reset_delta_baseline(zero_codewords,codeword_len,qr_size))return 0;
+    }
     update_delta(correction_codewords,screen_320);
-    _fmemcpy(correction_raster,screen_320,8000);return 1;
+    /* Q(0) is identical for every group.  Each group retains only the byte
+       differences from it, instead of an 8 KiB full correction raster. */
+    for(i=0;i<8000;++i) {
+        u8 x=(u8)(screen_320[i]^plane_zero_raster[i]);
+        if(x) {
+            if(count>=VGA_PLANE_MAX_CORRECTION_PATCHES)return 0;
+            patch_offset[count]=i;patch_xor[count]=x;++count;
+        }
+    }
+    *patch_count=count;return 1;
 }
 int vga_plane_show_mask(u16 start,u8 mask) {
 #ifdef DOSFER_PROFILE
@@ -708,29 +769,37 @@ int vga_plane_show_mask(u16 start,u8 mask) {
 #endif
     return (attribute_plane_enable_read()&0x0F)==mask;
 }
-int vga_plane_apply_correction(u8 slot,u8 plane,const u8 far *correction_raster,
-                               u32 *restore_hash) {
+void vga_plane_blank(void) {
+    if(!active_320)return;
+    vga_wait_retrace();attribute_plane_enable(0);
+}
+int vga_plane_apply_correction(u8 slot,u8 plane,const u16 far *patch_offset,
+                               const u8 far *patch_xor,u16 patch_count,u32 *restore_hash) {
     u8 far *vram=(u8 far *)MK_FP(0xA000,0);u16 i,base=(u16)(slot<<13);
 #ifdef DOSFER_PROFILE
     u32 t=timer_ticks();
 #endif
-    if(!correction_raster||!restore_hash||plane>3||slot>7)return 0;
+    if(!plane_zero_raster||!patch_offset||!patch_xor||!restore_hash||
+       patch_count>VGA_PLANE_MAX_CORRECTION_PATCHES||plane>3||slot>7)return 0;
     *restore_hash=plane_hash(slot,plane);plane_mode_setup((u8)(1U<<plane));
-    for(i=0;i<8000;++i)vram[base+i]^=correction_raster[i];
+    for(i=0;i<8000;++i)vram[base+i]^=plane_zero_raster[i];
+    for(i=0;i<patch_count;++i)vram[base+patch_offset[i]]^=patch_xor[i];
 #ifdef DOSFER_PROFILE
     dosferPlaneVgaProfileTicks[4]+=timer_ticks()-t;
 #endif
     return 1;
 }
-int vga_plane_restore_correction(u8 slot,u8 plane,const u8 far *correction_raster,
-                                 u32 restore_hash) {
+int vga_plane_restore_correction(u8 slot,u8 plane,const u16 far *patch_offset,
+                                 const u8 far *patch_xor,u16 patch_count,u32 restore_hash) {
     u8 far *vram=(u8 far *)MK_FP(0xA000,0);u16 i,base=(u16)(slot<<13);u32 after;
 #ifdef DOSFER_PROFILE
     u32 t=timer_ticks();
 #endif
-    if(!correction_raster||plane>3||slot>7)return 0;
+    if(!plane_zero_raster||!patch_offset||!patch_xor||
+       patch_count>VGA_PLANE_MAX_CORRECTION_PATCHES||plane>3||slot>7)return 0;
     plane_mode_setup((u8)(1U<<plane));
-    for(i=0;i<8000;++i)vram[base+i]^=correction_raster[i];
+    for(i=0;i<8000;++i)vram[base+i]^=plane_zero_raster[i];
+    for(i=0;i<patch_count;++i)vram[base+patch_offset[i]]^=patch_xor[i];
     after=plane_hash(slot,plane);
 #ifdef DOSFER_PROFILE
     dosferPlaneVgaProfileTicks[5]+=timer_ticks()-t;
@@ -905,11 +974,12 @@ static int prepare_delta(const u8 *codewords,u16 codeword_len,int n) {
     int bits=qrcodegen_dosferPlacementBits(),i,bit,x,y;u16 linear,off;u8 m;
     int total=(n+8)*2,x0=(640-total)/2,y0=8,data_x=((x0+12)/8)*8,data_byte=data_x>>3,px;
     if(!bytes||!masks||bits<=0||bits!=(int)codeword_len*8)return 0;
-    free_delta();delta_offset=(u16 far *)_fmalloc((u32)bits*sizeof(u16));
-    if(active_320)delta_mask=(u8 far *)_fmalloc((u32)bits);
-    if(!delta_offset||(active_320&&!delta_mask)||bits>QR40_DATA_BITS||codeword_len>QR40_CODEWORDS){free_delta();return 0;}
-    if(!active_320)memset(delta_select,0,(size_t)(bits+3)/4);
-    for(i=0;i<bits;++i){m=masks[i];bit=0;while(((u8)1<<bit)!=m)bit++;
+    free_delta();
+    if(bits>QR40_DATA_BITS||codeword_len>QR40_CODEWORDS)return 0;
+    delta_offset=delta_offset_storage;
+    if(active_320)delta_mask=delta_mask_storage;
+    if(!active_320)_fmemset(delta_select,0,(size_t)(bits+3)/4);
+    for(i=0;i<bits;++i){m=masks[i];if(!m||(m&(u8)(m-1))) {free_delta();return 0;}for(bit=0;bit<8;++bit)if(((u8)1<<bit)==m)break;if(bit==8){free_delta();return 0;}
         linear=(u16)(((bytes[i]-1)<<3)+bit);y=linear/n;x=linear-y*n;
         if(active_320){px=(320-(n+8))/2+4+x;
             delta_offset[i]=(u16)((y+4)*40+(px>>3));delta_mask[i]=(u8)(0x80>>(px&7));
@@ -919,7 +989,18 @@ static int prepare_delta(const u8 *codewords,u16 codeword_len,int n) {
     _fmemcpy(previous_codewords,codewords,codeword_len);delta_bits=(u16)bits;
     delta_codewords=codeword_len;delta_n=n;qrcodegen_dosferReleaseMatrixCache();return 1;
 }
+/* QR placement geometry depends only on V40-L dimensions, not the frame
+ * contents.  A queued C1 needs a full RAM raster but must not rebuild this
+ * 29,648-bit placement table for every group. */
+static int reset_delta_baseline(const u8 *codewords,u16 codeword_len,int n) {
+    if(delta_offset&&delta_n==n&&delta_codewords==codeword_len&&
+       (!active_320||delta_mask)) {
+        _fmemcpy(previous_codewords,codewords,codeword_len);return 1;
+    }
+    return prepare_delta(codewords,codeword_len,n);
+}
 static void update_delta(const u8 *codewords,u8 far *pixels) {
+    dosferLoadDgroup();
     if(active_320){const u16 far *offset=delta_offset;
         const u8 far *masks=delta_mask;
         u16 i,off;
@@ -949,7 +1030,7 @@ static void update_delta(const u8 *codewords,u8 far *pixels) {
     dosferDelta386(codewords,delta_codewords,previous_codewords,delta_offset,delta_select,pixels);
 #else
     static const u8 pixel_mask[4]={0xC0,0x30,0x0C,0x03};
-    const u16 far *offset=delta_offset;const u8 *selectors=delta_select;
+    const u16 far *offset=delta_offset;const u8 __far *selectors=delta_select;
     u16 i,off;u8 changed,sel,mask;
     for(i=0;i<delta_codewords;++i,offset+=8,selectors+=2){changed=(u8)(codewords[i]^previous_codewords[i]);previous_codewords[i]=codewords[i];
         sel=selectors[0];
@@ -993,7 +1074,7 @@ int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,int n,i
 #ifdef DOSFER_PROFILE
         profile_start=timer_ticks();
 #endif
-        if(delta_only){if(!delta_offset||delta_n!=n||delta_codewords!=codeword_len||screen_invert!=invert)return 0;update_delta(codewords,screen);}
+        if(delta_only){if(!delta_offset||delta_n!=n||delta_codewords!=codeword_len||screen_invert!=invert)return 0;update_delta(codewords,screen_320);}
         else{if(!build_qr_image_320(qr,n,invert))return 0;prepare_delta(codewords,codeword_len,n);}
 #ifdef DOSFER_PROFILE
         profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;

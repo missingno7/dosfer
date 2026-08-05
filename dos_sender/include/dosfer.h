@@ -17,7 +17,11 @@ typedef unsigned long u32;
 
 enum { FK_DATA=1, FK_END_WINDOW=2, FK_CALIBRATION=3, FK_CHAIN_XOR=4,
        FK_BLOCK_XOR=5, FK_PLANE_CODED=6 };
-enum { FF_REPEATED=0x0001, FF_PAIR_WHITENED=0x0004, FF_WHITENED=0x0008 };
+enum { FF_REPEATED=0x0001, FF_PAIR_WHITENED=0x0004, FF_WHITENED=0x0008,
+       /* PLANE symbols are whitened with their shared group-global key.
+        * This preserves odd-coefficient equations; a PLANE4 0xF parity is
+        * deliberately left clear because four identical streams cancel. */
+       FF_PLANE_WHITENED=0x0010 };
 enum { RT_SESSION=1, RT_DIRECTORY=2, RT_FILE_BEGIN=3,
        RT_FILE_DATA=4, RT_FILE_END=5, RT_TRANSFER_END=6 };
 
@@ -66,21 +70,21 @@ typedef struct {
     char spool_name[13];
 } Window;
 
-u32 crc32_update(u32 crc, const void *data, u16 len);
-u32 crc32_bytes(const void *data, u16 len);
-void put_u16(u8 *p, u16 v);
-void put_u32(u8 *p, u32 v);
-u16 make_record(u8 *out, u16 out_capacity, u8 type, u32 record_id,
-                u32 file_id, const u8 *body, u16 body_len);
-u16 make_frame(u8 *out, u8 kind, u16 flags, u32 session, u32 window,
+u32 crc32_update(u32 crc, const void far *data, u16 len);
+u32 crc32_bytes(const void far *data, u16 len);
+void put_u16(u8 far *p, u16 v);
+void put_u32(u8 far *p, u32 v);
+u16 make_record(u8 far *out, u16 out_capacity, u8 type, u32 record_id,
+                u32 file_id, const u8 far *body, u16 body_len);
+u16 make_frame(u8 far *out, u8 kind, u16 flags, u32 session, u32 window,
                u32 global_index, u16 window_index, u16 window_count,
-               u32 stream_id, u32 stream_offset, const u8 *payload,
+               u32 stream_id, u32 stream_offset, const u8 far *payload,
                u16 payload_len);
-u16 make_frame_header_crc(u8 *out, u8 kind, u16 flags, u32 session, u32 window,
+u16 make_frame_header_crc(u8 far *out, u8 kind, u16 flags, u32 session, u32 window,
                u32 global_index, u16 window_index, u16 window_count,
                u32 stream_id, u32 stream_offset, u32 payload_crc,
                u16 payload_len);
-u16 make_plane_frame(u8 *out,u32 session,u32 window,u32 group_global,
+u16 make_plane_frame(u8 far *out,u32 session,u32 window,u32 group_global,
                      u16 group_index,u16 window_count,u8 group_width,u8 coefficient,
                      const u8 far *payload,u16 payload_len);
 

@@ -1,6 +1,7 @@
 #ifndef VGA_H
 #define VGA_H
 #include "dosfer.h"
+#define VGA_PLANE_MAX_CORRECTION_PATCHES 1024
 int vga_enter(void);
 void vga_use_320(int enabled);
 void vga_leave(void);
@@ -23,12 +24,16 @@ int vga_plane_store_qr(const u8 *qr,const u8 *codewords,u16 codeword_len,
                        int qr_size,int invert,u8 plane,u8 slot,int delta_only);
 int vga_plane_prepare_correction(const u8 *zero_qr,const u8 *zero_codewords,
                                  const u8 *correction_codewords,u16 codeword_len,
-                                 int qr_size,int invert,u8 far *correction_raster);
+                                 int qr_size,int invert,u16 far *patch_offset,
+                                 u8 far *patch_xor,u16 *patch_count);
 int vga_plane_show_mask(u16 start,u8 mask);
-int vga_plane_apply_correction(u8 slot,u8 plane,const u8 far *correction_raster,
-                               u32 *restore_hash);
-int vga_plane_restore_correction(u8 slot,u8 plane,const u8 far *correction_raster,
-                                 u32 restore_hash);
+/* Blank the resident-plane output before a plane is modified.  This is not a
+ * transport symbol and prevents a correction restore from being visible. */
+void vga_plane_blank(void);
+int vga_plane_apply_correction(u8 slot,u8 plane,const u16 far *patch_offset,
+                               const u8 far *patch_xor,u16 patch_count,u32 *restore_hash);
+int vga_plane_restore_correction(u8 slot,u8 plane,const u16 far *patch_offset,
+                                 const u8 far *patch_xor,u16 patch_count,u32 restore_hash);
 #ifdef DOSFER_PROFILE
 /* raster construction, upload, readback, selection+retrace, correction
  * apply, correction restore (all in PIT ticks). */

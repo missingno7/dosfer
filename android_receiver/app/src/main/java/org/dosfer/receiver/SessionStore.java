@@ -57,7 +57,8 @@ public final class SessionStore {
         }
         if(f.kind==Protocol.PLANE_CODED){
             int coefficient=(int)f.globalIndex,basis=-1,width=(int)f.streamOffset;boolean valid=coefficient==1||coefficient==2||coefficient==4||coefficient==7||coefficient==8||coefficient==15;
-            if(!valid||f.flags!=0||(width!=3&&width!=4)||(coefficient==7&&width!=3)||(coefficient==15&&width!=4)||(coefficient==8&&width!=4)||f.windowIndex+width>f.windowCount){invalid++;return Result.INVALID;}
+            boolean expectedWhitened=!(width==4&&coefficient==15);
+            if(!valid||f.flags!=(expectedWhitened?Protocol.FLAG_PLANE_WHITENED:0)||(width!=3&&width!=4)||(coefficient==7&&width!=3)||(coefficient==15&&width!=4)||(coefficient==8&&width!=4)||f.windowIndex+width>f.windowCount){invalid++;return Result.INVALID;}
             if(coefficient==1)basis=0;else if(coefficient==2)basis=1;else if(coefficient==4)basis=2;else if(coefficient==8)basis=3;
             if(basis>=0)try{record=Protocol.parseRecord(trimPlaneRecord(f.payload));}catch(RuntimeException e){invalid++;return Result.INVALID;}
             windowExpected.put(f.window,f.windowCount);File target=planeFile(f.streamId,coefficient);
@@ -96,7 +97,7 @@ public final class SessionStore {
     }
     static boolean isPlaneStart(Protocol.Frame f) {
         int width=(int)f.streamOffset;
-        if(f.kind!=Protocol.PLANE_CODED||f.flags!=0||f.globalIndex!=1||(width!=3&&width!=4)||f.windowIndex+width>f.windowCount)return false;
+        if(f.kind!=Protocol.PLANE_CODED||f.flags!=Protocol.FLAG_PLANE_WHITENED||f.globalIndex!=1||(width!=3&&width!=4)||f.windowIndex+width>f.windowCount)return false;
         try{Protocol.parseRecord(trimPlaneRecord(f.payload));return true;}catch(RuntimeException e){return false;}
     }
     private Recovered storeRecovered(Protocol.Frame chain,long index,int wi,byte[] payload) {
@@ -134,11 +135,11 @@ public final class SessionStore {
     }
     private long recoverPlaneEquation(File eq) {
         try{Protocol.Frame parity=Protocol.parseFrame(readAll(eq));int width=(int)parity.streamOffset;int[] bases=parity.globalIndex==7?new int[]{1,2,4}:parity.globalIndex==15?new int[]{1,2,4,8}:null;
-            if(parity.kind!=Protocol.PLANE_CODED||bases==null||parity.flags!=0||(parity.globalIndex==7&&width!=3)||(parity.globalIndex==15&&width!=4)||parity.windowIndex+width>parity.windowCount)return -1;
+            if(parity.kind!=Protocol.PLANE_CODED||bases==null||parity.flags!=(width==3?Protocol.FLAG_PLANE_WHITENED:0)||(parity.globalIndex==7&&width!=3)||(parity.globalIndex==15&&width!=4)||parity.windowIndex+width>parity.windowCount)return -1;
             byte[] recovered=parity.payload;int missing=-1,missingCount=0;
             for(int i=0;i<bases.length;i++){File source=planeFile(parity.streamId,bases[i]);if(!source.exists()){missing=i;missingCount++;continue;}
                 Protocol.Frame known=Protocol.parseFrame(readAll(source));
-                if(known.kind!=Protocol.PLANE_CODED||known.session!=parity.session||known.window!=parity.window||known.streamId!=parity.streamId||known.streamOffset!=width||known.globalIndex!=bases[i])return -1;
+                if(known.kind!=Protocol.PLANE_CODED||known.flags!=Protocol.FLAG_PLANE_WHITENED||known.session!=parity.session||known.window!=parity.window||known.streamId!=parity.streamId||known.streamOffset!=width||known.globalIndex!=bases[i])return -1;
                 if(known.payload.length!=recovered.length)return -1;
                 for(int j=0;j<recovered.length;j++)recovered[j]^=known.payload[j];
             }
