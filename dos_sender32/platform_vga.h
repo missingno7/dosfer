@@ -25,10 +25,10 @@ int vga32_verify(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *raste
 int vga32_xor(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *delta);
 int vga32_apply_correction(Vga32 *vga, unsigned plane, unsigned slot,
     const uint16_t *patch_offset, const uint8_t *patch_xor, uint16_t patch_count, int include_zero,
-    uint32_t *restore_hash);
+    uint32_t *restore_hash, int verify);
 int vga32_restore_correction(Vga32 *vga, unsigned plane, unsigned slot,
     const uint16_t *patch_offset, const uint8_t *patch_xor, uint16_t patch_count, int include_zero,
-    uint32_t restore_hash);
+    uint32_t restore_hash, int verify);
 uint32_t vga32_hash(Vga32 *vga, unsigned plane, unsigned slot);
 int vga32_verify_composed(Vga32 *vga, unsigned slot, unsigned mask, const uint8_t *canonical);
 void vga32_compose_raster(const uint8_t *const planes[4], unsigned mask, uint8_t *out);

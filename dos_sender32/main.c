@@ -10,7 +10,7 @@
 #include <string.h>
 #include <time.h>
 
-#define DOSFER32_BUILD_ID "dosfer32-stream-r22-overlap-tail"
+#define DOSFER32_BUILD_ID "dosfer32-stream-r23-bulk-vga"
 #define QR_SIZE 177u
 #define QR_BUFFER qrcodegen_BUFFER_LEN_FOR_VERSION(40)
 #define QR_DATA_CODEWORDS 2956u
@@ -270,21 +270,42 @@ static int prepare_status_correction(PreparedGroup *g, WorkMemory *w, Vga32 *vga
     }
     return 1;
 }
+static const uint8_t reverse4_bits[16] = {
+    0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+    0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF
+};
+static uint8_t reverse8_bits(uint8_t value) {
+    return (uint8_t)((reverse4_bits[value & 0x0Fu] << 4) |
+                     reverse4_bits[value >> 4]);
+}
 static void qr_raster_from_matrix(WorkMemory *w) {
-    unsigned my, mx, index, row_off, px;
-    uint8_t mask, *row;
+    unsigned my, mx, bit, row_off, px;
+    uint8_t *row, chunk;
     memset(w->raster, 0xFF, VGA_RASTER_BYTES);
     for (my = 0; my < QR_SIZE; ++my) {
-        index = my * QR_SIZE;
+        bit = my * QR_SIZE;
         row_off = (my + QR_QUIET) * 40u;
         row = w->raster + row_off;
-        for (mx = 0; mx < QR_SIZE; ++mx) {
-            if ((w->matrix[(index >> 3) + 1] >> (index & 7)) & 1) {
+        /* QR_X0 is deliberately bit 7 of a byte.  Eight matrix modules
+           therefore clear one bit in the first byte and seven in the next;
+           this avoids 177 divisions and matrix bit extracts per row. */
+        for (mx = 0; mx + 8u <= QR_SIZE; mx += 8u, bit += 8u) {
+            unsigned base = (bit >> 3) + 1u;
+            uint32_t packed = (uint32_t)w->matrix[base] |
+                              ((uint32_t)w->matrix[base + 1u] << 8);
+            if (base + 2u < QR_BUFFER)
+                packed |= (uint32_t)w->matrix[base + 2u] << 16;
+            chunk = (uint8_t)((packed >> (bit & 7u)) & 0xFFu);
+            px = QR_X0 + mx;
+            row[px >> 3] &= (uint8_t)~(chunk & 1u);
+            row[(px >> 3) + 1u] &= (uint8_t)~reverse8_bits((uint8_t)(chunk >> 1));
+        }
+        if (mx < QR_SIZE) {
+            chunk = (uint8_t)((w->matrix[(bit >> 3) + 1u] >> (bit & 7u)) & 1u);
+            if (chunk) {
                 px = QR_X0 + mx;
-                mask = (uint8_t)(0x80u >> (px & 7u));
-                row[px >> 3] &= (uint8_t)~mask;
+                row[px >> 3] &= (uint8_t)~(uint8_t)(0x80u >> (px & 7u));
             }
-            ++index;
         }
     }
 }
@@ -872,7 +893,7 @@ static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemo
             trace_event("correction apply begin", g->slot, mask, g->correction_plane);
             if (!vga32_apply_correction(vga, g->correction_plane, g->slot,
                     g->correction_patch_offset, g->correction_patch_xor,
-                    g->correction_patch_count, g->width == 4, &g->correction_restore_hash)) return 0;
+                    g->correction_patch_count, g->width == 4, &g->correction_restore_hash, verify)) return 0;
             g->correction_applied = 1;
             trace_event("correction apply end", g->slot, 0, g->correction_plane);
             if (verify && g->canonical_parity &&
@@ -916,8 +937,8 @@ static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemo
             if (!vga32_show_raw(vga, g->slot, 2u, !g_noretrace)) return 0;
             trace_event("parity bridge C2", g->slot, 2u, 0);            trace_event("correction restore begin", g->slot, 0, g->correction_plane);
             if (!vga32_restore_correction(vga, g->correction_plane, g->slot,
-                    g->correction_patch_offset, g->correction_patch_xor,
-                    g->correction_patch_count, g->width == 4, g->correction_restore_hash)) return 0;
+                     g->correction_patch_offset, g->correction_patch_xor,
+                     g->correction_patch_count, g->width == 4, g->correction_restore_hash, verify)) return 0;
             g->correction_applied = 0;
             trace_event("correction restore end", g->slot, 0, g->correction_plane);
             if (verify) for (unsigned p = 0; p < g->width; ++p)
