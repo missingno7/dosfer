@@ -1,7 +1,9 @@
 # Project build outputs
 /build/
 /dos_sender/build/
+/dos_sender32/build/
 /dos_sender/*.obj
+/dos_sender32/*.obj
 /dos_sender/*.err
 /dos_sender/*.map
 /*.obj

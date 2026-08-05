@@ -406,6 +406,9 @@ bool qrcodegen_dosferDeriveXor4V40L(const uint8_t encodedA[], const uint8_t enco
 bool qrcodegen_dosferHeaderCorrectionV40L(const uint8_t protocolHeaderXor[48],
 		uint8_t result[]);
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[], uint8_t result[]);
+bool qrcodegen_dosferBuildMatrixV40L(const uint8_t codewords[], uint8_t qrcode[],
+		enum qrcodegen_Mask mask);
+uint32_t qrcodegen_dosferStateHash(void);
 
 
 #ifdef __cplusplus
