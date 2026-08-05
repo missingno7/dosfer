@@ -411,6 +411,17 @@ bool qrcodegen_dosferBuildMatrixV40L(const uint8_t codewords[], uint8_t qrcode[]
 uint32_t qrcodegen_dosferStateHash(void);
 
 
+#ifdef DOSFER_RS30_TEST
+#include <stdio.h>
+#include <stdint.h>
+int qrcodegen_dosferRs30SelfTest(void);
+void qrcodegen_dosferRs30SetAsm(int enabled);
+#endif
+#ifdef DOSFER_RS30_HOST
+void qrcodegen_test_prepare_rs30(void);
+const uint8_t *qrcodegen_test_rs_step(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

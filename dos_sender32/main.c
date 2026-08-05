@@ -2,6 +2,7 @@
 #include "protocol32.h"
 #include "qrcodegen.h"
 #include <conio.h>
+#include <direct.h>
 #include <dos.h>
 #include <malloc.h>
 #include <stdio.h>
@@ -18,6 +19,8 @@
 #define MAX_WINDOW32 128u
 #define HOLD_DEFAULT 100u
 #define DISK_RING_BYTES 32768u
+#define QR_QUIET 4u
+#define QR_X0 ((320u - (QR_SIZE + 2u * QR_QUIET)) / 2u + QR_QUIET)
 
 enum { SLOT_FREE, SLOT_FILLING, SLOT_READY, SLOT_PLAYING };
 
@@ -53,12 +56,22 @@ typedef struct {
     uint32_t prepared, prepare_ticks, starvation, gap_ticks;
 } PlaneQueue;
 
-typedef struct { unsigned width, window, hold, focus, verify; const char *path; } Options;
+typedef struct {
+    unsigned width, window, hold, focus, verify, dump, dump_exit, dump_groups;
+    const char *path, *dump_dir;
+} Options;
+
+typedef struct {
+    int active;
+    unsigned groups_limit, groups_done;
+    char dir[64];
+    FILE *meta;
+} DumpState;
+
+static DumpState g_dump;
 typedef struct { uint32_t qr_ticks, encode_ticks, delta_ticks, matrix_ticks, upload_ticks, correction_ticks, select_ticks, hold_ticks; } Metrics;
 static Metrics metrics;
 static FILE *trace_file;
-static uint8_t reverse_bits[256];
-static int reverse_bits_ready;
 
 static void trace_event(const char *event, unsigned slot, unsigned before, unsigned plane) {
     if (!trace_file) return;
@@ -69,46 +82,98 @@ static void trace_event(const char *event, unsigned slot, unsigned before, unsig
 static uint32_t now_ticks(void) { return (uint32_t)clock(); }
 static uint32_t ticks_ms(uint32_t t) { return (t * 1000UL) / (uint32_t)CLOCKS_PER_SEC; }
 
-static void qr_raster_from_matrix(WorkMemory *w) {
-    unsigned i, y;
-    if (!reverse_bits_ready) {
-        for (i = 0; i < 256u; ++i) {
-            uint8_t v = (uint8_t)i, r = 0; unsigned b;
-            for (b = 0; b < 8u; ++b) { r = (uint8_t)((r << 1) | (v & 1u)); v >>= 1; }
-            reverse_bits[i] = r;
-        }
-        reverse_bits_ready = 1;
+static int dump_write_bin(const char *name, const uint8_t *data, unsigned len) {
+    char path[80];
+    FILE *f;
+    if (!g_dump.active) return 0;
+    sprintf(path, "%s\\%s", g_dump.dir, name);
+    f = fopen(path, "wb");
+    if (!f) return 0;
+    if (fwrite(data, 1, len, f) != len) { fclose(f); return 0; }
+    fclose(f);
+    return 1;
+}
+
+static int dump_begin(const char *dir, unsigned groups_limit) {
+    char path[80];
+    memset(&g_dump, 0, sizeof(g_dump));
+    strncpy(g_dump.dir, dir, sizeof(g_dump.dir) - 1u);
+    g_dump.dir[sizeof(g_dump.dir) - 1u] = '\0';
+    _mkdir(g_dump.dir);
+    sprintf(path, "%s\\D32META.TXT", g_dump.dir);
+    g_dump.meta = fopen(path, "wt");
+    if (!g_dump.meta) return 0;
+    fprintf(g_dump.meta, "build=%s\nqr_size=%u qr_x0=%u raster=%u\n",
+            DOSFER32_BUILD_ID, QR_SIZE, QR_X0, VGA_RASTER_BYTES);
+    fflush(g_dump.meta);
+    g_dump.active = 1;
+    g_dump.groups_limit = groups_limit ? groups_limit : 1u;
+    return 1;
+}
+
+static void dump_end(void) {
+    if (g_dump.meta) { fclose(g_dump.meta); g_dump.meta = 0; }
+    g_dump.active = 0;
+}
+
+static void dump_prepare_plane(unsigned group, unsigned plane, const uint8_t *raster,
+                               const uint8_t *codewords, const uint8_t *matrix) {
+    char name[16];
+    if (!g_dump.active || group >= g_dump.groups_limit) return;
+    sprintf(name, "G%03uT%u.RAW", group, plane);
+    dump_write_bin(name, raster, VGA_RASTER_BYTES);
+    sprintf(name, "G%03uCW%u.BIN", group, plane);
+    dump_write_bin(name, codewords, QR_CODEWORDS);
+    if (plane == 0u && matrix) {
+        sprintf(name, "G%03uMX.BIN", group);
+        dump_write_bin(name, matrix, (unsigned)QR_BUFFER);
     }
+}
+
+static void dump_symbol(unsigned group, unsigned symbol, uint8_t mask, unsigned slot,
+                        Vga32 *vga, int correction) {
+    uint8_t *buf, *planes[4], composed[VGA_RASTER_BYTES];
+    char name[16];
+    unsigned p;
+    if (!g_dump.active || group >= g_dump.groups_limit) return;
+    buf = (uint8_t *)malloc(VGA_RASTER_BYTES * 4u);
+    if (!buf) return;
+    for (p = 0; p < 4u; ++p) planes[p] = buf + (size_t)p * VGA_RASTER_BYTES;
+    if (!vga32_read_planes(vga, slot, planes)) { free(buf); return; }
+    if (symbol == 0u) {
+        for (p = 0; p < 4u; ++p) {
+            sprintf(name, "G%03uV%u.RAW", group, p);
+            dump_write_bin(name, planes[p], VGA_RASTER_BYTES);
+        }
+    }
+    vga32_compose_raster((const uint8_t *const *)planes, mask, composed);
+    sprintf(name, "G%03uS%u.RAW", group, symbol);
+    dump_write_bin(name, composed, VGA_RASTER_BYTES);
+    if (g_dump.meta) {
+        fprintf(g_dump.meta, "group=%u sym=%u mask=%02X slot=%u correction=%d file=%s\n",
+                group, symbol, (unsigned)mask, slot, correction, name);
+        fflush(g_dump.meta);
+    }
+    free(buf);
+}
+
+static void qr_raster_from_matrix(WorkMemory *w) {
+    unsigned x, y, i;
     memset(w->raster, 0, VGA_RASTER_BYTES);
-    /* Matrix bits are LSB-first over one contiguous 177x177 stream (rows are
-       not byte aligned); VGA raster bytes are MSB-first and the QR starts at
-       pixel (4,4). Read each 8-module chunk at its actual bit offset, reverse
-       it, then shift it across the four-pixel horizontal offset. */
     for (y = 0; y < QR_SIZE; ++y) {
-        uint8_t *dst = w->raster + (y + 4u) * 40u + 8u;
-        for (i = 0; i < 23u; ++i) {
-            unsigned bit = y * QR_SIZE + i * 8u;
-            const uint8_t *src = w->matrix + 1u + (bit >> 3);
-            unsigned shift = bit & 7u;
-            uint32_t packed = (uint32_t)src[0] | ((uint32_t)src[1] << 8) |
-                ((uint32_t)src[2] << 16);
-            uint8_t v = (uint8_t)(packed >> shift);
-            if (i == 22u) v &= 1u;
-            v = reverse_bits[v];
-            if (i == 0u) {
-                dst[0] |= (uint8_t)(v >> 3);
-                dst[1] |= (uint8_t)((v & 0x07) << 5);
-            } else {
-                dst[i] |= (uint8_t)(v >> 4);
-                dst[i + 1u] |= (uint8_t)(v << 4);
-            }
+        uint8_t *dst = w->raster + (y + QR_QUIET) * 40u;
+        for (x = 0; x < QR_SIZE; ++x) {
+            unsigned px;
+            if (!qrcodegen_getModule(w->matrix, (int)x, (int)y)) continue;
+            px = QR_X0 + x;
+            dst[px >> 3] |= (uint8_t)(0x80u >> (px & 7u));
         }
     }
     /* The fixed odd-parity palette maps a set plane bit to white and a clear
-       bit to black.  qrcodegen marks dark modules with 1, so the temporary
-       raster above is the photographic inverse of a normal QR (white field,
-       black modules).  Invert the complete raster before it reaches VGA;
-       Android's fast decoder deliberately does not enable inverted-QRs. */
+     * bit to black.  qrcodegen marks dark modules with 1, so the temporary
+     * raster above is the photographic inverse of a normal QR (white field,
+     * black modules).  Invert the complete raster before it reaches VGA;
+     * Android's fast decoder deliberately does not enable inverted-QRs. */
     for (i = 0; i < VGA_RASTER_BYTES; ++i) w->raster[i] = (uint8_t)~w->raster[i];
 }
 
@@ -124,8 +189,9 @@ static int qr_prepare_delta_map(WorkMemory *w) {
         if (bit >= 8) return 0;
         linear = ((unsigned)bytes[i] - 1u) * 8u + (unsigned)bit;
         y = (int)(linear / QR_SIZE); x = (int)(linear % QR_SIZE);
-        off = (unsigned)(y + 4) * 40u + (unsigned)((x + 4) >> 3);
-        w->delta_entries[i] = (uint32_t)off | ((uint32_t)(0x80u >> ((x + 4) & 7)) << 16);
+        { unsigned px = QR_X0 + (unsigned)x;
+          off = (unsigned)(y + QR_QUIET) * 40u + (px >> 3);
+          w->delta_entries[i] = (uint32_t)off | ((uint32_t)(0x80u >> (px & 7)) << 16); }
     }
     memcpy(w->previous_codewords, w->codewords, QR_CODEWORDS);
     w->delta_ready = 1;
@@ -417,6 +483,9 @@ static int prepare_group(PlaneQueue *q, RecordStream *s, WorkMemory *w, Vga32 *v
           if (!vga32_store_fast(vga, p, g->slot, w->raster)) return 0;
           if (verify && !vga32_verify(vga, p, g->slot, w->raster)) return 0;
           metrics.upload_ticks += now_ticks() - a; }
+        if (g_dump.active && g_dump.groups_done < g_dump.groups_limit)
+            dump_prepare_plane(g_dump.groups_done, p, w->raster, w->codewords,
+                               p == 0u ? w->matrix : 0);
         g->basis_hash[p] = verify ? vga32_hash(vga, p, g->slot) : 0;
         for (i = 0; i < VGA_RASTER_BYTES; ++i) w->xor_raster[i] ^= w->raster[i];
     }
@@ -447,7 +516,7 @@ static int prepare_group(PlaneQueue *q, RecordStream *s, WorkMemory *w, Vga32 *v
 
 static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemory *w,
                       Vga32 *vga, unsigned width, unsigned window, unsigned hold,
-                      int focus, int verify) {
+                      int focus, int verify, int dump_group) {
     unsigned symbol, count = g->width + 1u, correction_plane = 0u; uint32_t deadline, start;
     g->state = SLOT_PLAYING; --q->ready;
     for (symbol = 0; symbol < count; ++symbol) {
@@ -461,6 +530,9 @@ static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemo
             trace_event("parity show", g->slot, 0, correction_plane);
         }
         { uint32_t a = now_ticks(); if (!vga32_show(vga, g->slot, mask)) return 0; metrics.select_ticks += now_ticks() - a; }
+        if (g_dump.active && dump_group < (int)g_dump.groups_limit)
+            dump_symbol((unsigned)dump_group, symbol, mask, g->slot, vga,
+                        g->correction_applied && mask == (uint8_t)((1u << g->width) - 1u));
         trace_event("symbol show", g->slot, mask, correction_plane);
         if (symbol == 0 && focus) {
             int key;
@@ -518,10 +590,15 @@ static int show_tail(RecordStream *s, WorkMemory *w, Vga32 *vga, unsigned window
     return 1;
 }
 
-static void usage(void) { puts("DOSFER32 file [/RE:PLANE3|/RE:PLANE4] [/WINDOW:n] [/HOLD:ms] [/VERIFY]"); }
+static void usage(void) {
+    puts("DOSFER32 file [/RE:PLANE3|/RE:PLANE4] [/WINDOW:n] [/HOLD:ms]");
+    puts("  [/NOFOCUS] [/VERIFY] [/DUMP[:dir]] [/DUMPGROUPS:n] [/DUMPEXIT]");
+}
 
 static void options(int argc, char **argv, Options *o) {
-    int i; o->width = 4; o->window = 32; o->hold = HOLD_DEFAULT; o->focus = 1; o->verify = 0; o->path = 0;
+    int i;
+    o->width = 4; o->window = 32; o->hold = HOLD_DEFAULT; o->focus = 1; o->verify = 0;
+    o->dump = 0; o->dump_exit = 0; o->dump_groups = 1; o->path = 0; o->dump_dir = "D32DUMP";
     for (i = 1; i < argc; ++i) {
         if (!strnicmp(argv[i], "/RE:PLANE3", 10)) o->width = 3;
         else if (!strnicmp(argv[i], "/RE:PLANE4", 10)) o->width = 4;
@@ -529,9 +606,14 @@ static void options(int argc, char **argv, Options *o) {
         else if (!strnicmp(argv[i], "/HOLD:", 6)) o->hold = (unsigned)atoi(argv[i] + 6);
         else if (!stricmp(argv[i], "/NOFOCUS")) o->focus = 0;
         else if (!stricmp(argv[i], "/VERIFY")) o->verify = 1;
+        else if (!stricmp(argv[i], "/DUMP")) o->dump = 1;
+        else if (!strnicmp(argv[i], "/DUMP:", 6)) { o->dump = 1; o->dump_dir = argv[i] + 6; }
+        else if (!strnicmp(argv[i], "/DUMPGROUPS:", 12)) o->dump_groups = (unsigned)atoi(argv[i] + 12);
+        else if (!stricmp(argv[i], "/DUMPEXIT")) o->dump_exit = 1;
         else if (argv[i][0] != '/') o->path = argv[i];
     }
     if (o->window < 4) o->window = 4; if (o->window > MAX_WINDOW32) o->window = MAX_WINDOW32;
+    if (!o->dump_groups) o->dump_groups = 1;
 }
 
 static void report_profile(const PlaneQueue *q, int completed, unsigned width, uint32_t useful_bytes) {
@@ -566,6 +648,11 @@ int main(int argc, char **argv) {
     session = (uint32_t)time(0) ^ 0xD05F3201UL; if (!session) session = 1;
     printf("DOSFER32 %s (Open Watcom + DOS/4GW)\n", DOSFER32_BUILD_ID);
     printf("Mode: PLANE%u  window=%u  hold=%u ms\n", o.width, o.window, o.hold);
+    if (o.dump) {
+        if (!dump_begin(o.dump_dir, o.dump_groups)) { puts("DOSFER32: dump directory open failed"); return 2; }
+        printf("Dump: %s  groups=%u%s\n", g_dump.dir, g_dump.groups_limit, o.dump_exit ? "  exit-after-dump" : "");
+        o.focus = 0;
+    }
     w = (WorkMemory *)calloc(1, sizeof(*w)); q = (PlaneQueue *)calloc(1, sizeof(*q)); memset(&vga, 0, sizeof(vga));
     if (!w || !q) { puts("DOSFER32: workspace allocation failed"); free(w); free(q); return 2; }
     w->input = (uint8_t *)malloc(QR_DATA_CODEWORDS); w->codewords = (uint8_t *)malloc(QR_CODEWORDS);
@@ -596,7 +683,19 @@ int main(int argc, char **argv) {
     rc = 1;
     while (q->ready) {
         PreparedGroup *g = &q->slots[q->head];
-        start = now_ticks(); rc = show_group(q, g, &stream, w, &vga, o.width, o.window, o.hold, first_group && o.focus, o.verify); first_group = 0; if (rc <= 0) break;
+        int dump_group = g_dump.active ? (int)g_dump.groups_done : -1;
+        start = now_ticks();
+        rc = show_group(q, g, &stream, w, &vga, o.width, o.window, o.hold,
+                        first_group && o.focus, o.verify, dump_group);
+        first_group = 0;
+        if (g_dump.active) {
+            ++g_dump.groups_done;
+            if (o.dump_exit || g_dump.groups_done >= g_dump.groups_limit) {
+                rc = -2;
+                break;
+            }
+        }
+        if (rc <= 0) break;
         q->head = (uint8_t)((q->head + 1u) & 7u);
         if (!q->ready && stream.global + o.width <= stream.total_records &&
             (stream.global % o.window) + o.width <= window_count(&stream, stream.global, o.window)) ++q->starvation;
@@ -609,10 +708,12 @@ int main(int argc, char **argv) {
     if (rc > 0) completed = 1;
     stream_close(&stream);
 done:
+    dump_end();
     vga32_leave(&vga);
     report_profile(q, completed, o.width, stream.file_size);
     if (completed) puts("DOSFER32 transfer complete");
     if (q) for (i = 0; i < SLOT_COUNT; ++i) { free(q->slots[i].correction); free(q->slots[i].canonical_parity); }
     if (w) { for (i = 0; i < 4; ++i) free(w->records[i]); free(w->input); free(w->codewords); free(w->basis_codewords); free(w->zero_codewords); free(w->previous_codewords); free(w->delta_entries); free(w->matrix); free(w->raster); free(w->wire); free(w->header_xor); free(w->parity); free(w->xor_raster); free(w->body); free(w->disk_ring); }
-    free(q); free(w); if (trace_file) { fclose(trace_file); trace_file = 0; } return rc < 0 ? 1 : rc;
+    free(q); free(w); if (trace_file) { fclose(trace_file); trace_file = 0; }
+    return rc == -2 ? 0 : (rc < 0 ? 1 : rc);
 }

@@ -22,6 +22,8 @@ int vga32_verify(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *raste
 int vga32_xor(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *delta);
 uint32_t vga32_hash(Vga32 *vga, unsigned plane, unsigned slot);
 int vga32_verify_composed(Vga32 *vga, unsigned slot, unsigned mask, const uint8_t *canonical);
+void vga32_compose_raster(const uint8_t *const planes[4], unsigned mask, uint8_t *out);
+int vga32_read_planes(Vga32 *vga, unsigned slot, uint8_t *plane_out[4]);
 void vga32_wait_retrace(void);
 
 #endif

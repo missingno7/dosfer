@@ -205,3 +205,29 @@ int vga32_show(Vga32 *vga, unsigned slot, unsigned mask) {
     attribute_plane_mask((uint8_t)mask);
     return 1;
 }
+
+void vga32_compose_raster(const uint8_t *const planes[4], unsigned mask, uint8_t *out) {
+    unsigned i, plane;
+    if (!planes || !out || !mask || mask > 15) return;
+    for (i = 0; i < VGA_RASTER_BYTES; ++i) {
+        uint8_t value = 0;
+        for (plane = 0; plane < 4; ++plane)
+            if (mask & (1u << plane)) value ^= planes[plane][i];
+        out[i] = value;
+    }
+}
+
+int vga32_read_planes(Vga32 *vga, unsigned slot, uint8_t *plane_out[4]) {
+    uint16_t offset;
+    unsigned plane, i;
+    if (!vga || !vga->active || slot > 7 || !plane_out) return 0;
+    offset = (uint16_t)(slot * VGA_SLOT_BYTES);
+    for (plane = 0; plane < 4; ++plane) {
+        if (!plane_out[plane]) return 0;
+        outp(0x3CE, 4); outp(0x3CF, (uint8_t)plane);
+        for (i = 0; i < VGA_RASTER_BYTES; ++i)
+            plane_out[plane][i] = vga_memory[offset + i];
+    }
+    outp(0x3CE, 4); outp(0x3CF, 0);
+    return 1;
+}
