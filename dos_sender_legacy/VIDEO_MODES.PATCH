@@ -1,0 +1,251 @@
+--- /mnt/data/dos_sender_legacy_unpacked/dos_sender_legacy/include/dosfer.h	2026-08-06 12:00:26.000000000 +0000
++++ /mnt/data/dos_sender_legacy_work/dos_sender_legacy/include/dosfer.h	2026-08-06 19:19:03.369841040 +0000
+@@ -21,6 +21,8 @@
+ enum { RT_SESSION=1, RT_DIRECTORY=2, RT_FILE_BEGIN=3,
+        RT_FILE_DATA=4, RT_FILE_END=5, RT_TRANSFER_END=6 };
+ 
++enum { VIDEO_320_60=0, VIDEO_320_70=1, VIDEO_640_60=2 };
++
+ typedef struct {
+     u8 qr_version;
+     u8 ecc;              /* 0=L, 1=M, 2=Q, 3=H */
+@@ -33,6 +35,7 @@
+     u8 speaker;
+     u8 redundancy;       /* 0=none, otherwise DATA frames per block parity */
+     u8 chain_width;      /* 0=block parity, otherwise even overlap width */
++    u8 video_mode;       /* VIDEO_320_60, VIDEO_320_70 or VIDEO_640_60 */
+ } Config;
+ 
+ typedef struct {
+--- /mnt/data/dos_sender_legacy_unpacked/dos_sender_legacy/include/vga.h	2026-08-06 12:00:26.000000000 +0000
++++ /mnt/data/dos_sender_legacy_work/dos_sender_legacy/include/vga.h	2026-08-06 19:19:03.370091371 +0000
+@@ -2,7 +2,7 @@
+ #define VGA_H
+ #include "dosfer.h"
+ int vga_enter(void);
+-void vga_use_320(int enabled);
++void vga_set_video_mode(int mode);
+ void vga_leave(void);
+ void vga_wait_retrace(void);
+ int vga_show_qr(const u8 *qr, int qr_size, int module_pixels, int invert,
+--- /mnt/data/dos_sender_legacy_unpacked/dos_sender_legacy/src/sender.c	2026-08-06 12:00:26.000000000 +0000
++++ /mnt/data/dos_sender_legacy_work/dos_sender_legacy/src/sender.c	2026-08-06 19:21:04.760698788 +0000
+@@ -121,10 +121,16 @@
+         return 0;
+     }
+     total=(modules+8)*cfg->module_pixels;
+-    if(cfg->qr_version==40&&cfg->module_pixels==1) {
+-        if(total>192){puts("QR does not fit the 320x200 transfer layout.");return 0;}
+-    } else if(total>440) {
+-        puts("QR does not fit the 640x480 transfer layout; reduce /SCALE.");return 0;
++    if(cfg->video_mode==VIDEO_320_60||cfg->video_mode==VIDEO_320_70) {
++        if(cfg->module_pixels!=1||total>192){
++            puts("Selected /VIDEO:320_60 or /VIDEO:320_70 requires /SCALE:1 and a QR fitting the 320x200 layout.");
++            puts("Use /VIDEO:640_60 for larger or scaled QR codes.");
++            return 0;
++        }
++    } else if(cfg->video_mode==VIDEO_640_60) {
++        if(total>440){puts("QR does not fit the 640x480 transfer layout; reduce /SCALE.");return 0;}
++    } else {
++        puts("Invalid video mode.");return 0;
+     }
+     return 1;
+ }
+@@ -137,6 +143,7 @@
+     memset(c,0,sizeof(*c)); c->qr_version=40; c->ecc=0; c->module_pixels=1;
+     c->repetitions=1; c->frame_payload=2904; c->hold_ms=0;
+     c->window_frames=32; c->speaker=1;c->redundancy=7;c->chain_width=0;
++    c->video_mode=VIDEO_320_60;
+ }
+ static u16 redundancy_group(const Config *c) {
+     return c->chain_width?0:c->redundancy;
+@@ -148,6 +155,11 @@
+     else strcpy(name,"OFF");
+     return name;
+ }
++static const char *video_name(const Config *c) {
++    if(c->video_mode==VIDEO_320_60)return "320_60";
++    if(c->video_mode==VIDEO_320_70)return "320_70";
++    return "640_60";
++}
+ static const char *base_name(const char *p) {
+     const char *b=p,*q;
+     for(q=p;*q;++q) if(*q=='\\' || *q=='/' || *q==':') b=q+1;
+@@ -582,7 +594,7 @@
+ static int run_transfer(FILE *mf,Config *cfg) {
+     u32 session=(timer_ticks()^(u32)time(NULL)^selected_bytes)|1UL,window_id=0;
+     int key,have_selection=0;u16 chosen=0,rescue_round=0;u8 selected[MAX_WINDOW];char line[80];
+-    vga_use_320(cfg->qr_version==40&&cfg->module_pixels==1);producer_open(mf);if(!fill_window(&current_window,cfg,session,window_id))return 0;
++    vga_set_video_mode(cfg->video_mode);producer_open(mf);if(!fill_window(&current_window,cfg,session,window_id))return 0;
+     /* Reserve the next window before entering graphics mode. This prevents a
+        large /WINDOW setting from failing only after the first batch is sent. */
+     if(!producer.finished&&!reserve_window(&previous_window,cfg))return 0;
+@@ -635,7 +647,7 @@
+ static int calibration(Config *cfg) {
+     u32 session=(timer_ticks()^(u32)time(NULL))|1UL,seq=0;u16 key,n,i;u8 ascii,scan;
+     u8 payload[256];char a[79],b[79];
+-    vga_use_320(cfg->qr_version==40&&cfg->module_pixels==1);if(!vga_enter())return 0;
++    vga_set_video_mode(cfg->video_mode);if(!vga_enter())return 0;
+     for(;;){
+         n=cfg->frame_payload;if(n>sizeof(payload))n=sizeof(payload);
+         memcpy(payload,"CAL1",4);put_u32(payload+4,seq);put_u16(payload+8,cfg->hold_ms);
+@@ -643,8 +655,8 @@
+         n=make_frame(raw_frame,FK_CALIBRATION,0,session,0,seq,(u16)(seq&0xFFFF),100,
+             0,0,payload,n);
+         if(!qr_encode(raw_frame,n,cfg,0)){cfg->frame_payload-=16;continue;}
+-        sprintf(a,"CALIBRATION v%u %c scale %u payload %u hold %u ms",
+-            cfg->qr_version,"LMQH"[cfg->ecc],cfg->module_pixels,cfg->frame_payload,cfg->hold_ms);
++        sprintf(a,"CAL v%u%c scale %u video %s payload %u hold %u",
++            cfg->qr_version,"LMQH"[cfg->ecc],cfg->module_pixels,video_name(cfg),cfg->frame_payload,cfg->hold_ms);
+         strcpy(b,"+/- hold  I invert  Esc done");
+         vga_show_qr(qr_code,qrcodegen_getSize(qr_code),cfg->module_pixels,cfg->invert,a,b,(int)(seq&1));
+         timer_wait_ms(cfg->hold_ms);seq++;
+@@ -665,7 +677,7 @@
+     t0=timer_ticks();timer_wait_ms(100);t1=timer_ticks();
+     printf("PIT pacing self-test: requested 100 ms, measured %lu ms\n",
+         timer_elapsed_ms(t0,t1));
+-    vga_use_320(cfg->qr_version==40&&cfg->module_pixels==1);f=fopen(path,"rb");if(!f){printf("Cannot open %s\n",path);return;}
++    vga_set_video_mode(cfg->video_mode);f=fopen(path,"rb");if(!f){printf("Cannot open %s\n",path);return;}
+     t0=timer_ticks();while((n=(u16)fread(b,1,sizeof(b),f))!=0){crc=crc32_update(crc,b,n);bytes+=n;}t1=timer_ticks();fclose(f);
+     printf("Disk+CRC: %lu bytes in %lu ms = %lu B/s, CRC %08lX\n",bytes,timer_elapsed_ms(t0,t1),timer_elapsed_ms(t0,t1)?bytes*1000UL/timer_elapsed_ms(t0,t1):0,crc);
+     memset(b,0,16);make_frame(raw_frame,FK_DATA,FF_WHITENED,0x6A67C69DUL,0,4,4,32,1,4510,b,16);
+@@ -923,9 +935,17 @@
+     if(*end||v<0||v>MAX_WINDOW)return -1;
+     cfg->redundancy=(u8)v;cfg->chain_width=0;return 1;
+ }
++static int video_value(Config *cfg,const char *p) {
++    if(!p||!*p)return -1;
++    if(!stricmp(p,"320_60")||!stricmp(p,"320X200_60")||!stricmp(p,"320-60")){cfg->video_mode=VIDEO_320_60;return 1;}
++    if(!stricmp(p,"320_70")||!stricmp(p,"320X200_70")||!stricmp(p,"320-70")){cfg->video_mode=VIDEO_320_70;return 1;}
++    if(!stricmp(p,"640_60")||!stricmp(p,"640X480_60")||!stricmp(p,"640-60")){cfg->video_mode=VIDEO_640_60;return 1;}
++    return -1;
++}
+ static int config_option(Config *cfg,const char *arg) {
+     long v;int rc;const char *p;
+     p=option_value(arg,"RE");if(p)return redundancy_value(cfg,p);
++    p=option_value(arg,"VIDEO");if(p)return video_value(cfg,p);
+     rc=option_number(arg,"V","VERSION",5,40,&v);if(rc){if(rc>0)cfg->qr_version=(u8)v;return rc;}
+     p=option_value(arg,"ECC");if(p){char *e;if(p[1])return -1;e=strchr("LMQH",toupper(p[0]));if(!e)return -1;cfg->ecc=(u8)(e-"LMQH");return 1;}
+     rc=option_number(arg,"SCALE",0,1,6,&v);if(rc){if(rc>0)cfg->module_pixels=(u8)v;return rc;}
+@@ -944,16 +964,20 @@
+ static int split_re_option(const char *arg) {
+     return !stricmp(arg,"/RE")||!stricmp(arg,"-RE");
+ }
++static int split_video_option(const char *arg) {
++    return !stricmp(arg,"/VIDEO")||!stricmp(arg,"-VIDEO");
++}
+ static void usage(const Config *cfg) {
+     puts("DOSfer 1.3 - optical DOS-to-Android file transfer");
+     puts("DOSFER [options] file_or_directory [more paths ...]");
+     puts("DOSFER /CAL [options]");
+     puts("DOSFER /BENCH file [options]");
+     puts("");
+-    puts("Default: V40-L, 320x200, 2904-byte payload, hold 0, window 32, /RE:7");
++    puts("Default: V40-L, /VIDEO:320_60, 2904-byte payload, hold 0, window 32, /RE:7");
+     puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 7)");
+     puts("/RE:Ck or /RE Ck      Even chain width C2..C64; k/2 must be < window");
+     puts("/ANCHOR:n            Repeat each nth data frame in chain mode; 0 disables");
++    puts("/VIDEO:name or /VIDEO name  320_60, 320_70 or 640_60 (default 320_60)");
+     puts("Advanced diagnostics: /V:n /ECC:L|M|Q|H /SCALE:n /PAYLOAD:n");
+     puts("/HOLD:ms or /SPEED:ms  Minimum frame hold 0..60000 ms");
+     puts("/WINDOW:n or /W:n    Frames per acknowledged batch 4..64");
+@@ -961,9 +985,9 @@
+     puts("/MASK:n              Fixed QR mask 0..7 (default 0; payload is whitened)");
+     puts("/INVERT /NOINVERT    Select black/white polarity");
+     puts("/BEEP /NOBEEP        End-of-batch sound");
+-    printf("Current: /V:%u /ECC:%c /SCALE:%u /PAYLOAD:%u /HOLD:%u /WINDOW:%u /REPEAT:%u /MASK:%u /RE:%s %s %s\n",
++    printf("Current: /V:%u /ECC:%c /SCALE:%u /PAYLOAD:%u /HOLD:%u /WINDOW:%u /REPEAT:%u /MASK:%u /RE:%s /VIDEO:%s %s %s\n",
+         cfg->qr_version,"LMQH"[cfg->ecc],cfg->module_pixels,cfg->frame_payload,
+-        cfg->hold_ms,cfg->window_frames,cfg->repetitions,qr_mask,redundancy_name(cfg),
++        cfg->hold_ms,cfg->window_frames,cfg->repetitions,qr_mask,redundancy_name(cfg),video_name(cfg),
+         cfg->invert?"/INVERT":"/NOINVERT",cfg->speaker?"/BEEP":"/NOBEEP");
+     puts("Example: DOSFER /HOLD:0 /W:32 /RE:C8 FILE.ZIP");
+     puts("The first QR waits for Enter so you can focus the camera; Esc cancels.");
+@@ -982,6 +1006,10 @@
+             if(i+1>=argc||redundancy_value(&cfg,argv[++i])<0){puts("Invalid /RE value.");return 1;}
+             continue;
+         }
++        if(split_video_option(argv[i])) {
++            if(i+1>=argc||video_value(&cfg,argv[++i])<0){puts("Invalid /VIDEO value.");return 1;}
++            continue;
++        }
+         rc=config_option(&cfg,argv[i]);if(rc<0){printf("Invalid option value: %s\n",argv[i]);return 1;}if(rc)continue;
+         if(argv[i][0]=='/'||argv[i][0]=='-'){printf("Unknown option: %s\n",argv[i]);return 1;}
+         if(action==2&&!bench_path)bench_path=argv[i];else path_count++;
+@@ -990,7 +1018,7 @@
+     if(action==1){if(path_count||bench_path){puts("/CAL does not take a file path.");return 1;}return calibration(&cfg)?0:1;}
+     if(action==2){if(!bench_path||path_count){puts("Usage: DOSFER /BENCH file [options]");return 1;}benchmark(bench_path,&cfg);free_chain_cache();vga_leave();return 0;}
+     mf=fopen(MANIFEST_NAME,"w+b");if(!mf){puts("Cannot create DOSFER.$$$ in current directory.");return 1;}
+-    if(path_count){for(i=1;i<argc;++i){if(split_re_option(argv[i])){++i;continue;}
++    if(path_count){for(i=1;i<argc;++i){if(split_re_option(argv[i])||split_video_option(argv[i])){++i;continue;}
+         if(argv[i][0]!='/'&&argv[i][0]!='-')if(!add_selection(mf,argv[i])){fclose(mf);remove(MANIFEST_NAME);return 1;}}}
+     else do {printf("File or directory: ");if(!fgets(path,sizeof(path),stdin))break;path[strcspn(path,"\r\n")]=0;
+         if(!add_selection(mf,path)){fclose(mf);remove(MANIFEST_NAME);return 1;}
+@@ -999,7 +1027,7 @@
+     if(!selected_files&&!selected_dirs){usage(&cfg);fclose(mf);remove(MANIFEST_NAME);return 1;}
+     est=1+selected_dirs+selected_files*2+selected_bytes/(cfg.frame_payload-28)+1;
+     printf("Selected: %lu files, %lu directories, %lu bytes, approximately %lu QR frames.\n",selected_files,selected_dirs,selected_bytes,est);
+-    printf("Settings: QR v%u-%c mask %u, %u px modules, %u ms hold, window %u, repeats %u, redundancy %s.\n",cfg.qr_version,"LMQH"[cfg.ecc],qr_mask,cfg.module_pixels,cfg.hold_ms,cfg.window_frames,cfg.repetitions,redundancy_name(&cfg));
++    printf("Settings: QR v%u-%c mask %u, %u px modules, video %s, %u ms hold, window %u, repeats %u, redundancy %s.\n",cfg.qr_version,"LMQH"[cfg.ecc],qr_mask,cfg.module_pixels,video_name(&cfg),cfg.hold_ms,cfg.window_frames,cfg.repetitions,redundancy_name(&cfg));
+     puts("Preparing the first QR code...");
+     rc=run_transfer(mf,&cfg);sender_cleanup();fclose(mf);remove(MANIFEST_NAME);
+     if(rc){printf("Transfer complete. Session %08lX, %lu frames, %lu bytes. Returning to DOS.\n",
+--- /mnt/data/dos_sender_legacy_unpacked/dos_sender_legacy/src/vga.c	2026-08-06 12:00:26.000000000 +0000
++++ /mnt/data/dos_sender_legacy_work/dos_sender_legacy/src/vga.c	2026-08-06 19:19:03.370899930 +0000
+@@ -10,7 +10,7 @@
+ static u8 far *screen;
+ static u8 far *font8;
+ static int screen_invert=-1;
+-static int use_320,active_320,screen_stride=80,screen_height=480,display_page,write_page;
++static int requested_video=VIDEO_320_60,active_320,screen_stride=80,screen_height=480,display_page,write_page;
+ static u8 page_initialized[2],page_invert[2];
+ static int vga_active;
+ static u32 screen_bytes=80UL*480UL;
+@@ -444,17 +444,44 @@
+ static void bios_mode(u8 mode) {
+     union REGS r; r.h.ah=0; r.h.al=mode; int86(0x10,&r,&r);
+ }
++
++/* Keep the Mode 0Dh memory layout and 200 logical scan lines, but extend
++ * the vertical period to 525 physical scan lines.  Mode 0Dh already uses
++ * double scanning, so the active image remains 320x200 while the refresh
++ * changes from about 70 Hz to about 59.94 Hz.
++ *
++ * These values are the established 320x200/60 timing for the standard
++ * 25.175 MHz VGA clock.  Only vertical CRTC timing changes; page stride,
++ * planar addressing and the two legacy display pages remain unchanged. */
++static void vga_set_320x200_60(void) {
++    u16 crtc=(inp(0x3CC)&1)?0x3D4:0x3B4;
++
++    /* CR11 bit 7 protects CR00..CR07. */
++    outp(crtc,0x11);outp(crtc+1,0x00);
++
++    /* 525-line vertical period, 400 active physical scan lines. */
++    outp(crtc,0x06);outp(crtc+1,0x0B);
++    outp(crtc,0x07);outp(crtc+1,0x3E);
++    outp(crtc,0x16);outp(crtc+1,0x0B);
++    outp(crtc,0x10);outp(crtc+1,0xD7);
++
++    /* Two-line vertical sync and re-enable CRTC write protection. */
++    outp(crtc,0x11);outp(crtc+1,0x89);
++}
++
+ int vga_enter(void) {
+     free_delta();
+-    active_320=use_320;screen_stride=active_320?40:80;screen_height=active_320?200:480;screen_bytes=(u32)screen_stride*screen_height;
++    active_320=requested_video!=VIDEO_640_60;screen_stride=active_320?40:80;screen_height=active_320?200:480;screen_bytes=(u32)screen_stride*screen_height;
+     screen=active_320?0:(u8 far *)_fmalloc(screen_bytes);
+     if (!active_320&&!screen) return 0;
+-    bios_mode(active_320?0x0D:0x12);vga_active=1;display_page=0;write_page=active_320?1:0;screen_invert=-1;font8=0;
++    bios_mode(active_320?0x0D:0x12);
++    if(requested_video==VIDEO_320_60)vga_set_320x200_60();
++    vga_active=1;display_page=0;write_page=active_320?1:0;screen_invert=-1;font8=0;
+     page_initialized[0]=page_initialized[1]=0;
+     if(active_320)font8=dosferFont8();
+     return 1;
+ }
+-void vga_use_320(int enabled){use_320=enabled!=0;}
++void vga_set_video_mode(int mode){requested_video=mode;}
+ void vga_leave(void) {
+     free_delta();if(screen){_ffree(screen);screen=0;}screen_invert=-1;
+     if(vga_active){bios_mode(3);bios_mode(3);vga_active=0;}

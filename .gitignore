@@ -14,6 +14,13 @@
 /dos_sender/*.map
 /*.obj
 
+# DOS legacy sender build outputs
+/dos_sender_legacy/*.obj
+/dos_sender_legacy/*.err
+/dos_sender_legacy/*.map
+/dos_sender_legacy/build/*
+!/dos_sender_legacy/build/run.bat
+
 # Android/Gradle local state
 .gradle/
 local.properties

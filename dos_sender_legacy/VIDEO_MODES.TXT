@@ -1,0 +1,17 @@
+DOSfer legacy-clean video modes
+================================
+
+The sender is intentionally fixed to QR Version 40 at one VGA pixel per QR
+module. Only the 320x200 planar Mode 0Dh backend remains.
+
+/VIDEO:320_60  (default)
+    BIOS VGA mode 0Dh plus custom ~59.94 Hz vertical timing. The memory
+    layout stays 320x200, 16-color planar, with the original 8 KiB page
+    stride and double buffering.
+
+/VIDEO:320_70
+    Unmodified BIOS mode 0Dh timing at approximately 70 Hz.
+
+The removed 640x480 backend and /SCALE option were legacy paths that were no
+longer used by the V40 transfer setup. Keeping one raster geometry also makes
+the stateful codeword-to-pixel delta map much simpler and easier to verify.

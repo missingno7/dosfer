@@ -1,0 +1,9 @@
+This archive contains the modified source code for the new /VIDEO switch.
+
+The DOS executable was not rebuilt in this environment because Open Watcom is
+not installed here. Run BUILD.BAT with Open Watcom to create:
+
+    build\DOSFER.EXE
+
+The stale pre-change executable and object files were removed deliberately so
+that the original ~70 Hz build cannot be mistaken for the new 320x200/60 build.
