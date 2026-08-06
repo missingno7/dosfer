@@ -40,9 +40,9 @@ public final class SessionStore {
         /* An end-window marker can remain visible while the user presses Reset.
            It must not claim the next empty session. A valid data frame from a
            different session may replace an empty stale session automatically. */
-        boolean planeStart=isPlaneStart(f);
-        if(active==0){if(f.kind==Protocol.END_WINDOW||!(f.kind==Protocol.DATA||planeStart)){other++;return Result.OTHER_SESSION;}activate(f.session);}
-        if(active!=f.session){if((f.kind==Protocol.DATA||planeStart)&&countFrames()==0)activate(f.session);else{other++;return Result.OTHER_SESSION;}}
+        boolean sessionStart=isSessionStart(f);
+        if(active==0){if(f.kind==Protocol.END_WINDOW||!sessionStart){other++;return Result.OTHER_SESSION;}activate(f.session);}
+        if(active!=f.session){if(sessionStart&&countFrames()==0)activate(f.session);else{other++;return Result.OTHER_SESSION;}}
         if(f.kind==Protocol.END_WINDOW){windowExpected.put(f.window,f.windowCount);return Result.STORED;}
         if(f.kind==Protocol.CHAIN_XOR){
             windowExpected.put(f.window,f.windowCount);File target=xorFile(f.globalIndex);
@@ -99,6 +99,24 @@ public final class SessionStore {
         int width=(int)f.streamOffset;
         if(f.kind!=Protocol.PLANE_CODED||f.flags!=Protocol.FLAG_PLANE_WHITENED||f.globalIndex!=1||(width!=3&&width!=4)||f.windowIndex+width>f.windowCount)return false;
         try{Protocol.parseRecord(trimPlaneRecord(f.payload));return true;}catch(RuntimeException e){return false;}
+    }
+    static boolean isLegacyRecoveryStart(Protocol.Frame f) {
+        if(f.kind==Protocol.CHAIN_XOR) {
+            int left=(int)(f.streamId>>>16),right=(int)(f.streamId&0xffff);
+            return f.flags==Protocol.FLAG_PAIR_WHITENED&&f.streamOffset==0&&
+                    left>=Protocol.RECORD_HEADER&&right>=Protocol.RECORD_HEADER&&
+                    f.windowIndex+1<f.windowCount&&f.payloadLength==Math.max(left,right);
+        }
+        if(f.kind==Protocol.BLOCK_XOR) {
+            int count=(int)f.streamId;
+            return f.flags==Protocol.FLAG_WHITENED&&f.streamOffset==0&&
+                    count>=1&&count<=64&&f.windowIndex+count<=f.windowCount&&
+                    f.payloadLength>=Protocol.RECORD_HEADER;
+        }
+        return false;
+    }
+    private static boolean isSessionStart(Protocol.Frame f) {
+        return f.kind==Protocol.DATA||isPlaneStart(f)||isLegacyRecoveryStart(f);
     }
     private Recovered storeRecovered(Protocol.Frame chain,long index,int wi,byte[] payload) {
         Protocol.Record r=Protocol.parseRecord(payload);long sid=0,off=0;

@@ -20,6 +20,18 @@ public class ProtocolTest {
         assertEquals(128,first.windowCount);assertEquals(0,first.streamId);assertTrue(SessionStore.isPlaneStart(first));
         assertEquals(128,finalBasis.windowCount);assertEquals(4,finalBasis.streamOffset);assertEquals(124,finalBasis.streamId);
     }
+    @Test public void legacyRecoveryFramesCanStartSession(){
+        byte[] left=record(10,17),right=record(11,31),chainPayload=new byte[Math.max(left.length,right.length)];
+        for(int i=0;i<chainPayload.length;i++)chainPayload[i]=(byte)((i<left.length?left[i]:0)^(i<right.length?right[i]:0));
+        Protocol.Frame chain=Protocol.parseFrame(Protocol.encodeFrame(Protocol.CHAIN_XOR,Protocol.FLAG_PAIR_WHITENED,
+                0x12345678L,2,10,0,2,((long)left.length<<16)|right.length,0,chainPayload));
+        assertTrue(SessionStore.isLegacyRecoveryStart(chain));
+
+        byte[] parity=left.clone();
+        Protocol.Frame block=Protocol.parseFrame(Protocol.encodeFrame(Protocol.BLOCK_XOR,Protocol.FLAG_WHITENED,
+                0x12345678L,3,20,0,2,2,0,parity));
+        assertTrue(SessionStore.isLegacyRecoveryStart(block));
+    }
     @Test public void planeCodedOddEquationsRoundTripAndSolve(){
         byte[][] basis={record(100,32),record(101,32),record(102,32),record(103,32)};int[] c={1,2,4,8,7,11,13,14};byte[][] equation=new byte[8][];
         for(int i=0;i<c.length;i++){equation[i]=new byte[basis[0].length];for(int bit=0;bit<4;bit++)if((c[i]&(1<<bit))!=0)for(int j=0;j<equation[i].length;j++)equation[i][j]^=basis[bit][j];}
