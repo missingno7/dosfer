@@ -215,6 +215,8 @@ public final class CameraScanner {
             request.addTarget(reader.getSurface());
             request.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             request.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON);
+            request.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
+                    CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO);
             if (fps != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
             camera.createCaptureSession(Arrays.asList(previewSurface, reader.getSurface()),
                     new CameraCaptureSession.StateCallback() {
