@@ -801,6 +801,95 @@ testable void addEccAndInterleave(uint8_t data[], int version, enum qrcodegen_Ec
 	}
 }
 
+
+/* Fixed V40-L hot path used by the 16-bit DOS sender.  It intentionally keeps
+ * the proven degree-30 RS recurrence and the proven V40 interleave layout, but
+ * removes all version/ECC/block-layout discovery from the per-frame path. */
+static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
+	const uint8_t *dat=data;
+	static uint8_t
+#ifdef __WATCOMC__
+		__near
+#endif
+		ecc[31];
+	int block,j;
+
+	dosferPrepareRs(30);
+	for(block=0;block<25;block++) {
+		int datLen=block<19?118:119;
+		memset(ecc,0,sizeof(ecc));
+#ifdef __WATCOMC__
+		dosferRs30PairAsm(dat,(uint16_t)datLen,dosferRsStep,ecc);
+		dosferStrideCopy(dat,118,result+block,25);
+		if(block>=19)result[2950+block-19]=dat[118];
+		dosferStrideCopy(ecc,30,result+2956+block,25);
+#else
+		for(j=0;j<datLen;j++) {
+			uint8_t factor=(uint8_t)(dat[j]^ecc[0]);
+			const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
+			ecc[30]=0;
+			for(int k=0;k<30;k++)ecc[k]=(uint8_t)(ecc[k+1]^row[k]);
+		}
+		for(j=0;j<118;j++)result[block+j*25]=dat[j];
+		if(block>=19)result[2950+block-19]=dat[118];
+		for(j=0;j<30;j++)result[2956+block+j*25]=ecc[j];
+#endif
+		dat+=datLen;
+	}
+}
+
+/* Encode one complete DOSfer transport frame as fixed QR V40-L + ECI 3.
+ * This is byte-for-byte equivalent to qrcodegen_encodeBinaryAligned() with
+ * version 40, ECC L and a fixed mask, but avoids segment construction,
+ * version search, ECC selection and generic block-layout branches.
+ *
+ * `workspace` is the normal V40 QR buffer.  On full rendering it receives
+ * the packed matrix.  In codewords-only mode its contents are unspecified.
+ * `codewords` always receives the 3706 interleaved V40-L codewords. */
+bool qrcodegen_dosferEncodeFrameV40L(const uint8_t frame[], uint16_t frameLen,
+		uint8_t codewords[], uint8_t workspace[], enum qrcodegen_Mask mask,
+		bool codewordsOnly) {
+	const int dataCapacity=2956;
+	int bitLen,terminatorBits,i;
+	uint8_t padByte;
+	DOSFER_PROFILE_START;
+
+	if(!frame||!codewords||!workspace||frameLen>2952||
+			(int)mask<0||(int)mask>7)return false;
+
+	/* ECI assignment 3 + byte mode + 16-bit byte count. */
+	memset(workspace,0,(size_t)dataCapacity);
+	workspace[0]=0x70;
+	workspace[1]=0x34;
+	workspace[2]=(uint8_t)(frameLen>>8);
+	workspace[3]=(uint8_t)frameLen;
+	if(frameLen)memcpy(workspace+4,frame,frameLen);
+	bitLen=32+(int)frameLen*8;
+
+	/* Same terminator/alignment/pad semantics as the canonical encoder. */
+	terminatorBits=dataCapacity*8-bitLen;
+	if(terminatorBits>4)terminatorBits=4;
+	bitLen+=terminatorBits;
+	bitLen=(bitLen+7)&~7;
+	padByte=0xEC;
+	for(i=bitLen>>3;i<dataCapacity;i++,padByte^=0xEC^0x11)
+		workspace[i]=padByte;
+	DOSFER_PROFILE_MARK(0);
+
+	dosferAddEccInterleaveV40L(workspace,codewords);
+	DOSFER_PROFILE_MARK(1);
+	if(codewordsOnly)return true;
+	if(!dosferPrepareMatrixCache(40,qrcodegen_Ecc_LOW,mask))return false;
+	memcpy(workspace,dosferFunctionTemplate,
+		(size_t)qrcodegen_BUFFER_LEN_FOR_VERSION(40));
+	DOSFER_PROFILE_MARK(2);
+	dosferDrawCodewordsCached(codewords,3706,workspace);
+	DOSFER_PROFILE_MARK(3);
+	DOSFER_PROFILE_MARK(4);
+	DOSFER_PROFILE_MARK(5);
+	return true;
+}
+
 bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t encodedRight[],
 		const uint8_t protocolHeaderXor[48],uint8_t result[]) {
 	static uint8_t
@@ -847,7 +936,7 @@ bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[],uint8_t result[
 #ifdef DOSFER_PROFILE
 	u32 profileStart=timer_ticks();
 #endif
-	addEccAndInterleave(dataCodewords,40,qrcodegen_Ecc_LOW,result);
+	dosferAddEccInterleaveV40L(dataCodewords,result);
 #ifdef DOSFER_PROFILE
 	dosferQrProfileTicks[1]+=timer_ticks()-profileStart;
 #endif

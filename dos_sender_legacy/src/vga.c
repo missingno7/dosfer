@@ -23,6 +23,9 @@ static int vga_active;
 static int screen_invert=-1;
 static int display_page;
 static int write_page;
+static u16 crtc_port;
+static u16 page_start[2];
+static u32 last_flip_tick;
 static u8 page_initialized[2];
 static u8 page_invert[2];
 
@@ -37,10 +40,13 @@ static u8
     __near
 #endif
     previous_codewords[DOSFER_QR_CODEWORDS];
-static u16 far *delta_offset;
-static u8 far *delta_mask;
+/* One 16-bit entry per QR codeword bit: low 13 bits are the 0..7999
+ * shadow-raster byte offset, high 3 bits select the pixel bit in that byte.
+ * This replaces the old 16-bit offset + separate 8-bit mask tables, saving
+ * 29,648 bytes and one far-memory load for every changed module. */
+static u16 far *delta_entry;
 static u16 delta_bits;
-static u16 delta_codewords;
+static const u8 pixel_mask[8]={0x80,0x40,0x20,0x10,0x08,0x04,0x02,0x01};
 
 #ifdef DOSFER_PROFILE
 /* render, VGA upload/setup, retrace wait, page flip, status drawing */
@@ -112,12 +118,9 @@ static void dosferCopyPartial320(const u8 far *src,u8 far *dest) {
 #endif
 
 static void free_delta(void) {
-    if(delta_offset)_ffree(delta_offset);
-    if(delta_mask)_ffree(delta_mask);
-    delta_offset=0;
-    delta_mask=0;
+    if(delta_entry)_ffree(delta_entry);
+    delta_entry=0;
     delta_bits=0;
-    delta_codewords=0;
 }
 
 static void bios_mode(u8 mode) {
@@ -128,18 +131,31 @@ static void bios_mode(u8 mode) {
     int86(0x10,&r,&r);
 }
 
+static void bios_page(u8 page) {
+    union REGS r;
+    memset(&r,0,sizeof(r));
+    r.h.ah=5;
+    r.h.al=page;
+    int86(0x10,&r,&r);
+}
+
+static u16 read_crtc_start(void) {
+    u16 start;
+    outp(crtc_port,0x0C);start=(u16)inp(crtc_port+1)<<8;
+    outp(crtc_port,0x0D);start|=(u8)inp(crtc_port+1);
+    return start;
+}
+
 /* Mode 0Dh is normally ~70 Hz.  Keep its 320x200 planar memory layout and
  * double-scanned 400-line active image, but extend the vertical period to
  * 525 physical scanlines: ~59.94 Hz with the standard 25.175 MHz VGA clock. */
 static void set_320x200_60hz(void) {
-    u16 crtc=(inp(0x3CC)&1)?0x3D4:0x3B4;
-
-    outp(crtc,0x11);outp(crtc+1,0x00); /* unlock CR00..CR07 */
-    outp(crtc,0x06);outp(crtc+1,0x0B); /* vertical total = 525 */
-    outp(crtc,0x07);outp(crtc+1,0x3E); /* overflow bits */
-    outp(crtc,0x16);outp(crtc+1,0x0B); /* vertical blank end */
-    outp(crtc,0x10);outp(crtc+1,0xD7); /* vertical retrace start */
-    outp(crtc,0x11);outp(crtc+1,0x89); /* retrace end + lock */
+    outp(crtc_port,0x11);outp(crtc_port+1,0x00); /* unlock CR00..CR07 */
+    outp(crtc_port,0x06);outp(crtc_port+1,0x0B); /* vertical total = 525 */
+    outp(crtc_port,0x07);outp(crtc_port+1,0x3E); /* overflow bits */
+    outp(crtc_port,0x16);outp(crtc_port+1,0x0B); /* vertical blank end */
+    outp(crtc_port,0x10);outp(crtc_port+1,0xD7); /* vertical retrace start */
+    outp(crtc_port,0x11);outp(crtc_port+1,0x89); /* retrace end + lock */
 }
 
 static void setup_planar_write(void) {
@@ -154,12 +170,22 @@ static void setup_planar_write(void) {
 int vga_enter(VideoMode mode) {
     free_delta();
     bios_mode(0x0D);
+    crtc_port=(inp(0x3CC)&1)?0x3D4:0x3B4;
     if(mode==VIDEO_320_60)set_320x200_60hz();
     else if(mode!=VIDEO_320_70){bios_mode(3);return 0;}
+
+    /* Ask the BIOS for the two page starts once, then use the measured CRTC
+     * values directly during streaming. This preserves adapter-specific page
+     * semantics without paying INT 10h overhead on every QR transition. */
+    bios_page(0);page_start[0]=read_crtc_start();
+    bios_page(1);page_start[1]=read_crtc_start();
+    bios_page(0);
+    if(page_start[0]==page_start[1]){bios_mode(3);return 0;}
 
     vga_active=1;
     display_page=0;
     write_page=1;
+    last_flip_tick=0;
     screen_invert=-1;
     page_initialized[0]=page_initialized[1]=0;
     font8=dosferFont8();
@@ -175,10 +201,49 @@ void vga_leave(void) {
     }
 }
 
-void vga_wait_retrace(void) {
+static void wait_next_retrace(void) {
     while(inp(0x3DA)&8) ;
     while(!(inp(0x3DA)&8)) ;
 }
+
+u32 vga_measure_refresh_hz100(u16 samples) {
+    u16 i;
+    u32 start,elapsed;
+    if(!vga_active)return 0;
+    if(samples<2)samples=2;
+    wait_next_retrace();
+    start=timer_ticks();
+    for(i=0;i<samples;++i)wait_next_retrace();
+    elapsed=timer_elapsed_ms(start,timer_ticks());
+    return elapsed?((u32)samples*100000UL)/elapsed:0;
+}
+
+/* Wait for the first vertical-retrace interval that is not earlier than the
+ * requested PIT deadline.  Polling from before the target avoids the old
+ * HOLD:50 + "one more retrace" penalty; at 59.94 Hz, 50 ms now naturally
+ * lands on the third refresh (~50.05 ms). */
+static void wait_retrace_at_or_after(u32 earliest_tick) {
+    for(;;) {
+        if(inp(0x3DA)&8) {
+            do {
+                if(!earliest_tick||(long)(timer_ticks()-earliest_tick)>=0)return;
+            } while(inp(0x3DA)&8);
+        }
+        while(!(inp(0x3DA)&8)) ;
+        if(!earliest_tick||(long)(timer_ticks()-earliest_tick)>=0)return;
+    }
+}
+
+/* Page-start values are learned from BIOS AH=05h during initialization.
+ * Streaming then writes those exact CRTC values directly, avoiding BIOS
+ * overhead while retaining the adapter's own Mode 0Dh page convention. */
+static void select_display_page(unsigned page) {
+    u16 start=page_start[page&1];
+    outp(crtc_port,0x0C);outp(crtc_port+1,(u8)(start>>8));
+    outp(crtc_port,0x0D);outp(crtc_port+1,(u8)start);
+}
+
+u32 vga_last_flip_tick(void) { return last_flip_tick; }
 
 static void status_text_320(const char *s) {
     int x,y;
@@ -222,9 +287,8 @@ static int build_qr_image_320(const u8 *qr,int invert) {
     return 1;
 }
 
-static void copy_320_flip(void) {
+static void copy_320_flip(u32 earliest_tick) {
     u8 far *vram=(u8 far *)MK_FP(0xA000,0);
-    union REGS r;
     u16 base=(u16)(write_page<<13);
 #ifdef DOSFER_PROFILE
     u32 profile_start=timer_ticks(),profile_now;
@@ -242,24 +306,22 @@ static void copy_320_flip(void) {
     profile_now=timer_ticks();dosferVgaProfileTicks[1]+=profile_now-profile_start;
     profile_start=profile_now;
 #endif
-    vga_wait_retrace();
+    wait_retrace_at_or_after(earliest_tick);
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[2]+=profile_now-profile_start;
     profile_start=profile_now;
 #endif
 
-    memset(&r,0,sizeof(r));
-    r.h.ah=5;
-    r.h.al=(u8)write_page;
-    int86(0x10,&r,&r);
+    select_display_page((unsigned)write_page);
+    last_flip_tick=timer_ticks();
 #ifdef DOSFER_PROFILE
-    profile_now=timer_ticks();dosferVgaProfileTicks[3]+=profile_now-profile_start;
+    profile_now=last_flip_tick;dosferVgaProfileTicks[3]+=profile_now-profile_start;
 #endif
     display_page=write_page;
     write_page^=1;
 }
 
-static int prepare_delta(const u8 *codewords,u16 codeword_len) {
+static int prepare_delta(const u8 *codewords) {
     const u16 *bytes=qrcodegen_dosferPlacementBytes();
     const u8 *masks=qrcodegen_dosferPlacementMasks();
     int bits=qrcodegen_dosferPlacementBits();
@@ -267,13 +329,11 @@ static int prepare_delta(const u8 *codewords,u16 codeword_len) {
     u16 linear;
     u8 m;
 
-    if(!bytes||!masks||!codewords||bits<=0||bits!=(int)codeword_len*8)return 0;
-    if(bits>QR_DATA_BITS||codeword_len>DOSFER_QR_CODEWORDS)return 0;
+    if(!bytes||!masks||!codewords||bits!=QR_DATA_BITS)return 0;
 
     free_delta();
-    delta_offset=(u16 far *)_fmalloc((u32)bits*sizeof(u16));
-    delta_mask=(u8 far *)_fmalloc((u32)bits);
-    if(!delta_offset||!delta_mask){free_delta();return 0;}
+    delta_entry=(u16 far *)_fmalloc((u32)bits*sizeof(u16));
+    if(!delta_entry){free_delta();return 0;}
 
     for(i=0;i<bits;++i){
         m=masks[i];
@@ -283,27 +343,25 @@ static int prepare_delta(const u8 *codewords,u16 codeword_len) {
         y=linear/DOSFER_QR_SIZE;
         x=linear-y*DOSFER_QR_SIZE;
         px=QR_X0+DOSFER_QR_QUIET+x;
-        delta_offset[i]=(u16)((QR_Y0+y)*VGA_BYTES_PER_LINE+(px>>3));
-        delta_mask[i]=(u8)(0x80>>(px&7));
+        delta_entry[i]=(u16)(((QR_Y0+y)*VGA_BYTES_PER_LINE+(px>>3))|
+            ((u16)(px&7)<<13));
     }
 
-    _fmemcpy(previous_codewords,codewords,codeword_len);
+    _fmemcpy(previous_codewords,codewords,DOSFER_QR_CODEWORDS);
     delta_bits=(u16)bits;
-    delta_codewords=codeword_len;
     qrcodegen_dosferReleaseMatrixCache();
     return 1;
 }
 
 static void update_delta(const u8 *codewords) {
-    const u16 far *offset=delta_offset;
-    const u8 far *masks=delta_mask;
-    u16 i,off;
+    const u16 far *map=delta_entry;
+    u16 i,entry;
     u8 changed;
 
-    for(i=0;i+1<delta_codewords;i+=2,offset+=16,masks+=16){
+    for(i=0;i+1<DOSFER_QR_CODEWORDS;i+=2,map+=16){
         changed=(u8)(codewords[i]^previous_codewords[i]);
         previous_codewords[i]=codewords[i];
-#define TOGGLE(k,b) if(changed&(b)){off=offset[k];screen_320[off]^=masks[k];}
+#define TOGGLE(k,b) if(changed&(b)){entry=map[k];screen_320[entry&0x1FFF]^=pixel_mask[entry>>13];}
         TOGGLE(0,0x80) TOGGLE(1,0x40) TOGGLE(2,0x20) TOGGLE(3,0x10)
         TOGGLE(4,0x08) TOGGLE(5,0x04) TOGGLE(6,0x02) TOGGLE(7,0x01)
         changed=(u8)(codewords[i+1]^previous_codewords[i+1]);
@@ -312,10 +370,10 @@ static void update_delta(const u8 *codewords) {
         TOGGLE(12,0x08) TOGGLE(13,0x04) TOGGLE(14,0x02) TOGGLE(15,0x01)
 #undef TOGGLE
     }
-    if(i<delta_codewords){
+    if(i<DOSFER_QR_CODEWORDS){
         changed=(u8)(codewords[i]^previous_codewords[i]);
         previous_codewords[i]=codewords[i];
-#define TOGGLE_TAIL(k,b) if(changed&(b)){off=offset[k];screen_320[off]^=masks[k];}
+#define TOGGLE_TAIL(k,b) if(changed&(b)){entry=map[k];screen_320[entry&0x1FFF]^=pixel_mask[entry>>13];}
         TOGGLE_TAIL(0,0x80) TOGGLE_TAIL(1,0x40) TOGGLE_TAIL(2,0x20) TOGGLE_TAIL(3,0x10)
         TOGGLE_TAIL(4,0x08) TOGGLE_TAIL(5,0x04) TOGGLE_TAIL(6,0x02) TOGGLE_TAIL(7,0x01)
 #undef TOGGLE_TAIL
@@ -323,7 +381,7 @@ static void update_delta(const u8 *codewords) {
 }
 
 int vga_delta_ready(void) {
-    return delta_offset!=0;
+    return delta_entry!=0;
 }
 
 void vga_delta_stats(u16 *bits) {
@@ -347,8 +405,8 @@ int vga_display_matches(void) {
     return 1;
 }
 
-int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,
-                       int invert,const char *status,int delta_only) {
+int vga_show_qr_stream_at(const u8 *qr,const u8 *codewords,
+                       int invert,const char *status,int delta_only,u32 earliest_tick) {
 #ifdef DOSFER_PROFILE
     u32 profile_start,profile_now;
 #endif
@@ -357,13 +415,13 @@ int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,
     profile_start=timer_ticks();
 #endif
     if(delta_only){
-        if(!delta_offset||delta_codewords!=codeword_len||screen_invert!=invert)return 0;
+        if(!delta_entry||screen_invert!=invert)return 0;
         update_delta(codewords);
     } else {
         if(!build_qr_image_320(qr,invert))return 0;
         /* Delta acceleration is optional. A low-memory machine must still
          * be able to transmit using canonical full redraws. */
-        prepare_delta(codewords,codeword_len);
+        prepare_delta(codewords);
     }
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;
@@ -373,46 +431,45 @@ int vga_show_qr_stream(const u8 *qr,const u8 *codewords,u16 codeword_len,
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[4]+=profile_now-profile_start;
 #endif
-    copy_320_flip();
+    copy_320_flip(earliest_tick);
     return 1;
 }
 
-int vga_show_qr(const u8 *qr,int invert,const char *status) {
-    if(!vga_active||!build_qr_image_320(qr,invert))return 0;
-    status_text_320(status);
-    copy_320_flip();
-    return 1;
+int vga_show_qr_stream(const u8 *qr,const u8 *codewords,
+                       int invert,const char *status,int delta_only) {
+    return vga_show_qr_stream_at(qr,codewords,invert,status,delta_only,0);
 }
+
 
 void vga_benchmark_qr(const u8 *qr,int loops,u32 *build_ms,u32 *copy_ms,u32 *text_ms) {
     int i;
     u32 a,b;
     a=timer_ticks();for(i=0;i<loops;++i)build_qr_image_320(qr,0);b=timer_ticks();
     *build_ms=timer_elapsed_ms(a,b);
-    a=timer_ticks();for(i=0;i<loops;++i)copy_320_flip();b=timer_ticks();
+    a=timer_ticks();for(i=0;i<loops;++i)copy_320_flip(0);b=timer_ticks();
     *copy_ms=timer_elapsed_ms(a,b);
     a=timer_ticks();for(i=0;i<loops;++i)status_text_320("DOSfer V40 320x200 benchmark");b=timer_ticks();
     *text_ms=timer_elapsed_ms(a,b);
 }
 
-void vga_benchmark_delta(const u8 *codewords,u16 codeword_len,int loops,
+void vga_benchmark_delta(const u8 *codewords,int loops,
                          u32 *update_ms,u32 *copy_ms,u32 *text_ms) {
-    u8 far *alternate=(u8 far *)_fmalloc(codeword_len);
+    u8 far *alternate=(u8 far *)_fmalloc(DOSFER_QR_CODEWORDS);
     int i;
     u32 a,b,state=0x6A67C69DUL;
 
-    if(!alternate||!delta_offset){
+    if(!alternate||!delta_entry){
         *update_ms=*copy_ms=*text_ms=0;
         if(alternate)_ffree(alternate);
         return;
     }
-    for(i=0;i<codeword_len;++i){
+    for(i=0;i<DOSFER_QR_CODEWORDS;++i){
         state^=state<<13;state^=state>>17;state^=state<<5;
         alternate[i]=(u8)(codewords[i]^(u8)state);
     }
     a=timer_ticks();for(i=0;i<loops;++i)update_delta((i&1)?codewords:alternate);b=timer_ticks();
     *update_ms=timer_elapsed_ms(a,b);
-    a=timer_ticks();for(i=0;i<loops;++i)copy_320_flip();b=timer_ticks();
+    a=timer_ticks();for(i=0;i<loops;++i)copy_320_flip(0);b=timer_ticks();
     *copy_ms=timer_elapsed_ms(a,b);
     a=timer_ticks();for(i=0;i<loops;++i)status_text_320("DOSfer V40 delta benchmark");b=timer_ticks();
     *text_ms=timer_elapsed_ms(a,b);

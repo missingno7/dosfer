@@ -2,7 +2,16 @@
 #define DOSFER32_PIPELINE_H
 
 #include <stdint.h>
+#include <stdio.h>
 #include "platform_vga.h"
+#include "protocol32.h"
+
+/* The pipeline owns the stage boundary, not the DOS sender's private worker
+ * layout.  These declarations keep WorkMemory/RecordStream out of the
+ * public buffer definitions while allowing the executable to install stage
+ * callbacks. */
+typedef struct WorkMemory WorkMemory;
+typedef struct RecordStream RecordStream;
 
 /* ========================================================================
  * DOSFER32 Fully Buffered Producer/Playback Pipeline
@@ -122,7 +131,7 @@ typedef struct {
     /* Basis hashes for verify */
     uint32_t basis_hash[4];
     PrepState state;
-} PreparedGroup;
+} PipelinePreparedGroup;
 
 /* ---- VGA slot descriptor ---- */
 
@@ -143,13 +152,13 @@ typedef struct {
 
 /* ---- Pipeline ---- */
 
-typedef struct {
+typedef struct Pipeline {
     /* Disk layer */
     DiskBuf disk[PL_DISK_SLOTS];
     /* Input layer */
     InputGroup input[PL_INPUT_SLOTS];
     /* Prepared layer */
-    PreparedGroup prep[PL_PREP_SLOTS];
+    PipelinePreparedGroup prep[PL_PREP_SLOTS];
     /* VGA layer */
     VgaSlot vga[PL_VGA_SLOTS];
     /* Indices */
@@ -169,6 +178,11 @@ typedef struct {
     /* Underrun tracking */
     unsigned underrun_count;
     unsigned duplicate_count;
+    void *context;
+    int (*input_builder)(struct Pipeline *pl, RecordStream *stream);
+    int (*qr_worker)(struct Pipeline *pl, WorkMemory *worker, Vga32 *vga, int verify);
+    int (*prepared_upload)(struct Pipeline *pl, WorkMemory *worker, Vga32 *vga);
+    int (*playback)(struct Pipeline *pl, Vga32 *vga);
 } Pipeline;
 
 /* ---- Stage functions (each performs bounded work) ---- */

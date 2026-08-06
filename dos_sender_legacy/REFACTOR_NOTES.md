@@ -1,53 +1,95 @@
-# Legacy sender cleanup
+# Legacy V40-L optimization notes
 
-The cleanup intentionally removes configuration dimensions that were no longer
-part of the real transfer target instead of carrying generic branches through
-every hot path.
+The guiding rule for this branch is: preserve the working legacy transport and
+optimize only stages that can be proved independently against the old/canonical
+implementation.
 
-## Removed
+## Fixed sender scope
 
-- QR versions 5..39 and `/V` / `/VERSION`
+Removed from the sender configuration and hot path:
+
+- QR versions other than 40
+- ECC M/Q/H selection; the sender is permanently V40-L
+- `/ECC`
 - module scaling and `/SCALE`
 - VGA 640x480 Mode 12h backend
-- generic 640x480 raster builder
-- 640x480 delta renderer and its selector tables/assembly
-- marker rendering used only by the old high-resolution path
-- second status line used only in 640x480
-- stale video-mode patch/build-note files
-- large historical benchmark/oracle schedule experiments that duplicated the
-  actual transfer code
+- `/V` / `/VERSION`
 
-## Refactored
+The generic third-party QR implementation remains available as an oracle, but it
+is not used by normal sender frame encoding.
 
-- configuration moved to `sender_config.c`
-- file/manifest/disk producer moved to `producer.c`
-- `Config` now contains only live sender options
-- QR mask and chain-anchor settings moved into `Config` instead of globals
-- VGA API is now explicitly V40/320x200 instead of passing size/scale on every
-  call
-- VGA state contains only the 8 KiB 320x200 shadow raster, two-page flip state
-  and the V40 codeword delta map
-- delta acceleration is optional; allocation failure falls back to canonical
-  full redraw instead of aborting the transfer
-- benchmark now measures only the current fixed-V40 pipeline
+## QR encoder optimization
 
-## Preserved
+`qrcodegen_dosferEncodeFrameV40L()` is now the normal frame encoder. It is
+byte-for-byte equivalent to the former call to
+`qrcodegen_encodeBinaryAligned(... V40, ECC L ...)`, but it skips:
 
-The wire protocol, record format, whitening, replay-window behavior and XOR
-redundancy semantics are unchanged. The `third_party/qrcodegen` library remains
-generic because it is also the canonical QR oracle; only the sender-facing
-configuration and renderer are specialized.
+- segment structure construction
+- version search
+- ECC-level selection
+- generic V40 block-layout discovery
+- clearing the full generic QR buffer when only 2956 data codewords are needed
 
-## Additional cleanup validation
+The fixed encoder uses the existing proven V40-L layout:
 
-- protocol code was decomposed into named xorshift/seed/CRC helpers instead of
-  dense one-line loops; a host-side equivalence test compared 500 randomized
-  frames (plain, whitened and pair-whitened) against the pre-refactor module
-  byte-for-byte
-- transfer control flow was expanded into explicit branches and a single
-  `enter_transfer_vga()` helper, removing ambiguous one-line statements while
-  retaining the existing replay/rescue state machine
-- fixed V40 constants are shared through `dosfer.h`; redundant runtime
-  `qr_codeword_bytes()` plumbing was removed
-- source-only syntax checks pass for all sender modules with DOS API stubs;
-  a real DOS executable still needs to be built with Open Watcom
+- 25 RS blocks
+- 19 x 118 data bytes
+- 6 x 119 data bytes
+- 30 ECC bytes per block
+- 25-byte interleave stride
+
+The existing 16-bit `dosferRs30PairAsm()` recurrence is retained unchanged.
+Only the surrounding dispatch/interleave path was specialized.
+
+## VGA delta-map optimization
+
+The old map stored, for every codeword bit:
+
+- a 16-bit raster byte offset
+- a separate 8-bit raster mask
+
+That required roughly 88,944 bytes. The new map stores one 16-bit packed entry:
+
+- low 13 bits: 0..7999 shadow-raster byte offset
+- high 3 bits: pixel selector 0..7
+
+Total map size is 59,296 bytes. This also removes one far-memory lookup for every
+changed module in the raster delta loop.
+
+## Display timing optimization
+
+Previously the transfer did:
+
+    encode/upload
+    wait until HOLD milliseconds elapsed
+    wait for next vertical retrace
+    BIOS page flip
+
+At 60 Hz this can turn a nominal 50 ms hold into roughly 66.7 ms when the 50 ms
+wait misses the retrace edge.
+
+The new path does:
+
+    encode/render
+    upload hidden page immediately
+    wait for first retrace at-or-after absolute visibility deadline
+    direct CRTC page flip
+
+Therefore `/HOLD:50` on the ~59.94 Hz mode normally uses exactly three refresh
+periods (~50.05 ms) when the producer is ready in time.
+
+The CRTC page-start values are not hardcoded. `vga_enter()` asks BIOS page select
+for pages 0 and 1 once, reads their CRTC start values, restores page 0, and then
+uses those measured values for direct streaming flips.
+
+## Preserved behavior
+
+Unchanged:
+
+- record/wire format
+- CRCs and whitening
+- C2 affine XOR semantics
+- block and chain redundancy semantics
+- replay/rescue behavior
+- disk producer and read-ahead model
+- 16-bit large-memory Open Watcom build

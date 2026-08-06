@@ -11,7 +11,10 @@
 - XOR block and overlapping-chain parity recover solvable missing frames, with
   manual replay as the fallback. There is no compression, fountain code, or
   multi-QR mode.
-- Camera2 requests 640×480 but a few devices may reject that exact stream pair.
-  Such devices need a supported-size selection enhancement.
+- Camera2 discovers every YUV_420_888 size exposed by the selected rear camera,
+  ranks modes using their per-size minimum frame duration, and persists the
+  user's camera, FPS, automatic/manual, and YUV resolution choices. A device
+  can still reject a particular YUV+preview session combination; the receiver
+  reports that as unsupported for device-specific testing.
 - The Android app rebuilds only after all frames are present; it stores chunks on
   disk incrementally but deliberately avoids presenting partial output as final.

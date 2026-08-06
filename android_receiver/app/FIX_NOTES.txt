@@ -1,0 +1,21 @@
+DOSfer Receiver 1.3.1 - UI/preview repair
+
+Fixed:
+- The preview overlay no longer expands a WRAP_CONTENT FrameLayout to the full
+  remaining screen height. Preview + overlay are now measured together as one
+  exact square, so the scan status/result/buttons remain below the camera.
+- The receiver page has no horizontal padding around the preview, so a
+  1440-pixel-wide app window produces a 1440x1440 preview.
+- TextureView now uses a centered FILL_CENTER transform. Raw camera-buffer
+  coordinates are no longer passed directly as a view transform, and sensor
+  orientation is no longer applied twice.
+- Camera output is centered, fills the whole square, and display rotation is
+  handled separately.
+- Diagnostics are shown below the preview, followed by the result and a single
+  four-button action row matching the intended receiver layout.
+- Corrected Camera2 front/back relative-rotation calculation.
+- Added geometry regression tests for square, 4:3, and 16:9 capture streams.
+
+The old build/ directory was intentionally not included because it contains
+APKs compiled from the broken source. Rebuild this app module in the containing
+Android Studio/Gradle project.

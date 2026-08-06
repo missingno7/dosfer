@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "sender_config.h"
-#include "qrcodegen.h"
 
 static const char *option_value(const char *arg,const char *name) {
     size_t n=strlen(name);
@@ -29,7 +28,6 @@ static int option_number(const char *arg,const char *a,const char *b,
 
 void config_defaults(Config *c) {
     memset(c,0,sizeof(*c));
-    c->ecc=0;
     c->repetitions=1;
     c->frame_payload=2904;
     c->hold_ms=0;
@@ -42,9 +40,7 @@ void config_defaults(Config *c) {
 }
 
 int config_validate(const Config *cfg) {
-    u32 raw_bytes,used_bits,capacity_bits;
-    int data_bytes;
-    if(!cfg||cfg->ecc>3||
+    if(!cfg||
        cfg->frame_payload<96||cfg->frame_payload>MAX_FRAME_PAYLOAD||
        cfg->window_frames<4||cfg->window_frames>MAX_WINDOW||
        cfg->repetitions<1||cfg->repetitions>20||
@@ -57,19 +53,11 @@ int config_validate(const Config *cfg) {
         return 0;
     }
 
-    data_bytes=qrcodegen_dosferDataCodewordBytes(DOSFER_QR_VERSION,
-        (enum qrcodegen_Ecc)cfg->ecc);
-    if(!data_bytes)return 0;
-
-    raw_bytes=(u32)FRAME_HEADER_SIZE+cfg->frame_payload;
-    used_bits=raw_bytes*8UL+(cfg->ecc==0?32UL:20UL);
-    capacity_bits=(u32)data_bytes*8UL;
-    if(used_bits>capacity_bits) {
-        u32 overhead=cfg->ecc==0?32UL:20UL;
-        u32 frame_bytes=(capacity_bits-overhead)/8UL;
-        u32 max_payload=frame_bytes>FRAME_HEADER_SIZE?frame_bytes-FRAME_HEADER_SIZE:0;
-        printf("Payload %u does not fit fixed V40-%c; maximum is %lu bytes.\n",
-            cfg->frame_payload,"LMQH"[cfg->ecc],max_payload);
+    /* V40-L + ECI 3 has exactly 2956 data codewords.  The fixed four-byte
+     * ECI/byte prefix leaves 2952 transport bytes = 48 header + 2904 payload. */
+    if((u32)FRAME_HEADER_SIZE+cfg->frame_payload>2952UL) {
+        printf("Payload %u exceeds fixed V40-L maximum of %u bytes.\n",
+            cfg->frame_payload,MAX_FRAME_PAYLOAD);
         return 0;
     }
     return 1;
@@ -129,15 +117,6 @@ int config_parse_option(Config *cfg,const char *arg) {
 
     p=option_value(arg,"RE");if(p)return config_parse_re(cfg,p);
     p=option_value(arg,"VIDEO");if(p)return config_parse_video(cfg,p);
-    p=option_value(arg,"ECC");
-    if(p){
-        char *e;
-        if(p[1])return -1;
-        e=strchr("LMQH",toupper(p[0]));
-        if(!e)return -1;
-        cfg->ecc=(u8)(e-"LMQH");
-        return 1;
-    }
     rc=option_number(arg,"PAYLOAD","P",96,MAX_FRAME_PAYLOAD,&v);
     if(rc){if(rc>0)cfg->frame_payload=(u16)v;return rc;}
     rc=option_number(arg,"HOLD","SPEED",0,60000,&v);
@@ -166,7 +145,7 @@ int config_is_split_video(const char *arg) {
 }
 
 void config_print_usage(const Config *cfg) {
-    puts("DOSfer legacy-clean - fixed V40 optical DOS-to-Android sender");
+    puts("DOSfer legacy V40-L - optimized 16-bit DOS-to-Android sender");
     puts("DOSFER [options] file_or_directory [more paths ...]");
     puts("DOSFER /CAL [options]");
     puts("DOSFER /BENCH file [options]");
@@ -174,8 +153,7 @@ void config_print_usage(const Config *cfg) {
     puts("Fixed renderer: QR Version 40, 177x177 modules, 1 pixel/module, VGA 320x200.");
     puts("Default: V40-L, /VIDEO:320_60, payload 2904, hold 0, window 32, /RE:7");
     puts("/VIDEO:320_60|320_70  CRT refresh mode (default 320_60)");
-    puts("/ECC:L|M|Q|H          V40 error correction level (default L)");
-    puts("/PAYLOAD:n or /P:n    Frame payload; validated against selected V40 ECC");
+    puts("/PAYLOAD:n or /P:n    Frame payload 96..2904 bytes for fixed V40-L");
     puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 7)");
     puts("/RE:Ck or /RE Ck      Overlapping chain parity C2..C64 (even k)");
     puts("/ANCHOR:n             Repeat every nth DATA frame in chain mode");
@@ -185,8 +163,8 @@ void config_print_usage(const Config *cfg) {
     puts("/MASK:n               Fixed QR mask 0..7 (default 0)");
     puts("/INVERT /NOINVERT     Black/white polarity");
     puts("/BEEP /NOBEEP         End-of-window sound");
-    printf("Current: V40-%c /PAYLOAD:%u /HOLD:%u /WINDOW:%u /REPEAT:%u /MASK:%u /RE:%s /VIDEO:%s %s %s\n",
-        "LMQH"[cfg->ecc],cfg->frame_payload,cfg->hold_ms,cfg->window_frames,
+    printf("Current: V40-L /PAYLOAD:%u /HOLD:%u /WINDOW:%u /REPEAT:%u /MASK:%u /RE:%s /VIDEO:%s %s %s\n",
+        cfg->frame_payload,cfg->hold_ms,cfg->window_frames,
         cfg->repetitions,cfg->qr_mask,config_redundancy_name(cfg),config_video_name(cfg),
         cfg->invert?"/INVERT":"/NOINVERT",cfg->speaker?"/BEEP":"/NOBEEP");
     puts("Example: DOSFER /VIDEO:320_60 /HOLD:50 /RE:C2 FILE.ZIP");

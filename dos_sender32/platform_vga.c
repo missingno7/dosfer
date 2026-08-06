@@ -125,11 +125,15 @@ int vga32_enter(Vga32 *vga) {
     attribute_map_identity();
     palette_odd_parity();
     attribute_plane_mask(0);
-    /* Clear all eight slots in every physical plane. */
-    memset(vga->raster, 0, VGA_RASTER_BYTES);
-    for (i = 0; i < 4; ++i)
-        for (unsigned slot = 0; slot < 8; ++slot)
-            if (!vga32_store(vga, i, slot, vga->raster)) { vga32_leave(vga); return 0; }
+    /* Normal palette index 15 is white.  Every slot starts as a complete
+       white raster so a later rectangle upload cannot expose black quiet
+       rows or stale bytes outside the QR. */
+    memset(vga->raster, 0xFF, VGA_RASTER_BYTES);
+    for (i = 0; i < 4; ++i) {
+        unsigned slot;
+        for (slot = 0; slot < 8; ++slot)
+            if (!vga32_store_fast(vga, i, slot, vga->raster)) { vga32_leave(vga); return 0; }
+    }
     return 1;
 }
 
@@ -156,21 +160,27 @@ int vga32_store_fast(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *r
     return 1;
 }
 
-/* Upload only the QR rectangle (rows QR_QUIET through QR_QUIET+QR_SIZE-1).
- * Each row is 40 bytes, so the rectangle is QR_SIZE * 40 bytes starting
- * at offset QR_QUIET * 40.  This saves ~12% of the upload bandwidth. */
-int vga32_store_qr_rect(Vga32 *vga, unsigned plane, unsigned slot,
-                        const uint8_t *raster, unsigned qr_start_row,
-                        unsigned qr_size) {
-    uint16_t offset, base;
-    unsigned start_byte, byte_count;
-    if (!vga || !vga->active || !raster || plane > 3 || slot > 7) return 0;
-    start_byte = qr_start_row * 40u;
-    byte_count = qr_size * 40u;
+/* Upload only bytes intersecting the centered QR, including its quiet
+ * zone. Mode 0Dh is one bit per pixel per plane, therefore the 185-pixel
+ * centered region occupies 24 bytes per row instead of the full 40. The
+ * untouched bytes stay white because every VGA slot is cleared on entry. */
+int vga32_store_qr(Vga32 *vga, unsigned plane, unsigned slot,
+                    const uint8_t *raster, unsigned qr_x,
+                    unsigned qr_y, unsigned qr_size) {
+    uint16_t base;
+    unsigned first_byte, last_byte, row, row_bytes;
+    if (!vga || !vga->active || !raster || plane > 3 || slot > 7 ||
+        qr_x >= 320u || qr_y >= 200u || !qr_size ||
+        qr_x + qr_size > 320u || qr_y + qr_size > 200u) return 0;
+    first_byte = qr_x >> 3;
+    last_byte = (qr_x + qr_size + 7u) >> 3;
+    row_bytes = last_byte - first_byte;
     base = (uint16_t)(slot * VGA_SLOT_BYTES);
-    offset = (uint16_t)(base + start_byte);
     plane_write_setup((uint8_t)(1u << plane));
-    memcpy((void *)(vga_memory + offset), raster + start_byte, byte_count);
+    for (row = 0; row < qr_size; ++row) {
+        unsigned src = (qr_y + row) * 40u + first_byte;
+        memcpy((void *)(vga_memory + base + src), raster + src, row_bytes);
+    }
     plane_write_setup(0x0F);
     outp(0x3CE, 4); outp(0x3CF, 0);
     return 1;

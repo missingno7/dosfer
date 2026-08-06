@@ -1,71 +1,66 @@
-# DOSFER32 Build Instructions with QR Fix
+# Building DOSFER32 r24
 
-## Quick Build
-Run the build script from the `dos_sender32` directory:
-```cmd
+## Open Watcom / DOS4GW build
+
+From a Windows command prompt:
+
+```bat
+cd dos_sender32
+set WATCOM=C:\WATCOM
 build32.bat
 ```
 
-The build script will automatically find Watcom in these locations:
-- `..\tools\watcom`
-- `C:\tmp\watcom` 
-- `C:\WATCOM`
-- Or set `%WATCOM%` environment variable manually
+The script also recognizes `..\tools\watcom` and `C:\tmp\watcom` when
+`WATCOM` is not set. It deletes stale executables, maps and object files before
+building, so an old `DOSFER32.EXE` cannot be mistaken for the new source.
 
-## Manual Build
-If you prefer to build manually or need to customize:
-```cmd
-cd dos_sender32
-set WATCOM=C:\tmp\watcom
-set PATH=%WATCOM%\binnt64;%PATH%
-set INCLUDE=%WATCOM%\h;..\dos_sender\include;..\dos_sender\third_party
-wcl386 -q -bt=dos -mf -3s -ot -ol -oi -or -oh -za99 -s -DDOSFER32 -I..\dos_sender\third_party -l=dos4g -fe=build\DOSFER32 -fm=build\DOSFER32 main.c platform_vga.c protocol32.c ..\dos_sender\third_party\qrcodegen.c
+Equivalent compiler invocation:
+
+```bat
+wcl386 -q -bt=dos -mf -3s -ot -ol -oi -or -oh -za99 -s ^
+  -DDOSFER32 -DDOSFER_RS30_FORCE_C -Ithird_party ^
+  -l=dos4g -fe=build\DOSFER32.EXE -fm=build\DOSFER32.MAP ^
+  main.c platform_vga.c protocol32.c timing32.c third_party\qrcodegen.c
 ```
 
-## What Was Fixed
-The QR code positioning bug that caused corruption in the left quarter of all QR codes has been fixed:
+`DOSFER_RS30_FORCE_C` selects the optimized flat 32-bit two-byte RS recurrence.
+It does not select the old scalar byte-at-a-time implementation.
 
-### Before
-- QR codes started at wrong horizontal position (pixel 0)
-- Left quarter of QR codes was corrupted
-- QR codes were not properly centered
+Keep `DOS4GW.EXE` next to `DOSFER32.EXE` when running it.
 
-### After
-- QR codes properly centered at pixel 71 (horizontal)
-- Correct quiet zones: 67 pixels left/right, 4 pixels top/bottom
-- No corruption in any portion of QR codes
+## Host tests before a DOS benchmark
 
-## Testing
-After building, test with:
-```cmd
-cd build
-DOSFER32.EXE testfile.bin /RE:PLANE4 /WINDOW:32 /HOLD:100
+```bash
+./run_host_tests.sh
 ```
 
-## Expected Results
-- QR codes should be perfectly centered in the 320x200 display
-- No visual corruption in any portion of the QR code
-- Android receiver should be able to decode all QR codes successfully
-- Plane streaming should work smoothly with proper delta updates
+For the exhaustive window/EOF boundary matrix:
 
-## Files Modified
-- `main.c`: Fixed `qr_raster_from_matrix()` and `qr_prepare_delta_map()` functions
-- Both functions now use correct horizontal offset of 71 pixels
+```bash
+./run_host_matrix.sh
+```
 
-## Technical Details
-- QR size: 177x177 pixels
-- Display: 320x200 pixels
-- Total QR width with quiet zone: 185 pixels
-- Left margin: (320-185)/2 = 67 pixels
-- QR start position: 67+4 = 71 pixels
+The exhaustive matrix currently runs 840 end-to-end cases across both PLANE
+widths, record-boundary sizes and window sizes from 4 through 128.
 
-## Troubleshooting
-If build fails:
-1. Ensure Watcom is installed at C:\tmp\watcom
-2. Check that all source files are present
-3. Verify qrcodegen.c is accessible at ..\dos_sender\third_party\
+## Required DOS benchmark
 
-If QR codes still appear corrupted:
-1. Verify you're using the newly built executable
-2. Check that the build completed successfully
-3. Test with a simple file first
+Use the same input and emulator configuration when comparing builds. A useful
+baseline command is:
+
+```bat
+DOSFER32.EXE TEST.ZIP /RE:PLANE4 /WINDOW:32 /HOLD:0 /NOFOCUS
+```
+
+For a fixed-3000-cycle CPU benchmark, record at least:
+
+- build ID and executable SHA-256
+- emulator core, CPU type and fixed cycles
+- `DOSFER32.PRO`
+- displayed symbols/s
+- useful file bytes/s
+- producer starvation and underrun duplicates
+- max protocol, encode, delta, upload and correction step times
+
+Do not compare a `/VERIFY`, `/FULLVGA` or `/DUMP` run with a normal run. Those
+modes intentionally add readback, full-page transfers or disk output.

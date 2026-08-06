@@ -32,7 +32,6 @@ typedef enum {
 } VideoMode;
 
 typedef struct {
-    u8 ecc;              /* 0=L, 1=M, 2=Q, 3=H; V40 only */
     u8 repetitions;
     u16 frame_payload;
     u16 hold_ms;

@@ -19,9 +19,9 @@ typedef struct {
 int vga32_enter(Vga32 *vga);
 void vga32_leave(Vga32 *vga);
 int vga32_store_fast(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *raster);
-int vga32_store_qr_rect(Vga32 *vga, unsigned plane, unsigned slot,
-                        const uint8_t *raster, unsigned qr_start_row,
-                        unsigned qr_size);
+int vga32_store_qr(Vga32 *vga, unsigned plane, unsigned slot,
+                    const uint8_t *raster, unsigned qr_x,
+                    unsigned qr_y, unsigned qr_size);
 int vga32_store(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *raster);
 int vga32_show(Vga32 *vga, unsigned slot, unsigned mask);
 int vga32_verify(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *raster);

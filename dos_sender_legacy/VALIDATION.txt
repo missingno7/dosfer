@@ -1,21 +1,50 @@
-DOSfer legacy-clean validation
-==============================
+DOSfer legacy V40-L optimized validation
+=========================================
 
 Scope:
-- fixed QR Version 40 (177x177)
+- fixed QR Version 40-L (177x177)
 - VGA Mode 0Dh / 320x200 only
 - VIDEO:320_60 default, VIDEO:320_70 fallback
+- 16-bit Open Watcom architecture retained
 
-Checks performed in the refactoring environment:
-- sender/config/producer/protocol/VGA/timing/qrcodegen source syntax checked
-  with GCC plus small DOS API compatibility stubs
-- removed-mode scan: no 640x480, Mode 12h, /SCALE, /V or /VERSION code paths
-  remain in src/ or include/
-- configuration harness: default V40-L /PAYLOAD:2904 /VIDEO:320_60 validates;
-  640_60 is rejected and 320_70 remains accepted
-- protocol refactor compared against the pre-cleanup protocol implementation
-  for 500 deterministic randomized frames, including plain, whitened and
-  pair-whitened payloads: byte-for-byte PASS
+Checks performed in this environment:
+
+1. Source syntax
+   - sender/config/producer/protocol/VGA/timing sources checked with GCC plus
+     lightweight DOS API compatibility stubs.
+   - The only expected warning is that `bios_ticks()` is supplied by Watcom
+     `#pragma aux` and therefore has no host-C definition.
+
+2. Fixed V40-L encoder equivalence
+   - 500 deterministic randomized frame lengths from 0..2952 bytes.
+   - all masks 0..7 exercised through randomized selection.
+   - specialized codewords compared with the old canonical
+     qrcodegen_encodeBinaryAligned(V40, ECC L) path: PASS.
+   - specialized full matrices compared with the canonical path: PASS.
+   - full 2952-byte prepacked helper compared with the new fixed frame helper:
+     PASS.
+
+3. Packed VGA delta map
+   - 100 deterministic randomized V40-L transitions.
+   - packed-map delta update compared with a complete canonical raster redraw
+     after every transition: PASS.
+
+4. Configuration
+   - default /PAYLOAD:2904 /VIDEO:320_60 validates.
+   - 320_70 remains accepted.
+   - removed 640_60 remains rejected.
+   - /ECC is no longer a sender option; V40-L is fixed.
+
+5. Protocol
+   - protocol.c was not changed by this optimization pass.
+   - it therefore retains the previous cleanup validation where 500 randomized
+     plain/whitened/pair-whitened frames matched the pre-refactor protocol
+     byte-for-byte.
+
+Not hardware-validated here:
+- direct CRTC page switching
+- custom 320x200 ~59.94 Hz timing on a real VGA adapter/CRT
+- actual Open Watcom generated executable performance
 
 Open Watcom is not installed in this environment, so DOSFER.EXE was not rebuilt.
-Run build.bat with Open Watcom before testing on DOS/DOSBox/real hardware.
+Run build.bat, then use /BENCH and a real transfer on DOSBox/86Box/real hardware.

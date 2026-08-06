@@ -72,8 +72,11 @@ u32 timer_elapsed_ms(u32 a,u32 b) {
     return (d/TIMER_TICKS_PER_SECOND)*1000UL+
         ((d%TIMER_TICKS_PER_SECOND)*1000UL)/TIMER_TICKS_PER_SECOND;
 }
+u32 timer_ticks_from_ms(u16 ms) {
+    return (u32)ms*74UL+((u32)ms*574UL+999UL)/1000UL;
+}
 void timer_wait_ms(u16 ms) {
     u32 start=timer_ticks();
-    u32 need=(u32)ms*74UL+((u32)ms*574UL+999UL)/1000UL;
+    u32 need=timer_ticks_from_ms(ms);
     while (timer_ticks()-start<need) ;
 }

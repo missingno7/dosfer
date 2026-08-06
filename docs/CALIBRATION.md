@@ -16,5 +16,9 @@ experimental and normally off. The alternating marks outside the quiet zone
 help visual stability without changing QR pixels.
 
 `DOSFER /BENCH file` separately reports sequential disk+CRC bytes/s and QR
-encode time. Android reports decoded fps, useful payload B/s, duplicate/missing
-counts and decode latency. Record manual window wait time separately.
+encode time. Android reports requested capture resolution, zero-copy centered
+decode crop, requested and measured sensor/ImageReader FPS, decode attempts,
+duplicate and missing counts, busy-worker drops, exposure time, sensor frame
+duration, and decode latency. The camera section lists discovered YUV modes,
+their theoretical maximum FPS, measured status, and whether automatic or
+manual mode selection is active. Record manual window wait time separately.

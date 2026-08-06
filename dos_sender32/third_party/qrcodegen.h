@@ -396,10 +396,24 @@ int qrcodegen_dosferDataCodewordBytes(int version, enum qrcodegen_Ecc ecl);
 void qrcodegen_dosferReleaseMatrixCache(void);
 bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[], const uint8_t encodedRight[],
 		const uint8_t protocolHeaderXor[48], uint8_t result[]);
+typedef struct qrcodegen_dosferV40LEncoder {
+	const uint8_t *data;
+	uint8_t *result;
+	uint16_t dataOffset;
+	uint8_t block;
+} qrcodegen_dosferV40LEncoder;
+void qrcodegen_dosferV40LBegin(qrcodegen_dosferV40LEncoder *state,
+		const uint8_t dataCodewords[2956], uint8_t result[3706]);
+/* Processes one of the 25 V40-L Reed-Solomon blocks. Returns 1 when the
+ * complete interleaved codeword stream is ready, 0 when more blocks remain,
+ * and -1 for invalid arguments/state. */
+int qrcodegen_dosferV40LStep(qrcodegen_dosferV40LEncoder *state);
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[], uint8_t result[]);
-bool qrcodegen_dosferEncodeFrameV40L(const uint8_t frame[], uint16_t frameLen,
-		uint8_t codewords[], uint8_t workspace[], enum qrcodegen_Mask mask,
-		bool codewordsOnly);
+bool qrcodegen_dosferBuildMatrixV40L(const uint8_t codewords[], uint8_t matrix[],
+        enum qrcodegen_Mask mask);
+bool qrcodegen_dosferHeaderCorrectionV40L(const uint8_t headerDelta[48],
+        uint8_t result[3706]);
+const uint8_t *qrcodegen_dosferRsStep(void);
 
 
 #ifdef __cplusplus

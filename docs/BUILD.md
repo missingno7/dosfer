@@ -17,8 +17,34 @@ DOSfer's GF(256) lookup-table and cached-divisor speed path.
 Requirements: JDK 17+, Android SDK platform 36/build-tools 36, and internet for
 the first dependency resolution. The wrapper pins Gradle 8.11.1, the project
 pins Android Gradle Plugin 8.10.1 and the ZXing-C++ Android/JNI wrapper 3.1.0.
-The scanner feeds retained Camera2 Y planes directly to two native decode
-workers; no bitmap or RGB conversion is used.
+The scanner discovers YUV_420_888 modes through Camera2, prefers a mode that
+can theoretically sustain fixed 60 FPS with a shorter side of at least 1000
+pixels, and can be switched to a persisted manual camera/FPS/resolution choice
+in the UI. The longer side is represented to ZXing-C++ by a centered square
+crop rectangle; the Camera2 Y plane remains retained and is never copied or
+converted to RGB. Runtime stats compare Image timestamps with
+SENSOR_FRAME_DURATION/SENSOR_EXPOSURE_TIME and separately report sensor and
+ImageReader FPS.
+
+The decoder is specialized for DOSfer's fixed QR format: QR-only, one symbol,
+no rotation/inversion/downscale/denoise search, no normal `tryHarder`, and an
+early `DQR1` payload gate. After a successful full-detector read, the receiver
+tracks the reported QR bounds. It enables ZXing-C++ pure mode only for a large,
+centered, near-square, upright-looking tracked crop; any failure resets the
+tracker and returns to the normal QR detector, with occasional `tryHarder`
+recovery. The installed 3.1.0 Android wrapper exposes pure mode and result
+corner positions, but not decoded QR version or a reusable perspective/module
+sampling API, so exact V40 version inspection and direct 177-module reuse are
+not claimed at this layer. The UI reports fast/reuse, full-detector, recovery,
+and busy-drop metrics separately.
+
+The receiver UI always uses a fixed square preview. `CameraCrop` is the single
+raw-buffer crop definition shared by the ImageProxy handed to ZXing-C++ and the
+TextureView transform, so a 1920x1080 stream displays only its centered
+1080x1080 region. The full capture buffer remains the SurfaceTexture buffer;
+only the view-to-buffer transform selects the crop. Preview diagnostics report
+the capture size, crop coordinates, sensor/display rotation, relative rotation,
+and uniform scale.
 
 ```powershell
 cd android_receiver

@@ -25,7 +25,7 @@ extern u32 dosferVgaProfileTicks[5];
 static Producer producer;
 static Window current_window, previous_window;
 static int have_previous;
-static u8 qr_temp[QR_BUFFER+1], qr_code[QR_BUFFER+1], raw_frame[DOSFER_MAX_FRAME_BYTES];
+static u8 qr_codewords[DOSFER_QR_CODEWORDS], qr_workspace[QR_BUFFER+1], raw_frame[DOSFER_MAX_FRAME_BYTES];
 static SelectionStats selection;
 static u32 completed_session,completed_frames,completed_bytes;
 static u32 last_visible_tick;
@@ -71,46 +71,39 @@ static int can_delta(u8 display_mask) {
     return qr_delta_ready&&display_mask==encoded_qr_mask;
 }
 
-static int qr_encode_mask(const u8 *data,u16 n,const Config *cfg,int delta_only,u8 mask) {
-    int ok;
-    memcpy(qr_temp,data,n);
-    qrcodegen_dosferSetCodewordsOnly(delta_only!=0);
-
-    /* V40-L uses the aligned fast path; V40-M/Q/H stay supported through
-     * the canonical fixed-version encoder. The sender no longer supports
-     * any QR version other than 40. */
-    if(cfg->ecc==0)
-        ok=qrcodegen_encodeBinaryAligned(qr_temp,n,qr_code,qrcodegen_Ecc_LOW,
-            DOSFER_QR_VERSION,DOSFER_QR_VERSION,(enum qrcodegen_Mask)mask,0);
-    else
-        ok=qrcodegen_encodeBinary(qr_temp,n,qr_code,(enum qrcodegen_Ecc)cfg->ecc,
-            DOSFER_QR_VERSION,DOSFER_QR_VERSION,(enum qrcodegen_Mask)mask,0);
+static int qr_encode_mask(const u8 *data,u16 n,int delta_only,u8 mask) {
+    int ok=qrcodegen_dosferEncodeFrameV40L(data,n,qr_codewords,qr_workspace,
+        (enum qrcodegen_Mask)mask,delta_only!=0);
     if(ok)encoded_qr_mask=mask;
     return ok;
 }
 
 static int qr_encode(const u8 *data,u16 n,const Config *cfg,int delta_only) {
-    return qr_encode_mask(data,n,cfg,delta_only,cfg->qr_mask);
+    return qr_encode_mask(data,n,delta_only,cfg->qr_mask);
 }
 
-static int make_prepacked_data(const Window *w,u16 i,const Config *cfg,u32 session) {
+static int make_prepacked_data(const Window *w,u16 i,u32 session,u16 flags,u8 mask) {
     const PendingFrame *f=&w->frames[i];
     u16 n;
-    qr_code[0]=0x70;qr_code[1]=0x34;qr_code[2]=0x0B;qr_code[3]=0x88;
-    n=make_frame(qr_code+4,FK_DATA,FF_WHITENED,session,w->id,f->global_index,
+    qr_workspace[0]=0x70;qr_workspace[1]=0x34;qr_workspace[2]=0x0B;qr_workspace[3]=0x88;
+    n=make_frame(qr_workspace+4,FK_DATA,flags,session,w->id,f->global_index,
         i,w->count,f->stream_id,f->stream_offset,f->payload,f->payload_len);
     if(n!=2952)return 0;
-    _fmemcpy(raw_frame,qr_code+4,FRAME_HEADER_SIZE);
-    if(!qrcodegen_dosferEncodePrepackedV40L(qr_code,qr_temp))return 0;
-    encoded_qr_mask=cfg->qr_mask;
+    _fmemcpy(raw_frame,qr_workspace+4,FRAME_HEADER_SIZE);
+    if(!qrcodegen_dosferEncodePrepackedV40L(qr_workspace,qr_codewords))return 0;
+    encoded_qr_mask=mask;
     return n;
 }
 
-static void wait_minimum_hold(u16 hold_ms) {
-    u32 elapsed;
-    if(!last_visible_tick)return;
-    elapsed=timer_elapsed_ms(last_visible_tick,timer_ticks());
-    if(elapsed<hold_ms)timer_wait_ms((u16)(hold_ms-elapsed));
+static int display_encoded(const Config *cfg,const char *status,int delta,u16 hold_ms) {
+    u32 earliest=0;
+    if(last_visible_tick&&hold_ms)
+        earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
+    if(!vga_show_qr_stream_at(qr_workspace,qr_codewords,cfg->invert,
+            status,delta,earliest))return 0;
+    qr_delta_ready=vga_delta_ready();
+    last_visible_tick=vga_last_flip_tick();
+    return 1;
 }
 
 static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
@@ -126,18 +119,18 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
        chain_cache_index==i&&chain_cache_mask==display_mask) {
         n=chain_cache_rawlen;
         _fmemcpy(raw_frame,chain_cached_raw,FRAME_HEADER_SIZE);
-        _fmemcpy(qr_temp,chain_right_codewords,DOSFER_QR_CODEWORDS);
+        _fmemcpy(qr_codewords,chain_right_codewords,DOSFER_QR_CODEWORDS);
         encoded_qr_mask=display_mask;
         chain_cache_valid=0;
-    } else if(delta&&!repeated&&display_mask==cfg->qr_mask&&cfg->ecc==0&&
-              f->payload_len==2904) {
-        n=(u16)make_prepacked_data(w,i,cfg,session);
+    } else if(delta&&f->payload_len==2904) {
+        n=(u16)make_prepacked_data(w,i,session,
+            (u16)((repeated?FF_REPEATED:0)|FF_WHITENED),display_mask);
         if(!n)return 0;
     } else {
         n=make_frame(raw_frame,FK_DATA,(repeated?FF_REPEATED:0)|FF_WHITENED,
             session,w->id,f->global_index,i,w->count,f->stream_id,
             f->stream_offset,f->payload,f->payload_len);
-        if(!qr_encode_mask(raw_frame,n,cfg,delta,display_mask))return 0;
+        if(!qr_encode_mask(raw_frame,n,delta,display_mask))return 0;
     }
 
     if(waiting)
@@ -146,15 +139,10 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
         sprintf(status,"W%lu F%u/%u RESCUE %ums M%u",
             w->id+1,i+1,w->count,hold_ms,display_mask);
     else
-        sprintf(status,"TRANSFER V40%c W%lu F%u/%u",
-            "LMQH"[cfg->ecc],w->id+1,i+1,w->count);
+        sprintf(status,"TRANSFER V40L W%lu F%u/%u",
+            w->id+1,i+1,w->count);
 
-    wait_minimum_hold(hold_ms);
-    if(!vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
-            status,delta))return 0;
-    qr_delta_ready=vga_delta_ready();
-    last_visible_tick=timer_ticks();
-    return 1;
+    return display_encoded(cfg,status,delta,hold_ms);
 }
 
 static u32 read_u32be(const u8 *p) {
@@ -183,17 +171,17 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
     /* C2 has a V40-L affine shortcut: encode the right DATA frame once,
      * derive the XOR QR from the two canonical codeword streams, then cache
      * the right frame because it is the next DATA frame to display. */
-    if(delta&&cfg->ecc==0&&ensure_chain_cache()) {
+    if(delta&&ensure_chain_cache()) {
         _fmemcpy(left_header,raw_frame,FRAME_HEADER_SIZE);
-        _fmemcpy(chain_left_codewords,qr_temp,DOSFER_QR_CODEWORDS);
-        qr_code[0]=0x70;qr_code[1]=0x34;qr_code[2]=0x0B;qr_code[3]=0x88;
-        right_rawlen=make_frame(qr_code+4,FK_DATA,FF_WHITENED,session,w->id,
+        _fmemcpy(chain_left_codewords,qr_codewords,DOSFER_QR_CODEWORDS);
+        qr_workspace[0]=0x70;qr_workspace[1]=0x34;qr_workspace[2]=0x0B;qr_workspace[3]=0x88;
+        right_rawlen=make_frame(qr_workspace+4,FK_DATA,FF_WHITENED,session,w->id,
             right->global_index,i+1,w->count,right->stream_id,right->stream_offset,
             right->payload,right->payload_len);
-        _fmemcpy(chain_cached_raw,qr_code+4,FRAME_HEADER_SIZE);
-        if(right_rawlen==2952&&qrcodegen_dosferEncodePrepackedV40L(qr_code,qr_temp)) {
+        _fmemcpy(chain_cached_raw,qr_workspace+4,FRAME_HEADER_SIZE);
+        if(right_rawlen==2952&&qrcodegen_dosferEncodePrepackedV40L(qr_workspace,qr_codewords)) {
             encoded_qr_mask=cfg->qr_mask;
-            _fmemcpy(chain_right_codewords,qr_temp,DOSFER_QR_CODEWORDS);
+            _fmemcpy(chain_right_codewords,qr_codewords,DOSFER_QR_CODEWORDS);
             chain_cache_valid=1;
             chain_cache_session=session;
             chain_cache_window=w->id;
@@ -213,7 +201,7 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
         for(j=0;j<FRAME_HEADER_SIZE;++j)
             header_xor[j]=(u8)(left_header[j]^chain_cached_raw[j]^raw_frame[j]);
         derived=qrcodegen_dosferDeriveXorV40L(chain_left_codewords,
-            chain_right_codewords,header_xor,qr_temp);
+            chain_right_codewords,header_xor,qr_codewords);
         if(derived)encoded_qr_mask=cfg->qr_mask;
     }
 
@@ -221,16 +209,11 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
         n=xor_frame_payload(left,right);
         rawlen=make_frame(raw_frame,FK_CHAIN_XOR,FF_PAIR_WHITENED,session,w->id,
             left->global_index,i,w->count,lengths,0,chain_payload,n);
-        if(!qr_encode_mask(raw_frame,rawlen,cfg,delta,cfg->qr_mask))return 0;
+        if(!qr_encode_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
     }
 
-    sprintf(status,"TRANSFER V40%c XOR %u-%u/%u","LMQH"[cfg->ecc],i+1,i+2,w->count);
-    wait_minimum_hold(hold_ms);
-    if(!vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
-            status,delta))return 0;
-    qr_delta_ready=vga_delta_ready();
-    last_visible_tick=timer_ticks();
-    return 1;
+    sprintf(status,"TRANSFER V40L XOR %u-%u/%u",i+1,i+2,w->count);
+    return display_encoded(cfg,status,delta,hold_ms);
 }
 
 static u16 xor_block_payload(const Window *w,u16 first,u16 count) {
@@ -255,16 +238,11 @@ static int show_block_parity(const Window *w,u16 first,u16 count,const Config *c
 
     rawlen=make_frame(raw_frame,FK_BLOCK_XOR,FF_WHITENED,session,w->id,
         base->global_index,first,w->count,count,0,chain_payload,n);
-    if(!qr_encode_mask(raw_frame,rawlen,cfg,delta,cfg->qr_mask))return 0;
+    if(!qr_encode_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
 
-    sprintf(status,"TRANSFER V40%c XOR %u-%u/%u","LMQH"[cfg->ecc],
+    sprintf(status,"TRANSFER V40L XOR %u-%u/%u",
         first+1,first+count,w->count);
-    wait_minimum_hold(hold_ms);
-    if(!vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
-            status,delta))return 0;
-    qr_delta_ready=vga_delta_ready();
-    last_visible_tick=timer_ticks();
-    return 1;
+    return display_encoded(cfg,status,delta,hold_ms);
 }
 
 static void flush_keys(void) {
@@ -353,13 +331,8 @@ static void show_eow(const Window *w,const Config *cfg,u32 session,int filtered)
         w->frames[w->count-1].global_index,0,w->count,0,0,0,0);
     delta=can_delta(cfg->qr_mask);
     if(qr_encode(raw_frame,n,cfg,delta)) {
-        wait_minimum_hold(cfg->hold_ms);
         sprintf(status,"W%lu DONE  Enter R M B +/- Esc",w->id+1);
-        if(vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
-                status,delta)) {
-            qr_delta_ready=vga_delta_ready();
-            last_visible_tick=timer_ticks();
-        }
+        display_encoded(cfg,status,delta,cfg->hold_ms);
     }
     if(cfg->speaker)speaker_beep();
 }
@@ -433,12 +406,12 @@ static int run_transfer(FILE *mf,Config *cfg) {
     /* Reserve the next window before entering graphics mode. This prevents a
        large /WINDOW setting from failing only after the first batch is sent. */
     if(!producer.finished&&!producer_reserve_window(&previous_window,cfg))return 0;
-    if(cfg->chain_width==2&&cfg->ecc==0)ensure_chain_cache();
+    if(cfg->chain_width==2)ensure_chain_cache();
     if(!enter_transfer_vga(cfg))return 0;
 
     if(!show_frame(&current_window,0,cfg,session,0,1,cfg->hold_ms,cfg->qr_mask)) {
         vga_leave();
-        puts("Could not build the first V40 QR; check /ECC and /PAYLOAD.");
+        puts("Could not build the first V40-L QR; check /PAYLOAD.");
         return 0;
     }
 
@@ -454,7 +427,7 @@ static int run_transfer(FILE *mf,Config *cfg) {
     for(;;) {
         if(!transmit(&current_window,cfg,session,0,0,0)) {
             vga_leave();
-            puts("QR frame does not fit V40; reduce /PAYLOAD or use a lower ECC level.");
+            puts("QR frame does not fit fixed V40-L; reduce /PAYLOAD.");
             return 0;
         }
 
@@ -553,6 +526,9 @@ static int calibration(Config *cfg) {
     char status[41];
 
     if(!vga_enter(cfg->video_mode))return 0;
+    last_visible_tick=0;
+    qr_delta_ready=0;
+    encoded_qr_mask=-1;
     for(;;) {
         n=cfg->frame_payload;
         if(n>sizeof(payload))n=sizeof(payload);
@@ -563,12 +539,13 @@ static int calibration(Config *cfg) {
 
         n=make_frame(raw_frame,FK_CALIBRATION,0,session,0,seq,
             (u16)(seq&0xFFFF),100,0,0,payload,n);
-        if(!qr_encode(raw_frame,n,cfg,0)){vga_leave();return 0;}
-
-        sprintf(status,"CAL V40%c %s hold %u","LMQH"[cfg->ecc],
-            config_video_name(cfg),cfg->hold_ms);
-        if(!vga_show_qr(qr_code,cfg->invert,status)){vga_leave();return 0;}
-        timer_wait_ms(cfg->hold_ms);
+        {
+            int delta=can_delta(cfg->qr_mask);
+            if(!qr_encode(raw_frame,n,cfg,delta)){vga_leave();return 0;}
+            sprintf(status,"CAL V40L %s hold %u",
+                config_video_name(cfg),cfg->hold_ms);
+            if(!display_encoded(cfg,status,delta,cfg->hold_ms)){vga_leave();return 0;}
+        }
         ++seq;
 
         if(!_bios_keybrd(_KEYBRD_READY))continue;
@@ -636,8 +613,8 @@ static void benchmark(const char *path,Config *cfg) {
     t1=timer_ticks();
     elapsed=timer_elapsed_ms(t0,t1);
     protocol_ms=elapsed/25UL;
-    printf("Config: fixed V40-%c, payload %u, video %s, mask %u\n",
-        "LMQH"[cfg->ecc],cfg->frame_payload,config_video_name(cfg),cfg->qr_mask);
+    printf("Config: fixed V40-L, payload %u, video %s, mask %u\n",
+        cfg->frame_payload,config_video_name(cfg),cfg->qr_mask);
     printf("Protocol x25: %lu ms (%lu ms/frame)\n",elapsed,protocol_ms);
 
 #ifdef DOSFER_PROFILE
@@ -658,7 +635,11 @@ static void benchmark(const char *path,Config *cfg) {
 #endif
 
     if(!vga_enter(cfg->video_mode)){puts("VGA benchmark unavailable.");return;}
-    vga_benchmark_qr(qr_code,25,&build_ms,&copy_ms,&text_ms);
+    {
+        u32 hz100=vga_measure_refresh_hz100(60);
+        printf("Measured VGA refresh: %lu.%02lu Hz\n",hz100/100UL,hz100%100UL);
+    }
+    vga_benchmark_qr(qr_workspace,25,&build_ms,&copy_ms,&text_ms);
     printf("VGA full build x25: %lu ms (%lu ms/frame)\n",build_ms,build_ms/25UL);
     printf("VGA flip/copy x25: %lu ms (%lu ms/frame)\n",copy_ms,copy_ms/25UL);
     printf("VGA status x25: %lu ms (%lu ms/frame)\n",text_ms,text_ms/25UL);
@@ -667,7 +648,7 @@ static void benchmark(const char *path,Config *cfg) {
     rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,0,0,1,0,0,b,cfg->frame_payload);
     t0=timer_ticks();
     if(!qr_encode(raw_frame,rawlen,cfg,0)||
-       !vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
+       !vga_show_qr_stream(qr_workspace,qr_codewords,cfg->invert,
             "BENCH first V40 frame",0))ok=0;
     t1=timer_ticks();
     first_ms=timer_elapsed_ms(t0,t1);
@@ -684,7 +665,7 @@ static void benchmark(const char *path,Config *cfg) {
         rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,(u32)i,0,1,0,0,
             b,cfg->frame_payload);
         if(!qr_encode(raw_frame,rawlen,cfg,qr_delta_ready)||
-           !vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
+           !vga_show_qr_stream(qr_workspace,qr_codewords,cfg->invert,
                 "BENCH delta V40 frame",qr_delta_ready))ok=0;
         qr_delta_ready=vga_delta_ready();
     }
@@ -695,7 +676,7 @@ static void benchmark(const char *path,Config *cfg) {
         dirty_hash=vga_screen_hash();
         display_ok=vga_display_matches();
         if(qr_encode(raw_frame,rawlen,cfg,0)&&
-           vga_show_qr_stream(qr_code,qr_temp,DOSFER_QR_CODEWORDS,cfg->invert,
+           vga_show_qr_stream(qr_workspace,qr_codewords,cfg->invert,
                 "BENCH canonical redraw",0)) {
             full_hash=vga_screen_hash();
             redraw_ok=dirty_hash==full_hash;
@@ -705,7 +686,7 @@ static void benchmark(const char *path,Config *cfg) {
         printf("Stateful raster: %s (%08lX/%08lX), VGA page: %s\n",
             redraw_ok?"MATCH":"FAIL",dirty_hash,full_hash,display_ok?"MATCH":"FAIL");
         {u32 du,dc,dt;
-            vga_benchmark_delta(qr_temp,DOSFER_QR_CODEWORDS,24,&du,&dc,&dt);
+            vga_benchmark_delta(qr_codewords,24,&du,&dc,&dt);
             printf("Delta microbench x24: update %lu ms, flip %lu ms, status %lu ms\n",du,dc,dt);
         }
 #ifdef DOSFER_PROFILE
@@ -765,8 +746,8 @@ int main(int argc,char **argv) {
     if(!selection.files&&!selection.dirs){config_print_usage(&cfg);fclose(mf);remove(MANIFEST_NAME);return 1;}
     est=1+selection.dirs+selection.files*2+selection.bytes/(cfg.frame_payload-28)+1;
     printf("Selected: %lu files, %lu directories, %lu bytes, approximately %lu QR frames.\n",selection.files,selection.dirs,selection.bytes,est);
-    printf("Settings: V40-%c mask %u, video %s, %u ms hold, window %u, repeats %u, redundancy %s.\n",
-        "LMQH"[cfg.ecc],cfg.qr_mask,config_video_name(&cfg),cfg.hold_ms,cfg.window_frames,
+    printf("Settings: V40-L mask %u, video %s, %u ms hold, window %u, repeats %u, redundancy %s.\n",
+        cfg.qr_mask,config_video_name(&cfg),cfg.hold_ms,cfg.window_frames,
         cfg.repetitions,config_redundancy_name(&cfg));
     puts("Preparing the first QR code...");
     rc=run_transfer(mf,&cfg);sender_cleanup();fclose(mf);remove(MANIFEST_NAME);

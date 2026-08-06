@@ -4,7 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "../dos_sender/third_party/qrcodegen.h"
+#include "qrcodegen.h"
 
 #define QR_SIZE 177u
 #define VGA_RASTER_BYTES 8000u
@@ -60,23 +60,22 @@ static void raster_per_module_centered(const uint8_t *matrix, uint8_t *raster) {
 
 static void raster_batched_left(const uint8_t *matrix, uint8_t *raster) {
     unsigned y, i;
-    memset(raster, 0, VGA_RASTER_BYTES);
+    memset(raster, 0xFF, VGA_RASTER_BYTES);
     for (y = 0; y < QR_SIZE; ++y) {
         uint8_t *dst = raster + (y + 4u) * 40u;
-        for (i = 0; i < 23u; ++i) {
-            unsigned bit = y * QR_SIZE + i * 8u;
+        for (i = 0; i < QR_SIZE; i += 8u) {
+            unsigned bit = y * QR_SIZE + i;
             const uint8_t *src = matrix + 1u + (bit >> 3);
             unsigned shift = bit & 7u;
             uint32_t packed = (uint32_t)src[0] | ((uint32_t)src[1] << 8) |
                 ((uint32_t)src[2] << 16);
-            uint8_t v = (uint8_t)(packed >> shift);
-            if (i == 22u) v &= 1u;
-            v = reverse_bits[v];
-            dst[i] |= (uint8_t)(v >> 4);
-            dst[i + 1u] |= (uint8_t)(v << 4);
+            uint8_t chunk = (uint8_t)((packed >> shift) & 0xFFu);
+            unsigned px = 71u + i;
+            if (chunk & 1u) dst[px >> 3] &= (uint8_t)~(0x80u >> (px & 7u));
+            if (i + 1u < QR_SIZE)
+                dst[(px >> 3) + 1u] &= (uint8_t)~reverse_bits[chunk >> 1];
         }
     }
-    for (i = 0; i < VGA_RASTER_BYTES; ++i) raster[i] = (uint8_t)~raster[i];
 }
 
 static int raster_diff(const uint8_t *a, const uint8_t *b, int *first_diff) {

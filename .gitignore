@@ -9,6 +9,7 @@
 /dos_sender32/*.PRO
 /dos_sender32/*.TRC
 /dos_sender32/build_old/
+/dos_sender32/.host_build/
 /dos_sender/dos_sender.zip
 /dos_sender/*.err
 /dos_sender/*.map
