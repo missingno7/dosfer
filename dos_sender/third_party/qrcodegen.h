@@ -410,6 +410,10 @@ bool qrcodegen_dosferBuildMatrixV40L(const uint8_t codewords[], uint8_t qrcode[]
 		enum qrcodegen_Mask mask);
 uint32_t qrcodegen_dosferStateHash(void);
 
+/* Expose the RS step table for delta-first RS processing. */
+const uint8_t *qrcodegen_dosferRsStep(void);
+#define DOSFER_RS_STRIDE_EXPOSED 32
+
 
 #ifdef DOSFER_RS30_TEST
 #include <stdio.h>

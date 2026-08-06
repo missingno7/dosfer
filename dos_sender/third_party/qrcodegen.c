@@ -464,6 +464,98 @@ static void dosferRs30Flat(const uint8_t *data, uint16_t len,
 	parm [esi] [ecx] [ebx] [edi] \
 	modify [eax ebp esi ecx];
 
+/* Two-byte flat RS recurrence: consume two input bytes per iteration.
+ * This halves loop overhead and address calculations compared to the
+ * one-byte dosferRs30Flat kernel.  The recurrence is:
+ *
+ *   f1 = data[0] ^ ecc[0]
+ *   f2 = data[1] ^ ecc[1] ^ row(f1)[0]
+ *   B[j] = E[j+2] ^ row(f1)[j+1] ^ row(f2)[j]   for j = 0..29
+ *
+ * where row(f) = table + f*32.  The 30-byte update is unrolled into
+ * seven 4-byte XORs (28 bytes) plus one 2-byte XOR (bytes 28-29).
+ * The tail byte (ecc[30]) is not touched because the caller zeroed it
+ * and the portable kernel never reads it. */
+static void dosferRs30PairFlat(const uint8_t *data, uint16_t len,
+		const uint8_t *table, uint8_t *ecc);
+#pragma aux dosferRs30PairFlat = \
+	"cmp ecx,2" \
+	"jb rsfp_single" \
+	"rsfp_loop:" \
+	/* f1 = data[0] ^ ecc[0] */ \
+	"mov al,[esi]" \
+	"xor al,[edi]" \
+	"xor ah,ah" \
+	"shl eax,5" \
+	"add eax,ebx" \
+	"mov ebp,eax" \
+	/* f2 = data[1] ^ ecc[1] ^ row(f1)[0] */ \
+	"mov al,[esi+1]" \
+	"xor al,[edi+1]" \
+	"xor al,[ebp]" \
+	"xor ah,ah" \
+	"shl eax,5" \
+	"add eax,ebx" \
+	"mov edx,eax" \
+	"add esi,2" \
+	/* 30-byte update: B[j] = E[j+2] ^ row(f1)[j+1] ^ row(f2)[j] */ \
+	"mov eax,[edi+2]" \
+	"xor eax,[ebp+1]" \
+	"xor eax,[edx]" \
+	"mov [edi],eax" \
+	"mov eax,[edi+6]" \
+	"xor eax,[ebp+5]" \
+	"xor eax,[edx+4]" \
+	"mov [edi+4],eax" \
+	"mov eax,[edi+10]" \
+	"xor eax,[ebp+9]" \
+	"xor eax,[edx+8]" \
+	"mov [edi+8],eax" \
+	"mov eax,[edi+14]" \
+	"xor eax,[ebp+13]" \
+	"xor eax,[edx+12]" \
+	"mov [edi+12],eax" \
+	"mov eax,[edi+18]" \
+	"xor eax,[ebp+17]" \
+	"xor eax,[edx+16]" \
+	"mov [edi+16],eax" \
+	"mov eax,[edi+22]" \
+	"xor eax,[ebp+21]" \
+	"xor eax,[edx+20]" \
+	"mov [edi+20],eax" \
+	"mov eax,[edi+26]" \
+	"xor eax,[ebp+25]" \
+	"xor eax,[edx+24]" \
+	"mov [edi+24],eax" \
+	"mov ax,[edi+30]" \
+	"xor al,[ebp+29]" \
+	"mov [edi+28],ax" \
+	"sub ecx,2" \
+	"cmp ecx,2" \
+	"jae rsfp_loop" \
+	"rsfp_single:" \
+	"test ecx,ecx" \
+	"jz rsfp_done" \
+	/* tail: single byte */ \
+	"xor eax,eax" \
+	"mov al,[esi]" \
+	"xor al,[edi]" \
+	"shl eax,5" \
+	"add eax,ebx" \
+	"mov ebp,eax" \
+	"mov eax,[edi+1]" "xor eax,[ebp]" "mov [edi],eax" \
+	"mov eax,[edi+5]" "xor eax,[ebp+4]" "mov [edi+4],eax" \
+	"mov eax,[edi+9]" "xor eax,[ebp+8]" "mov [edi+8],eax" \
+	"mov eax,[edi+13]" "xor eax,[ebp+12]" "mov [edi+12],eax" \
+	"mov eax,[edi+17]" "xor eax,[ebp+16]" "mov [edi+16],eax" \
+	"mov eax,[edi+21]" "xor eax,[ebp+20]" "mov [edi+20],eax" \
+	"mov eax,[edi+25]" "xor eax,[ebp+24]" "mov [edi+24],eax" \
+	"mov al,[edi+29]" "xor al,[ebp+28]" "mov [edi+28],al" \
+	"mov al,[ebp+29]" "mov [edi+29],al" \
+	"rsfp_done:" \
+	parm [esi] [ecx] [ebx] [edi] \
+	modify [eax edx ebp esi ecx];
+
 #ifdef DOSFER_RS30_PROVE_BUG
 /* Pre-fix assembly: xor ah,ah leaves stale bits 16-31 in EAX before shl eax,5. */
 static void dosferRs30FlatBuggy(const uint8_t *data, uint16_t len,
@@ -881,7 +973,7 @@ testable void addEccAndInterleave(uint8_t data[], int version, enum qrcodegen_Ec
 			#endif
 		} else if (blockEccLen == 30) {
 			#if defined(__WATCOMC__) && defined(DOSFER32) && !defined(DOSFER_RS30_FORCE_C) && !defined(DOSFER_RS30_TEST)
-			dosferRs30Flat(dat,(uint16_t)datLen,rsStep,eccLocal);
+			dosferRs30PairFlat(dat,(uint16_t)datLen,rsStep,eccLocal);
 			#elif defined(__WATCOMC__) && defined(DOSFER32) && defined(DOSFER_RS30_TEST)
 			if (dosferRs30UseAsm)
 				#if defined(DOSFER_RS30_PROVE_BUG)
@@ -1150,6 +1242,11 @@ uint32_t qrcodegen_dosferStateHash(void) {
 	for(i=0;i<qrcodegen_REED_SOLOMON_DEGREE_MAX;++i){h^=dosferRsDiv[i];h*=16777619UL;}
 	h^=(uint32_t)dosferRsDegree;h*=16777619UL;
 	return h;
+}
+
+const uint8_t *qrcodegen_dosferRsStep(void) {
+	dosferPrepareRs(30);
+	return dosferRsStep;
 }
 
 

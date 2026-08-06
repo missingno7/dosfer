@@ -156,6 +156,26 @@ int vga32_store_fast(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *r
     return 1;
 }
 
+/* Upload only the QR rectangle (rows QR_QUIET through QR_QUIET+QR_SIZE-1).
+ * Each row is 40 bytes, so the rectangle is QR_SIZE * 40 bytes starting
+ * at offset QR_QUIET * 40.  This saves ~12% of the upload bandwidth. */
+int vga32_store_qr_rect(Vga32 *vga, unsigned plane, unsigned slot,
+                        const uint8_t *raster, unsigned qr_start_row,
+                        unsigned qr_size) {
+    uint16_t offset, base;
+    unsigned start_byte, byte_count;
+    if (!vga || !vga->active || !raster || plane > 3 || slot > 7) return 0;
+    start_byte = qr_start_row * 40u;
+    byte_count = qr_size * 40u;
+    base = (uint16_t)(slot * VGA_SLOT_BYTES);
+    offset = (uint16_t)(base + start_byte);
+    plane_write_setup((uint8_t)(1u << plane));
+    memcpy((void *)(vga_memory + offset), raster + start_byte, byte_count);
+    plane_write_setup(0x0F);
+    outp(0x3CE, 4); outp(0x3CF, 0);
+    return 1;
+}
+
 int vga32_store(Vga32 *vga, unsigned plane, unsigned slot, const uint8_t *raster) {
     if (!vga32_store_fast(vga, plane, slot, raster)) return 0;
     return vga32_verify(vga, plane, slot, raster);

@@ -1,6 +1,7 @@
 #include "platform_vga.h"
 #include "protocol32.h"
 #include "qrcodegen.h"
+#include "timing32.h"
 #include <conio.h>
 #include <direct.h>
 #include <dos.h>
@@ -38,6 +39,14 @@ typedef struct {
     unsigned history_count;
     unsigned disk_pos[DISK_RING_SLOTS], disk_len[DISK_RING_SLOTS];
     unsigned disk_slot;
+    int zero_codewords_cached;
+    uint8_t *header_basis;
+    int header_basis_ready;
+    uint8_t *keystream;
+    int keystream_ready;
+    uint32_t keystream_index;
+    uint8_t *previous_input;  /* 2956-byte previous QR input for delta-first RS */
+    int delta_first_ready;    /* Set after first frame establishes previous_input */
 } WorkMemory;
 
 typedef struct {
@@ -117,8 +126,27 @@ static void trace_group(const char *event, const PreparedGroup *g) {
     fflush(trace_file);
 }
 
-static uint32_t now_ticks(void) { return (uint32_t)clock(); }
-static uint32_t ticks_ms(uint32_t t) { return (t * 1000UL) / (uint32_t)CLOCKS_PER_SEC; }
+static uint32_t now_ticks(void) { return timer_ticks(); }
+static uint32_t ticks_ms(uint32_t t) { return timer_elapsed_ms(0, t); }
+#define TICKS_PER_SEC 74574UL
+#define DISPLAY_INTERVAL_TICKS (TICKS_PER_SEC / 20UL)  /* 50 ms at 20 FPS */
+
+/* Absolute-deadline playback scheduler.
+ *
+ * The timeline starts at g_timeline_start and advances by exactly
+ * DISPLAY_INTERVAL_TICKS (50 ms) per symbol.  The next deadline is
+ * g_next_deadline.  When now >= g_next_deadline, the next symbol should
+ * be shown and g_next_deadline advances by one interval.
+ *
+ * If the producer is late, the current symbol stays visible for another
+ * complete interval (duplicate), and the deadline advances by one interval.
+ * No catch-up bursts are allowed.
+ */
+static uint32_t g_timeline_start = 0;
+static uint32_t g_next_deadline = 0;
+static unsigned g_display_interval_idx = 0;
+static unsigned g_underrun_duplicates = 0;
+static unsigned g_burst_catchups = 0;
 
 static int dump_write_bin(const char *name, const uint8_t *data, unsigned len) {
     char path[80];
@@ -494,35 +522,94 @@ static void qr_restore_basis_delta(WorkMemory *w) {
     modify [eax ebp];
 #endif
 
+/* Precompute the RS correction contribution for every possible header bit.
+ * V40-L has a 48-byte protocol header; each of the 384 bits produces a
+ * 3706-byte correction codeword vector.  At runtime, header correction is
+ * constructed by XORing the precomputed entries for set bits — no fresh
+ * RS encode is needed per group. */
+static int precompute_header_basis(WorkMemory *w) {
+    unsigned bit, byte_idx, bit_idx;
+    if (w->header_basis_ready) return 1;
+    if (!w->header_basis) {
+        w->header_basis = (uint8_t *)malloc((size_t)384 * QR_CODEWORDS);
+        if (!w->header_basis) return 0;
+    }
+    memset(w->header_basis, 0, (size_t)384 * QR_CODEWORDS);
+    for (bit = 0; bit < 384u; ++bit) {
+        uint8_t *out = w->header_basis + (size_t)bit * QR_CODEWORDS;
+        uint8_t hdr[DOS32_FRAME_HEADER];
+        memset(hdr, 0, DOS32_FRAME_HEADER);
+        byte_idx = bit >> 3;
+        bit_idx = bit & 7;
+        hdr[byte_idx] = (uint8_t)(1u << bit_idx);
+        if (!qrcodegen_dosferHeaderCorrectionV40L(hdr, out)) return 0;
+    }
+    w->header_basis_ready = 1;
+    return 1;
+}
+
+static void apply_header_correction_fast(WorkMemory *w, const uint8_t *header_delta,
+                                         uint8_t *out) {
+    unsigned bit, byte_idx, bit_idx;
+    memset(out, 0, QR_CODEWORDS);
+    for (bit = 0; bit < 384u; ++bit) {
+        byte_idx = bit >> 3;
+        bit_idx = bit & 7;
+        if (header_delta[byte_idx] & (uint8_t)(1u << bit_idx)) {
+            const uint8_t *basis = w->header_basis + (size_t)bit * QR_CODEWORDS;
+            unsigned i;
+            for (i = 0; i < QR_CODEWORDS; ++i) out[i] ^= basis[i];
+        }
+    }
+}
+
 static int qr_prepare_correction_patches(Vga32 *vga, WorkMemory *w,
         const uint8_t *zero_codewords, const uint8_t *correction_codewords,
         uint16_t *patch_offset, uint8_t *patch_xor, uint16_t *patch_count) {
-    unsigned i;
-    if (!vga->zero_raster) return 0;
+    unsigned i, bit;
+    /* Build the zero raster once. */
     if (!vga->zero_ready) {
         if (!qrcodegen_dosferBuildMatrixV40L(zero_codewords, w->matrix,
                 qrcodegen_Mask_0)) return 0;
         qr_raster_from_matrix(w);
         memcpy(vga->zero_raster, w->raster, VGA_RASTER_BYTES);
         vga->zero_ready = 1;
-    } else {
-        memcpy(w->raster, vga->zero_raster, VGA_RASTER_BYTES);
     }
-    memcpy(w->previous_codewords, zero_codewords, QR_CODEWORDS);
-#if defined(__WATCOMC__) && defined(DOSFER32)
-    dosfer_delta32(correction_codewords, w->previous_codewords, w->raster,
-                   w->delta_entries, QR_CODEWORDS);
-#else
-    qr_apply_codeword_delta(w, w->raster, zero_codewords, correction_codewords);
-#endif
+    /* Generate correction patches directly from codeword deltas.
+     * For each changed bit in the correction codewords, look up the
+     * raster offset and pixel mask from the delta_entries map, then
+     * accumulate the XOR into the patch list.  This avoids materializing
+     * or scanning a complete 8000-byte correction raster. */
     *patch_count = 0;
-    for (i = 0; i < VGA_RASTER_BYTES; ++i) {
-        uint8_t x = (uint8_t)(w->raster[i] ^ vga->zero_raster[i]);
-        if (!x) continue;
-        if (*patch_count >= VGA_PLANE_MAX_CORRECTION_PATCHES) return 0;
-        patch_offset[*patch_count] = (uint16_t)i;
-        patch_xor[*patch_count] = x;
-        ++*patch_count;
+    for (i = 0; i < QR_CODEWORDS; ++i) {
+        uint8_t changed = (uint8_t)(correction_codewords[i] ^ zero_codewords[i]);
+        if (!changed) continue;
+        for (bit = 0; bit < 8; ++bit) {
+            uint32_t entry;
+            uint8_t mask;
+            if (!(changed & (uint8_t)(0x80u >> bit))) continue;
+            entry = w->delta_entries[i * 8u + bit];
+            mask = (uint8_t)(entry >> 16);
+            if (!mask) continue;
+            { unsigned j, off = (unsigned)(entry & 0xFFFFu);
+              /* The zero raster already has the correct pixel value for
+               * the zero codeword.  The correction flips it.  Merge into
+               * the existing patch list (linear scan, but patches are
+               * typically very few). */
+              for (j = 0; j < *patch_count; ++j) {
+                  if (patch_offset[j] == off) {
+                      patch_xor[j] ^= mask;
+                      break;
+                  }
+              }
+              if (j == *patch_count) {
+                  if (*patch_count >= VGA_PLANE_MAX_CORRECTION_PATCHES) return 0;
+                  patch_offset[*patch_count] = (uint16_t)off;
+                  patch_xor[*patch_count] = mask;
+                  ++*patch_count;
+              }
+            }
+        }
     }
     return 1;
 }
@@ -534,24 +621,291 @@ static int qr_encode_wire_codewords(WorkMemory *w, const uint8_t *wire, uint8_t 
     return qrcodegen_dosferEncodePrepackedV40L(w->input, out_codewords) != 0;
 }
 
-static int qr_render(WorkMemory *w, const uint8_t *wire, int delta_only) {
-    /* PLANE_CODED frames are always fixed-length V40-L records.  Feed the
-       already packed ECI/byte header directly to the specialized encoder;
-       this bypasses the generic segment planner and its buffer shuffling. */
+/* Delta-first RS pipeline.
+ *
+ * V40-L layout (fixed):
+ *   25 blocks
+ *   19 short blocks: 118 data bytes + 30 ECC bytes
+ *   6 long blocks:   119 data bytes + 30 ECC bytes
+ *   interleave stride = 25
+ *   short block data offset in interleaved stream: block_index * 118
+ *   long block extra byte at offset 2950 + (block_index - 19)
+ *
+ * The input buffer (w->input) contains:
+ *   [0..3]   = fixed ECI/Byte header (0x70, 0x34, 0x0B, 0x88)
+ *   [4..51]  = 48-byte DOSfer frame header
+ *   [52..2955] = 2904 bytes record payload
+ *
+ * Total data codewords = 2956 (including the 4-byte ECI/Byte prefix).
+ *
+ * The delta-first pipeline:
+ *   1. Computes input_delta = next_input XOR previous_input
+ *   2. For each block, processes only changed data bytes through the RS
+ *      recurrence, accumulating the ECC delta
+ *   3. Applies changed data bits and changed ECC bits directly to the
+ *      raster using the delta_entries map
+ *
+ * After processing, previous_input is updated to next_input.
+ */
+
+#define V40L_NUM_BLOCKS    25
+#define V40L_SHORT_DATA    118
+#define V40L_LONG_DATA     119
+#define V40L_ECC_LEN       30
+#define V40L_DATA_CODEWORDS 2956
+#define V40L_TOTAL_CODEWORDS 3706
+
+/* V40-L block layout: for each of the 25 blocks, store the data offset
+ * within the input buffer (relative to the start of the data codewords).
+ * The input layout after interleave is:
+ *   data[0..117]   = block 0 data (short)
+ *   data[118..235] = block 1 data (short)
+ *   ...
+ *   data[118*19..] = block 19 data (long, 119 bytes)
+ *   ...
+ *   data[118*24..] = block 24 data (long, 119 bytes)
+ *
+ * But the input buffer is NOT interleaved — it's the raw 2956-byte data
+ * codeword stream. The interleave happens inside addEccAndInterleave().
+ *
+ * Actually, looking at the code more carefully:
+ *   - The input to qrcodegen_dosferEncodePrepackedV40L is the 2956-byte
+ *     data codeword stream (including ECI/Byte header).
+ *   - addEccAndInterleave() splits this into 25 blocks, computes RS, and
+ *     interleaves into the 3706-byte result.
+ *
+ * The block data layout in the input stream:
+ *   Block i (i < 19): data starts at offset i * V40L_SHORT_DATA
+ *                     data length = 118
+ *   Block i (i >= 19): data starts at offset i * V40L_SHORT_DATA
+ *                      data length = 119
+ *
+ * Wait, that's not right either. Let me re-read addEccAndInterleave:
+ *
+ *   shortBlockDataLen = rawCodewords / numBlocks - blockEccLen
+ *                     = 3706 / 25 - 30 = 148 - 30 = 118
+ *   numShortBlocks = numBlocks - rawCodewords % numBlocks
+ *                  = 25 - 3706 % 25 = 25 - 6 = 19
+ *
+ *   For block i:
+ *     datLen = shortBlockDataLen + (i < numShortBlocks ? 0 : 1)
+ *            = 118 + (i < 19 ? 0 : 1)
+ *     dat = data + (accumulated offset)
+ *
+ * The data pointer advances by datLen each iteration. So:
+ *   Block 0:  data[0..117]    (118 bytes)
+ *   Block 1:  data[118..235]  (118 bytes)
+ *   ...
+ *   Block 18: data[2124..2241] (118 bytes)
+ *   Block 19: data[2242..2360] (119 bytes)
+ *   Block 20: data[2361..2479] (119 bytes)
+ *   ...
+ *   Block 24: data[2836..2955] (119 bytes, but last byte is at 2955)
+ *
+ * Total: 19*118 + 6*119 = 2242 + 714 = 2956. ✓
+ *
+ * The interleave output layout:
+ *   result[k] for data: k = i + j * numBlocks (for j < shortBlockDataLen)
+ *   For long blocks (i >= 19), the extra byte goes at result[2950 + i - 19]
+ *   ECC: result[dataLen + i + j * numBlocks] = ecc[j] for block i
+ *
+ * So the interleaved codeword stream is:
+ *   [0..24]     = data[0] from blocks 0..24  (stride 25)
+ *   [25..49]    = data[1] from blocks 0..24
+ *   ...
+ *   [2925..2949] = data[117] from blocks 0..24
+ *   [2950..2955] = data[118] from blocks 19..24 (long blocks only)
+ *   [2956..2980] = ecc[0] from blocks 0..24
+ *   [2981..3005] = ecc[1] from blocks 0..24
+ *   ...
+ *   [3676..3700] = ecc[29] from blocks 0..24
+ *   [3701..3705] = padding (zero)
+ *
+ * The delta_entries map maps each codeword bit to a raster offset+mask.
+ * The codeword index in the interleaved stream corresponds to the
+ * delta_entries index.
+ */
+
+/* Compute the data offset for block i in the input stream. */
+static unsigned v40l_block_data_offset(unsigned block) {
+    /* Blocks 0..18 have 118 bytes each.
+     * Blocks 19..24 have 119 bytes each.
+     * Offset = sum of previous block lengths. */
+    if (block <= 19) return block * V40L_SHORT_DATA;
+    return 19u * V40L_SHORT_DATA + (block - 19u) * V40L_LONG_DATA;
+}
+
+/* Compute the data length for block i. */
+static unsigned v40l_block_data_len(unsigned block) {
+    return block < 19u ? V40L_SHORT_DATA : V40L_LONG_DATA;
+}
+
+/* Compute the interleaved codeword offset for a data byte in block i.
+ * For j < 118: offset = i + j * 25
+ * For j == 118 (long blocks only): offset = 2950 + (i - 19) */
+static unsigned v40l_data_cw_offset(unsigned block, unsigned j) {
+    if (j < V40L_SHORT_DATA) return block + j * V40L_NUM_BLOCKS;
+    return 2950u + (block - 19u);
+}
+
+/* Compute the interleaved codeword offset for an ECC byte in block i.
+ * ECC byte j (0..29): offset = 2956 + i + j * 25 */
+static unsigned v40l_ecc_cw_offset(unsigned block, unsigned j) {
+    return V40L_DATA_CODEWORDS + block + j * V40L_NUM_BLOCKS;
+}
+
+/* Delta-first RS: process only changed bytes per block.
+ *
+ * For each block:
+ *   - Walk the data bytes in the input stream
+ *   - For each changed byte (delta != 0):
+ *     - Feed the delta through the RS recurrence
+ *     - Apply the changed data bits to the raster
+ *   - After processing all data bytes, the ECC register contains the
+ *     accumulated ECC delta
+ *   - Apply the changed ECC bits to the raster
+ *
+ * The RS recurrence for a delta byte is:
+ *   factor = delta_byte (XOR with ecc[0] which starts at 0)
+ *   ecc[j] = ecc[j+1] ^ rsStep[factor][j]  for j = 0..29
+ *
+ * Wait, that's not right. The RS recurrence processes the FULL data byte
+ * (not the delta). The delta approach works because RS is linear:
+ *
+ *   RS(A XOR B) = RS(A) XOR RS(B)
+ *
+ * So if we maintain the previous RS state and the current RS state,
+ * the ECC delta is:
+ *
+ *   ecc_delta = RS(current_data) XOR RS(previous_data)
+ *            = RS(current_data XOR previous_data)  (by linearity)
+ *
+ * But RS is not simply RS(data) — it's RS applied to each block with
+ * the RS generator polynomial. The linearity holds:
+ *
+ *   RS(A XOR B) = RS(A) XOR RS(B)
+ *
+ * So we can compute the ECC delta by feeding the DATA DELTA through
+ * the RS recurrence (starting from an all-zero ECC state).
+ *
+ * Then the codeword delta is:
+ *   data_delta (at data positions)
+ *   ecc_delta  (at ECC positions)
+ *
+ * And we apply this codeword delta to the raster using delta_entries.
+ */
+
+static int qr_delta_first_rs(WorkMemory *w, const uint8_t *next_input,
+                             uint8_t *out_codewords) {
+    const uint8_t *rs_step = qrcodegen_dosferRsStep();
+    const uint8_t *prev = w->previous_codewords; /* 2956-byte previous input */
+    const uint8_t *next = next_input;             /* 2956-byte new input */
+    uint8_t ecc_delta[V40L_ECC_LEN];
+    unsigned block, j, bit;
+
+    /* For each of the 25 blocks, process the data delta through RS. */
+    for (block = 0; block < V40L_NUM_BLOCKS; ++block) {
+        unsigned data_off = v40l_block_data_offset(block);
+        unsigned data_len = v40l_block_data_len(block);
+        const uint8_t *prev_block = prev + data_off;
+        const uint8_t *next_block = next + data_off;
+
+        /* Initialize ECC delta to zero. */
+        memset(ecc_delta, 0, V40L_ECC_LEN);
+
+        /* Process each data byte in the block. */
+        for (j = 0; j < data_len; ++j) {
+            uint8_t delta = prev_block[j] ^ next_block[j];
+            if (delta) {
+                /* Feed delta through RS recurrence. */
+                uint8_t factor = delta ^ ecc_delta[0];
+                const uint8_t *row = rs_step + (unsigned)factor * DOSFER_RS_STRIDE_EXPOSED;
+                ecc_delta[0] = ecc_delta[1] ^ row[0];
+                ecc_delta[1] = ecc_delta[2] ^ row[1];
+                ecc_delta[2] = ecc_delta[3] ^ row[2];
+                ecc_delta[3] = ecc_delta[4] ^ row[3];
+                ecc_delta[4] = ecc_delta[5] ^ row[4];
+                ecc_delta[5] = ecc_delta[6] ^ row[5];
+                ecc_delta[6] = ecc_delta[7] ^ row[6];
+                ecc_delta[7] = ecc_delta[8] ^ row[7];
+                ecc_delta[8] = ecc_delta[9] ^ row[8];
+                ecc_delta[9] = ecc_delta[10] ^ row[9];
+                ecc_delta[10] = ecc_delta[11] ^ row[10];
+                ecc_delta[11] = ecc_delta[12] ^ row[11];
+                ecc_delta[12] = ecc_delta[13] ^ row[12];
+                ecc_delta[13] = ecc_delta[14] ^ row[13];
+                ecc_delta[14] = ecc_delta[15] ^ row[14];
+                ecc_delta[15] = ecc_delta[16] ^ row[15];
+                ecc_delta[16] = ecc_delta[17] ^ row[16];
+                ecc_delta[17] = ecc_delta[18] ^ row[17];
+                ecc_delta[18] = ecc_delta[19] ^ row[18];
+                ecc_delta[19] = ecc_delta[20] ^ row[19];
+                ecc_delta[20] = ecc_delta[21] ^ row[20];
+                ecc_delta[21] = ecc_delta[22] ^ row[21];
+                ecc_delta[22] = ecc_delta[23] ^ row[22];
+                ecc_delta[23] = ecc_delta[24] ^ row[23];
+                ecc_delta[24] = ecc_delta[25] ^ row[24];
+                ecc_delta[25] = ecc_delta[26] ^ row[25];
+                ecc_delta[26] = ecc_delta[27] ^ row[26];
+                ecc_delta[27] = ecc_delta[28] ^ row[27];
+                ecc_delta[28] = ecc_delta[29] ^ row[28];
+                ecc_delta[29] = row[29];
+            }
+        }
+
+        /* Apply data delta to raster. */
+        for (j = 0; j < data_len; ++j) {
+            uint8_t delta = prev_block[j] ^ next_block[j];
+            if (!delta) continue;
+            /* The data byte at position (block, j) maps to interleaved
+             * codeword offset v40l_data_cw_offset(block, j). */
+            unsigned cw_off = v40l_data_cw_offset(block, j);
+            for (bit = 0; bit < 8; ++bit) {
+                if (delta & (uint8_t)(0x80u >> bit)) {
+                    uint32_t entry = w->delta_entries[cw_off * 8u + bit];
+                    w->raster[entry & 0xFFFFu] ^= (uint8_t)(entry >> 16);
+                }
+            }
+        }
+
+        /* Apply ECC delta to raster. */
+        for (j = 0; j < V40L_ECC_LEN; ++j) {
+            if (!ecc_delta[j]) continue;
+            unsigned cw_off = v40l_ecc_cw_offset(block, j);
+            for (bit = 0; bit < 8; ++bit) {
+                if (ecc_delta[j] & (uint8_t)(0x80u >> bit)) {
+                    uint32_t entry = w->delta_entries[cw_off * 8u + bit];
+                    w->raster[entry & 0xFFFFu] ^= (uint8_t)(entry >> 16);
+                }
+            }
+        }
+    }
+
+    /* Update previous_input to next_input. */
+    memcpy(w->previous_codewords, next_input, V40L_DATA_CODEWORDS);
+
+    return 1;
+}
+
+
+static int qr_render(WorkMemory *w, const uint8_t *wire, int delta_only, uint8_t *out_codewords) {
+    /* PLANE_CODED frames are always fixed-length V40-L records.  The caller
+       has already placed the wire frame at w->input + 4 via dos32_plane_frame;
+       we only need to set the fixed ECI/byte header prefix. */
     uint32_t elapsed;
+    (void)wire;
     ++metrics.qr_calls;
     w->input[0] = 0x70; w->input[1] = 0x34;
     w->input[2] = 0x0B; w->input[3] = 0x88;
-    memcpy(w->input + 4, wire, DOS32_FRAME_BYTES);
     { uint32_t t = now_ticks();
-      if (!qrcodegen_dosferEncodePrepackedV40L(w->input, w->codewords)) return 0;
+      if (!qrcodegen_dosferEncodePrepackedV40L(w->input, out_codewords)) return 0;
       elapsed = now_ticks() - t;
       metrics.encode_ticks += elapsed; ++metrics.encode_calls;
       if (elapsed > metrics.max_encode_ticks) metrics.max_encode_ticks = elapsed; }
     if (delta_only && w->delta_ready) {
         uint32_t t = now_ticks();
 #if defined(__WATCOMC__) && defined(DOSFER32)
-        dosfer_delta32(w->codewords, w->previous_codewords, w->raster,
+        dosfer_delta32(out_codewords, w->previous_codewords, w->raster,
                        w->delta_entries, QR_CODEWORDS);
 #else
         qr_delta_fallback(w);
@@ -563,13 +917,13 @@ static int qr_render(WorkMemory *w, const uint8_t *wire, int delta_only) {
     }
     { uint32_t t = now_ticks();
       if (!delta_only || !w->delta_ready) {
-          if (!qrcodegen_dosferBuildMatrixV40L(w->codewords, w->matrix,
+          if (!qrcodegen_dosferBuildMatrixV40L(out_codewords, w->matrix,
                   qrcodegen_Mask_0)) return 0;
           qr_raster_from_matrix(w);
           /* A fresh group C1 establishes the delta baseline for C2/C4/C8.
            * Without this reset, the next basis delta would be computed
            * against the previous group's last basis codewords. */
-          if (w->delta_ready) memcpy(w->previous_codewords, w->codewords, QR_CODEWORDS);
+          if (w->delta_ready) memcpy(w->previous_codewords, out_codewords, QR_CODEWORDS);
           if (!w->delta_ready && !qr_prepare_delta_map(w)) return 0;
            elapsed = now_ticks() - t;
            metrics.matrix_ticks += elapsed; ++metrics.matrix_calls;
@@ -626,7 +980,6 @@ static int prepare_group_claim(PlaneQueue *q, RecordStream *s, WorkMemory *w,
     g->ordinal = ++q->next_ordinal; g->overlap = (uint8_t)overlap;
     g->prepare_started = now_ticks();
     trace_group("group claim", g);
-    memset(w->xor_raster, 0, VGA_RASTER_BYTES);
     memset(w->parity, 0, DOS32_RECORD_BYTES);
     memset(w->header_xor, 0, DOS32_FRAME_HEADER);
     q->preparing = q->tail;
@@ -653,34 +1006,47 @@ static int prepare_group_step(PlaneQueue *q, RecordStream *s, WorkMemory *w, Vga
         }
         if (rc <= 0 || got_wi != g->window_index + p || got_wc != g->window_count) return -1;
         for (i = 0; i < DOS32_RECORD_BYTES; ++i) w->parity[i] ^= w->records[0][i];
-        if (!dos32_plane_frame(w->wire, s->session, g->window, g->group_global, g->window_index,
-                g->window_count, (uint8_t)width, coefficient[p], w->records[0])) return -1;
-        memcpy(w->headers[p], w->wire, DOS32_FRAME_HEADER);
-        for (i = 0; i < DOS32_FRAME_HEADER; ++i) w->header_xor[i] ^= w->wire[i];
+        /* Generate the whitening keystream once per group (p == 0). */
+        if (p == 0 && !w->keystream_ready) {
+            dos32_generate_keystream(w->keystream, s->session, g->group_global);
+            w->keystream_ready = 1;
+            w->keystream_index = g->group_global;
+        }
+        if (p == 0 && w->keystream_index != g->group_global) {
+            dos32_generate_keystream(w->keystream, s->session, g->group_global);
+            w->keystream_index = g->group_global;
+        }
+        if (!dos32_plane_frame_whitened(w->input + 4, s->session, g->window, g->group_global, g->window_index,
+                g->window_count, (uint8_t)width, coefficient[p], w->records[0], w->keystream)) return -1;
+        memcpy(w->headers[p], w->input + 4, DOS32_FRAME_HEADER);
+        for (i = 0; i < DOS32_FRAME_HEADER; ++i) w->header_xor[i] ^= w->input[4 + i];
          { uint32_t a = now_ticks();
            uint32_t elapsed;
-          /* Once the placement map exists, stay in sparse-delta mode across
-             groups  including the next C1.  Forcing a full matrix on every
-             group plane-0 was the dominant PLANE prepare cost. */
-          if (!qr_render(w, w->wire, w->delta_ready != 0)) return -1;
-          { char label[16]; status_label(label, (unsigned)g->ordinal, coefficient[p]); status_draw(w->raster, label); }
+          /* Delta-first RS pipeline: after the first frame, process only
+           * changed input bytes through the RS recurrence and apply the
+           * codeword delta directly to the raster. */
+          if (w->delta_first_ready) {
+              if (!qr_delta_first_rs(w, w->input, w->basis_codewords + (size_t)p * QR_CODEWORDS)) return -1;
+          } else {
+              if (!qr_render(w, 0, w->delta_ready != 0, w->basis_codewords + (size_t)p * QR_CODEWORDS)) return -1;
+              memcpy(w->previous_input, w->input, QR_DATA_CODEWORDS);
+              w->delta_first_ready = 1;
+          }
+          if (verify || g_dump.active) { char label[16]; status_label(label, (unsigned)g->ordinal, coefficient[p]); status_draw(w->raster, label); }
            elapsed = now_ticks() - a;
            metrics.qr_ticks += elapsed;
            if (elapsed > metrics.max_qr_ticks) metrics.max_qr_ticks = elapsed; }
         if (verify) {
             memcpy(g->canonical_parity, w->raster, VGA_RASTER_BYTES);
-            if (!qrcodegen_dosferBuildMatrixV40L(w->codewords, w->matrix,
+            if (!qrcodegen_dosferBuildMatrixV40L(w->basis_codewords + (size_t)p * QR_CODEWORDS, w->matrix,
                     qrcodegen_Mask_0)) return -1;
             qr_raster_from_matrix(w);
             { char label[16]; status_label(label, (unsigned)g->ordinal, coefficient[p]); status_draw(w->raster, label); }
             if (memcmp(g->canonical_parity, w->raster, VGA_RASTER_BYTES) != 0) return -1;
             memcpy(w->raster, g->canonical_parity, VGA_RASTER_BYTES);
         }
-        memcpy(w->basis_codewords + (size_t)p * QR_CODEWORDS, w->codewords, QR_CODEWORDS);
-        if (p + 1u == g->width && w->last_basis_raster)
-            memcpy(w->last_basis_raster, w->raster, VGA_RASTER_BYTES);
          { uint32_t a = now_ticks(), elapsed;
-           if (!vga32_store_fast(vga, p, g->slot, w->raster)) return -1;
+           if (!vga32_store_qr_rect(vga, p, g->slot, w->raster, QR_QUIET, QR_SIZE)) return -1;
            if (verify && !vga32_verify(vga, p, g->slot, w->raster)) return -1;
            elapsed = now_ticks() - a;
            metrics.upload_ticks += elapsed; ++metrics.upload_calls;
@@ -689,7 +1055,6 @@ static int prepare_group_step(PlaneQueue *q, RecordStream *s, WorkMemory *w, Vga
             dump_prepare_plane(g_dump.groups_done, p, w->raster, w->codewords,
                                p == 0u ? w->matrix : 0);
         g->basis_hash[p] = verify ? vga32_hash(vga, p, g->slot) : 0;
-        for (i = 0; i < VGA_RASTER_BYTES; ++i) w->xor_raster[i] ^= w->raster[i];
         ++g->prepare_stage;
         return 0;
     }
@@ -703,29 +1068,36 @@ static int prepare_group_step(PlaneQueue *q, RecordStream *s, WorkMemory *w, Vga
             for (i = 0; i < DOS32_FRAME_HEADER; ++i) header_delta[i] = w->wire[i];
             for (p = 0; p < width; ++p)
                 for (i = 0; i < DOS32_FRAME_HEADER; ++i) header_delta[i] ^= w->headers[p][i];
-            if (!qrcodegen_dosferHeaderCorrectionV40L(header_delta, w->correction_codewords)) return -1;
-            /* Encode Q(0) without touching the live delta baseline/raster. */
-            w->input[0] = 0x70; w->input[1] = 0x34;
-            w->input[2] = 0x0B; w->input[3] = 0x88;
-            memset(w->input + 4, 0, DOS32_FRAME_BYTES);
-            if (!qrcodegen_dosferEncodePrepackedV40L(w->input, w->zero_codewords)) return -1;
+            if (w->header_basis_ready)
+                apply_header_correction_fast(w, header_delta, w->correction_codewords);
+            else if (!qrcodegen_dosferHeaderCorrectionV40L(header_delta, w->correction_codewords)) return -1;
+            if (!w->zero_codewords_cached) {
+                w->input[0] = 0x70; w->input[1] = 0x34;
+                w->input[2] = 0x0B; w->input[3] = 0x88;
+                memset(w->input + 4, 0, DOS32_FRAME_BYTES);
+                if (!qrcodegen_dosferEncodePrepackedV40L(w->input, w->zero_codewords)) return -1;
+                w->zero_codewords_cached = 1;
+            }
             if (!qr_prepare_correction_patches(vga, w, w->zero_codewords, w->correction_codewords,
                     g->correction_patch_offset, g->correction_patch_xor,
                     &g->correction_patch_count)) return -1;
-            { char label[16]; status_label(label, (unsigned)g->ordinal, width == 3u ? 7u : 15u);
-              if (!prepare_status_correction(g, w, vga, width, label)) return -1; }
+            if (verify || g_dump.active) {
+                char label[16]; status_label(label, (unsigned)g->ordinal, width == 3u ? 7u : 15u);
+                if (!prepare_status_correction(g, w, vga, width, label)) return -1;
+            }
             if (verify) {
-                /* Oracle for the complete parity QR, not merely Q(delta). */
-                if (!qr_encode_wire_codewords(w, w->wire, w->codewords) ||
+                /* Oracle for the complete parity QR: the frame is already at
+                 * w->input + 4 from dos32_plane_frame.  Just set the header
+                 * and encode. */
+                w->input[0] = 0x70; w->input[1] = 0x34;
+                w->input[2] = 0x0B; w->input[3] = 0x88;
+                if (!qrcodegen_dosferEncodePrepackedV40L(w->input, w->codewords) ||
                     !qrcodegen_dosferBuildMatrixV40L(w->codewords, w->matrix,
                         qrcodegen_Mask_0)) return -1;
                 qr_raster_from_matrix(w);
                 { char label[16]; status_label(label, (unsigned)g->ordinal, width == 3u ? 7u : 15u); status_draw(w->raster, label); }
                 memcpy(g->canonical_parity, w->raster, VGA_RASTER_BYTES);
             }
-            /* Restore last-basis raster + codeword baseline for the next C1 delta. */
-            if (w->last_basis_raster)
-                memcpy(w->raster, w->last_basis_raster, VGA_RASTER_BYTES);
             memcpy(w->previous_codewords,
                    w->basis_codewords + (size_t)(g->width - 1u) * QR_CODEWORDS,
                    QR_CODEWORDS);
@@ -832,7 +1204,7 @@ static int stream_next(RecordStream *s, WorkMemory *w, unsigned window, uint16_t
     uint16_t body_len; uint32_t file_id = 1; unsigned cap = 2876u; size_t got;
     uint8_t *body = w->body;
     if (s->stage >= 5 || s->global >= s->total_records) return 0;
-    memset(w->records[0], 0, DOS32_RECORD_BYTES);
+    /* dos32_record clears the record internally; no pre-clear needed. */
     if (s->stage == 0) {
         put32_local(body, s->session); body[4] = 0; body[5] = 6; memcpy(body + 6, "DOSFER", 6);
         body_len = 12; s->stage = 1;
@@ -885,7 +1257,7 @@ static PreparedGroup *next_ready_group(PlaneQueue *q, const PreparedGroup *curre
 static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemory *w,
                       Vga32 *vga, unsigned width, unsigned window, unsigned hold,
                       int focus, int verify, int dump_group) {
-    unsigned symbol, count = g->width + 1u; uint32_t deadline, start;
+    unsigned symbol, count = g->width + 1u;
     g->state = SLOT_PLAYING; --q->ready;
     for (symbol = 0; symbol < count; ++symbol) {
         uint8_t mask = symbol == g->width ? (uint8_t)((1u << g->width) - 1u) : (uint8_t)(1u << symbol);
@@ -921,21 +1293,32 @@ static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemo
             do key = getch(); while (key != 13 && key != 27);
             if (key == 27) return -1;
         }
-        start = now_ticks(); deadline = start + (uint32_t)hold * CLOCKS_PER_SEC / 1000UL;
-        { uint32_t a = now_ticks(); while ((long)(now_ticks() - deadline) < 0) {
-            int pr;
-            if (q->ready < SLOT_COUNT) {
-                pr = prepare_group_step(q, s, w, vga, width, window, verify);
-                if (pr < 0) return 0;
+        /* Absolute-deadline wait: advance the timeline by exactly one
+         * 50 ms interval.  Between now and the deadline, execute bounded
+         * producer steps.  No catch-up bursts. */
+        {
+            uint32_t deadline = g_next_deadline;
+            /* If we're already past the deadline (producer was slow), just
+             * advance the timeline by one interval — the current symbol
+             * stays visible for a complete interval (duplicate). */
+            while ((long)(now_ticks() - deadline) < 0) {
+                int pr;
+                if (q->ready < SLOT_COUNT) {
+                    pr = prepare_group_step(q, s, w, vga, width, window, verify);
+                    if (pr < 0) return 0;
+                }
             }
-        } metrics.hold_ticks += now_ticks() - a; }
+            g_next_deadline += DISPLAY_INTERVAL_TICKS;
+            ++g_display_interval_idx;
+        }
         if (mask == (uint8_t)((1u << g->width) - 1u)) {
             trace_event("parity hold end", g->slot, mask, g->correction_plane);
             /* Keep this slot visible while restoring its hidden correction.
                The next group is selected before this slot is recycled, so
                producer uploads can never mutate the visible bridge raster. */
             if (!vga32_show_raw(vga, g->slot, 2u, !g_noretrace)) return 0;
-            trace_event("parity bridge C2", g->slot, 2u, 0);            trace_event("correction restore begin", g->slot, 0, g->correction_plane);
+            trace_event("parity bridge C2", g->slot, 2u, 0);
+            trace_event("correction restore begin", g->slot, 0, g->correction_plane);
             if (!vga32_restore_correction(vga, g->correction_plane, g->slot,
                      g->correction_patch_offset, g->correction_patch_xor,
                      g->correction_patch_count, g->width == 4, g->correction_restore_hash, verify)) return 0;
@@ -955,10 +1338,6 @@ static int show_group(PlaneQueue *q, PreparedGroup *g, RecordStream *s, WorkMemo
                     if (!vga32_show_raw(vga, next->slot, 1u, !g_noretrace)) return 0;
                     trace_event("next group C1 handoff", next->slot, 1u, 0);
                     trace_group("next group metadata", next);
-                    /* The CRTC start write is performed at the retrace edge,
-                       but some adapters latch it on the following scanout.
-                       Do not recycle/upload the old slot until that latch has
-                       completed, or its new C1 can flash for one frame. */
                     if (!g_noretrace) vga32_wait_retrace();
                     q->head = next->slot;
                 }
@@ -986,12 +1365,12 @@ static int show_tail(RecordStream *s, WorkMemory *w, Vga32 *vga, unsigned window
             off = ((uint32_t)w->records[0][24] << 24) | ((uint32_t)w->records[0][25] << 16) |
                   ((uint32_t)w->records[0][26] << 8) | w->records[0][27];
     }
-    if (!dos32_frame(w->wire, DOS32_DATA, DOS32_FLAG_WHITENED, s->session,
+    if (!dos32_frame(w->input + 4, DOS32_DATA, DOS32_FLAG_WHITENED, s->session,
             global / window, global, wi, wc, sid, off, w->records[0], DOS32_FRAME_PAYLOAD) ||
-        !qr_render(w, w->wire, 0) ||
+        !qr_render(w, w->input + 4, 0, w->codewords) ||
         !vga32_show_data_qr(vga, TAIL_VGA_SLOT, w->raster, !g_noretrace)) return 0;
     ++metrics.tail_frames;
-    deadline = now_ticks() + (uint32_t)visible * CLOCKS_PER_SEC / 1000UL;
+    deadline = now_ticks() + (uint32_t)visible * TICKS_PER_SEC / 1000UL;
     while ((long)(now_ticks() - deadline) < 0) {}
     return 1;
 }
@@ -1084,9 +1463,8 @@ int main(int argc, char **argv) {
     g_noretrace = o.noretrace != 0;
     memset(&metrics, 0, sizeof(metrics));
     metrics.min_ready = SLOT_COUNT;
-    /* Keep the trace name strictly 8.3 so it works on real DOS, not only
-       DOSBox's long-name layer. */
-    trace_file = fopen("DOSFER32.TRC", "wt");
+    /* Trace file is only opened in debug/verify builds to avoid I/O overhead. */
+    if (o.verify) trace_file = fopen("DOSFER32.TRC", "wt");
     session = (uint32_t)time(0) ^ 0xD05F3201UL; if (!session) session = 1;
     printf("DOSFER32 %s (Open Watcom + DOS/4GW)\n", DOSFER32_BUILD_ID);
     printf("Mode: PLANE%u  window=%u  hold=%u ms%s%s\n", o.width, o.window, o.hold,
@@ -1112,13 +1490,16 @@ int main(int argc, char **argv) {
     w->header_xor = (uint8_t *)malloc(DOS32_FRAME_HEADER);
     w->parity = (uint8_t *)malloc(DOS32_RECORD_BYTES); w->xor_raster = (uint8_t *)malloc(VGA_RASTER_BYTES); w->body = (uint8_t *)malloc(2880); w->disk_ring = (uint8_t *)malloc(DISK_RING_BYTES);
     for (i = 0; i < 4; ++i) w->records[i] = (uint8_t *)malloc(DOS32_RECORD_BYTES);
+    w->header_basis = (uint8_t *)malloc((size_t)384 * QR_CODEWORDS);
+    w->keystream = (uint8_t *)malloc(DOS32_FRAME_PAYLOAD);
+    w->previous_input = (uint8_t *)malloc(QR_DATA_CODEWORDS);
     if (o.verify) for (i = 0; i < SLOT_COUNT; ++i)
         q->slots[i].canonical_parity = (uint8_t *)malloc(VGA_RASTER_BYTES);
     if (!w->input || !w->codewords || !w->basis_codewords || !w->zero_codewords ||
         !w->correction_codewords || !w->previous_codewords || !w->delta_entries || !w->matrix ||
         !w->raster || !w->last_basis_raster || !w->wire || !w->header_xor || !w->parity ||
         !w->xor_raster || !w->body ||
-        !w->disk_ring || !vga32_enter(&vga)) {
+        !w->disk_ring || !w->header_basis || !w->previous_input || !vga32_enter(&vga)) {
         puts("DOSFER32: protected-mode workspace/VGA allocation failed"); rc = 2; goto done;
     }
     if (o.verify) for (i = 0; i < SLOT_COUNT; ++i)
@@ -1126,6 +1507,8 @@ int main(int argc, char **argv) {
     printf("CRTC slot step=%u words (%u bytes)\n", (unsigned)vga.slot_step,
            (unsigned)vga.slot_step * 2u);
     if (!stream_open(&stream, o.path, session)) { puts("DOSFER32: cannot open source file"); rc = 2; goto done; }
+    /* Precompute the 384 header-bit basis corrections once at startup. */
+    if (!precompute_header_basis(w)) { puts("DOSFER32: header basis precompute failed"); rc = 2; goto done; }
     /* Prefetch both disk half-buffers so the first DATA records do not stall
        on a cold fread during the initial display burst. */
     {
@@ -1145,10 +1528,15 @@ int main(int argc, char **argv) {
     target = 2u;
     start = now_ticks();
     while (q->ready < target && prepare_group(q, &stream, w, &vga, o.width, o.window, o.verify) > 0) {}
+    /* Initialize the absolute-deadline playback timeline. */
+    g_timeline_start = now_ticks();
+    g_next_deadline = g_timeline_start + DISPLAY_INTERVAL_TICKS;
+    g_display_interval_idx = 0;
     rc = 1;
     for (;;) {
-        while (q->ready < SLOT_COUNT &&
-               prepare_group(q, &stream, w, &vga, o.width, o.window, o.verify) > 0) {}
+        /* Deadline-driven playback: show the next prepared symbol as soon as
+         * it's ready, rather than filling the entire queue first.  Between
+         * playback deadlines, execute one bounded producer step. */
         if (q->ready) {
             PreparedGroup *g = &q->slots[q->head];
             int dump_group = g_dump.active ? (int)g_dump.groups_done : -1;
@@ -1169,13 +1557,23 @@ int main(int argc, char **argv) {
             if (q->ready < metrics.min_ready) metrics.min_ready = q->ready;
             continue;
         }
-        if (stream.global >= stream.total_records) break;
-        if (!show_tail(&stream, w, &vga, o.window, o.hold)) { rc = 0; break; }
+        /* No ready group: try to produce one. */
+        if (q->preparing == 0xFF && !prepare_group_claim(q, &stream, w, o.width, o.window)) {
+            /* No free slot or no more records. */
+            if (stream.global >= stream.total_records) break;
+            if (!show_tail(&stream, w, &vga, o.window, o.hold)) { rc = 0; break; }
+            continue;
+        }
+        /* Execute one bounded producer step. */
+        {
+            int pr = prepare_group_step(q, &stream, w, &vga, o.width, o.window, o.verify);
+            if (pr < 0) { rc = 0; break; }
+        }
     }
     /* Keep the final symbol visible briefly even with /HOLD:0 so the last
        tail/DATA frame is not erased by the mode-3 restore. */
     if (rc > 0) {
-        uint32_t linger = now_ticks() + (uint32_t)(o.hold ? o.hold : 100u) * CLOCKS_PER_SEC / 1000UL;
+        uint32_t linger = now_ticks() + (uint32_t)(o.hold ? o.hold : 100u) * TICKS_PER_SEC / 1000UL;
         while ((long)(now_ticks() - linger) < 0) {}
     }
     metrics.wall_ticks = now_ticks() - start;
@@ -1192,7 +1590,7 @@ done:
         free(w->previous_codewords); free(w->delta_entries); free(w->matrix); free(w->raster);
         free(w->last_basis_raster); free(w->wire); free(w->header_xor); free(w->parity);
         free(w->xor_raster); free(w->body);
-        free(w->disk_ring); }
+        free(w->disk_ring); free(w->header_basis); free(w->keystream); free(w->previous_input); }
     free(q); free(w); if (trace_file) { fclose(trace_file); trace_file = 0; }
     return rc == -2 ? 0 : (rc < 0 ? 1 : rc);
 }

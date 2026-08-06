@@ -47,6 +47,27 @@ static void whiten(uint8_t *dst, const uint8_t *src, size_t n,
     }
 }
 
+void dos32_generate_keystream(uint8_t *dst, uint32_t session, uint32_t index) {
+    uint32_t state = session ^ (index * 0x9E3779B9UL) ^ 0xD05FE123UL;
+    if (!state) state = 0xA5A5A5A5UL;
+    for (unsigned i = 0; i < DOS32_FRAME_PAYLOAD; i += 4) {
+        state = xorshift(state);
+        dst[i] = (uint8_t)state;
+        dst[i + 1] = (uint8_t)(state >> 8);
+        dst[i + 2] = (uint8_t)(state >> 16);
+        dst[i + 3] = (uint8_t)(state >> 24);
+    }
+}
+
+static void apply_keystream(uint8_t *dst, const uint8_t *src,
+                            const uint8_t *keystream, size_t n) {
+    const uint32_t *ks = (const uint32_t *)keystream;
+    const uint32_t *s = (const uint32_t *)src;
+    uint32_t *d = (uint32_t *)dst;
+    unsigned i;
+    for (i = 0; i < n / 4; ++i) d[i] = s[i] ^ ks[i];
+}
+
 static uint16_t frame_header(uint8_t *out, uint8_t kind, uint16_t flags,
         uint32_t session, uint32_t window, uint32_t global, uint16_t wi,
         uint16_t wc, uint32_t sid, uint32_t off, uint32_t payload_crc,
@@ -98,4 +119,21 @@ uint16_t dos32_plane_frame(uint8_t *out, uint32_t session, uint32_t window,
     return dos32_frame(out, DOS32_PLANE_CODED, flags, session, window,
         coefficient, group_index, window_count, group_global, width,
         payload, DOS32_FRAME_PAYLOAD);
+}
+
+uint16_t dos32_plane_frame_whitened(uint8_t *out, uint32_t session, uint32_t window,
+                                    uint32_t group_global, uint16_t group_index,
+                                    uint16_t window_count, uint8_t width,
+                                    uint8_t coefficient, const uint8_t *payload,
+                                    const uint8_t *keystream) {
+    uint16_t flags = (width == 4 && coefficient == 0x0F) ? 0 : DOS32_FLAG_PLANE_WHITENED;
+    if (flags & DOS32_FLAG_PLANE_WHITENED) {
+        apply_keystream(out + DOS32_FRAME_HEADER, payload, keystream, DOS32_FRAME_PAYLOAD);
+    } else {
+        memcpy(out + DOS32_FRAME_HEADER, payload, DOS32_FRAME_PAYLOAD);
+    }
+    uint32_t pcrc = dos32_crc(out + DOS32_FRAME_HEADER, DOS32_FRAME_PAYLOAD);
+    return frame_header(out, DOS32_PLANE_CODED, flags, session, window,
+                        group_global, group_index, window_count, width,
+                        coefficient, pcrc, DOS32_FRAME_PAYLOAD);
 }

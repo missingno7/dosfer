@@ -13,7 +13,7 @@ set INCLUDE=%WATCOM%\h;..\dos_sender\include;..\dos_sender\third_party
 if not exist build mkdir build
 wcl386 -q -bt=dos -mf -3s -ot -ol -oi -or -oh -za99 -s -DDOSFER32 -I..\dos_sender\third_party ^
   -l=dos4g -fe=build\DOSFER32 -fm=build\DOSFER32 ^
-  main.c platform_vga.c protocol32.c ..\dos_sender\third_party\qrcodegen.c
+  main.c platform_vga.c protocol32.c timing32.c ..\dos_sender\third_party\qrcodegen.c
 if errorlevel 1 exit /b 1
 if exist "%WATCOM%\binw\dos4gw.exe" copy /y "%WATCOM%\binw\dos4gw.exe" build\DOS4GW.EXE >nul
 certutil -hashfile build\DOSFER32.EXE SHA256 > build\DOSFER32.SHA256

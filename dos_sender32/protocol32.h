@@ -32,5 +32,11 @@ uint16_t dos32_plane_frame(uint8_t *out, uint32_t session, uint32_t window,
                            uint32_t group_global, uint16_t group_index,
                            uint16_t window_count, uint8_t width,
                            uint8_t coefficient, const uint8_t *payload);
+void dos32_generate_keystream(uint8_t *dst, uint32_t session, uint32_t index);
+uint16_t dos32_plane_frame_whitened(uint8_t *out, uint32_t session, uint32_t window,
+                                    uint32_t group_global, uint16_t group_index,
+                                    uint16_t window_count, uint8_t width,
+                                    uint8_t coefficient, const uint8_t *payload,
+                                    const uint8_t *keystream);
 
 #endif
