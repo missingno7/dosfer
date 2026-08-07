@@ -37,7 +37,6 @@ void producer_init(Producer *producer,FILE *manifest);
 void producer_close(Producer *producer);
 int producer_fill_window(Producer *producer,Window *window,const Config *cfg,
                          u32 session,u32 window_id);
-int producer_reserve_window(Window *window,const Config *cfg);
 void producer_free_window(Window *window);
 
 #endif

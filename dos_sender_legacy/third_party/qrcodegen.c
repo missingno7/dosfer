@@ -84,8 +84,11 @@ static void applyMask(const uint8_t functionModules[], uint8_t qrcode[], enum qr
 static bool dosferPrepareMatrixCache(int version, enum qrcodegen_Ecc ecl, enum qrcodegen_Mask mask);
 static void dosferDrawCodewordsCached(const uint8_t data[], int dataLen, uint8_t qrcode[]);
 static uint8_t *dosferFunctionTemplate;
-static uint16_t *dosferDataByte;
-static uint8_t *dosferDataMask;
+/* One linear module index per codeword bit.  The old cache kept a 16-bit
+ * matrix-byte index plus a separate 8-bit mask (3 bytes per bit).  A linear
+ * 0..31328 module index carries the same information in 2 bytes and can be
+ * handed directly to the VGA backend after the first canonical render. */
+static uint16_t *dosferDataModule;
 static int dosferCacheVersion;
 static int dosferCacheEcl = -1;
 static int dosferCacheMask = -1;
@@ -838,6 +841,66 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 	}
 }
 
+/* Pack one complete DOSfer frame into the fixed V40-L ECI-3/Byte data
+ * codeword layout.  This is the packing half of the specialized encoder and
+ * is exposed for the persistent streaming path. */
+bool qrcodegen_dosferPackFrameV40L(const uint8_t frame[], uint16_t frameLen,
+		uint8_t dataCodewords[]) {
+	const int dataCapacity=2956;
+	int bitLen,terminatorBits,i;
+	uint8_t padByte;
+
+	if(!frame||!dataCodewords||frameLen>2952)return false;
+	memset(dataCodewords,0,(size_t)dataCapacity);
+	dataCodewords[0]=0x70;
+	dataCodewords[1]=0x34;
+	dataCodewords[2]=(uint8_t)(frameLen>>8);
+	dataCodewords[3]=(uint8_t)frameLen;
+	if(frameLen)memcpy(dataCodewords+4,frame,frameLen);
+	bitLen=32+(int)frameLen*8;
+
+	terminatorBits=dataCapacity*8-bitLen;
+	if(terminatorBits>4)terminatorBits=4;
+	bitLen+=terminatorBits;
+	bitLen=(bitLen+7)&~7;
+	padByte=0xEC;
+	for(i=bitLen>>3;i<dataCapacity;i++,padByte^=0xEC^0x11)
+		dataCodewords[i]=padByte;
+	return true;
+}
+
+/* Compute the 25 degree-30 V40-L ECC blocks in block-major order:
+ * eccBlocks[block * 30 + eccByte].  The same proven two-input-byte RS
+ * recurrence is used as by the canonical full encoder. */
+void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
+		uint8_t eccBlocks[]) {
+	const uint8_t *dat=dataCodewords;
+	static uint8_t
+#ifdef __WATCOMC__
+		__near
+#endif
+		ecc[31];
+	int block,j;
+
+	dosferPrepareRs(30);
+	for(block=0;block<25;block++) {
+		int datLen=block<19?118:119;
+		memset(ecc,0,sizeof(ecc));
+#ifdef __WATCOMC__
+		dosferRs30PairAsm(dat,(uint16_t)datLen,dosferRsStep,ecc);
+#else
+		for(j=0;j<datLen;j++) {
+			uint8_t factor=(uint8_t)(dat[j]^ecc[0]);
+			const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
+			ecc[30]=0;
+			for(int k=0;k<30;k++)ecc[k]=(uint8_t)(ecc[k+1]^row[k]);
+		}
+#endif
+		memcpy(eccBlocks+block*30,ecc,30);
+		dat+=datLen;
+	}
+}
+
 /* Encode one complete DOSfer transport frame as fixed QR V40-L + ECI 3.
  * This is byte-for-byte equivalent to qrcodegen_encodeBinaryAligned() with
  * version 40, ECC L and a fixed mask, but avoids segment construction,
@@ -849,31 +912,11 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 bool qrcodegen_dosferEncodeFrameV40L(const uint8_t frame[], uint16_t frameLen,
 		uint8_t codewords[], uint8_t workspace[], enum qrcodegen_Mask mask,
 		bool codewordsOnly) {
-	const int dataCapacity=2956;
-	int bitLen,terminatorBits,i;
-	uint8_t padByte;
 	DOSFER_PROFILE_START;
 
 	if(!frame||!codewords||!workspace||frameLen>2952||
 			(int)mask<0||(int)mask>7)return false;
-
-	/* ECI assignment 3 + byte mode + 16-bit byte count. */
-	memset(workspace,0,(size_t)dataCapacity);
-	workspace[0]=0x70;
-	workspace[1]=0x34;
-	workspace[2]=(uint8_t)(frameLen>>8);
-	workspace[3]=(uint8_t)frameLen;
-	if(frameLen)memcpy(workspace+4,frame,frameLen);
-	bitLen=32+(int)frameLen*8;
-
-	/* Same terminator/alignment/pad semantics as the canonical encoder. */
-	terminatorBits=dataCapacity*8-bitLen;
-	if(terminatorBits>4)terminatorBits=4;
-	bitLen+=terminatorBits;
-	bitLen=(bitLen+7)&~7;
-	padByte=0xEC;
-	for(i=bitLen>>3;i<dataCapacity;i++,padByte^=0xEC^0x11)
-		workspace[i]=padByte;
+	if(!qrcodegen_dosferPackFrameV40L(frame,frameLen,workspace))return false;
 	DOSFER_PROFILE_MARK(0);
 
 	dosferAddEccInterleaveV40L(workspace,codewords);
@@ -1202,17 +1245,17 @@ static bool dosferPrepareMatrixCache(int version, enum qrcodegen_Ecc ecl, enum q
 	int qrsize, rawBits, i, right, vert, j, x, y, index;
 	if (version > DOSFER_CACHE_MAX_VERSION)
 		return false;
-	if (dosferFunctionTemplate == NULL || neededLen > dosferTemplateCapacity || neededBits > dosferMapCapacity) {
-		free(dosferFunctionTemplate);free(dosferDataByte);free(dosferDataMask);
+	if (dosferFunctionTemplate == NULL || dosferDataModule == NULL ||
+			neededLen > dosferTemplateCapacity || neededBits > dosferMapCapacity) {
+		free(dosferFunctionTemplate);free(dosferDataModule);
 		dosferFunctionTemplate = malloc(neededLen);
-		dosferDataByte = malloc(neededBits * sizeof(dosferDataByte[0]));
-		dosferDataMask = malloc(neededBits);
+		dosferDataModule = malloc(neededBits * sizeof(dosferDataModule[0]));
 		if (dosferFunctionTemplate == NULL ||
-				dosferDataByte == NULL || dosferDataMask == NULL) {
+				dosferDataModule == NULL) {
 			free(dosferFunctionTemplate);
-			free(dosferDataByte); free(dosferDataMask);
+			free(dosferDataModule);
 			dosferFunctionTemplate = NULL;
-			dosferDataByte = NULL; dosferDataMask = NULL;
+			dosferDataModule = NULL;
 			dosferTemplateCapacity=0;dosferMapCapacity=0;
 			return false;
 		}
@@ -1232,8 +1275,7 @@ static bool dosferPrepareMatrixCache(int version, enum qrcodegen_Ecc ecl, enum q
 			y = (((right + 1) & 2) == 0) ? qrsize - 1 - vert : vert;
 			index = y * qrsize + x;
 			if (!(dosferFunctionTemplate[(index >> 3) + 1] & (1 << (index & 7))) && i < rawBits) {
-				dosferDataByte[i] = (uint16_t)((index >> 3) + 1);
-				dosferDataMask[i] = (uint8_t)(1 << (index & 7));
+				dosferDataModule[i] = (uint16_t)index;
 				i++;
 			}
 		}
@@ -1268,26 +1310,26 @@ static bool dosferPrepareMatrixCache(int version, enum qrcodegen_Ecc ecl, enum q
 }
 
 static void dosferDrawCodewordsCached(const uint8_t data[], int dataLen, uint8_t qrcode[]) {
-	int i,base=0;uint8_t v;
+	int i,base=0;uint8_t v;uint16_t pos;
 	if(dataLen*8>dosferCacheDataBits)dataLen=dosferCacheDataBits/8;
 	for(i=0;i<dataLen;i++,base+=8){v=data[i];
-		if(v&0x80)qrcode[dosferDataByte[base  ]]^=dosferDataMask[base  ];
-		if(v&0x40)qrcode[dosferDataByte[base+1]]^=dosferDataMask[base+1];
-		if(v&0x20)qrcode[dosferDataByte[base+2]]^=dosferDataMask[base+2];
-		if(v&0x10)qrcode[dosferDataByte[base+3]]^=dosferDataMask[base+3];
-		if(v&0x08)qrcode[dosferDataByte[base+4]]^=dosferDataMask[base+4];
-		if(v&0x04)qrcode[dosferDataByte[base+5]]^=dosferDataMask[base+5];
-		if(v&0x02)qrcode[dosferDataByte[base+6]]^=dosferDataMask[base+6];
-		if(v&0x01)qrcode[dosferDataByte[base+7]]^=dosferDataMask[base+7];
+#define DRAW_BIT(k,b) if(v&(b)){pos=dosferDataModule[base+(k)];qrcode[(pos>>3)+1]^=(uint8_t)(1<<(pos&7));}
+		DRAW_BIT(0,0x80) DRAW_BIT(1,0x40) DRAW_BIT(2,0x20) DRAW_BIT(3,0x10)
+		DRAW_BIT(4,0x08) DRAW_BIT(5,0x04) DRAW_BIT(6,0x02) DRAW_BIT(7,0x01)
+#undef DRAW_BIT
 	}
 }
 
-const uint16_t *qrcodegen_dosferPlacementBytes(void) { return dosferDataByte; }
-const uint8_t *qrcodegen_dosferPlacementMasks(void) { return dosferDataMask; }
 int qrcodegen_dosferPlacementBits(void) { return dosferCacheDataBits; }
+uint16_t *qrcodegen_dosferTakePlacementModules(void) {
+	uint16_t *result=dosferDataModule;
+	dosferDataModule=NULL;
+	dosferMapCapacity=0;
+	return result;
+}
 void qrcodegen_dosferReleaseMatrixCache(void) {
-	free(dosferFunctionTemplate);free(dosferDataByte);free(dosferDataMask);
-	dosferFunctionTemplate=NULL;dosferDataByte=NULL;dosferDataMask=NULL;
+	free(dosferFunctionTemplate);free(dosferDataModule);
+	dosferFunctionTemplate=NULL;dosferDataModule=NULL;
 	dosferTemplateCapacity=dosferMapCapacity=0;dosferCacheVersion=0;
 	dosferCacheEcl=-1;dosferCacheMask=-1;dosferCacheDataBits=0;
 }

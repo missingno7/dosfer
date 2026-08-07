@@ -1,0 +1,66 @@
+DOSfer legacy V40-L fused streaming validation
+
+Implemented steady-state changes
+--------------------------------
+
+1. The sender keeps one persistent 3706-byte current-codeword stream.
+2. Recurring V40-L frames are packed into 2956 data codewords, compute 25 x 30
+   ECC bytes into a 750-byte scratch area, and are emitted in final interleaved
+   order directly into the persistent stream and RAM shadow raster.
+3. The old second 3706-byte previous-codeword array and the separate full
+   codeword-difference pass were removed.
+4. C2-derived/cached complete streams use the same generic in-place codeword
+   delta application without overwriting the current baseline first.
+5. The QR placement cache now stores one 16-bit linear module index per bit and
+   is transferred to the VGA backend and converted in place. The old 16-bit
+   byte map, 8-bit mask map and second 16-bit VGA allocation no longer coexist.
+6. Production frames with no status text do not clear or upload the 320-byte
+   status area on every transition. Status rows are copied only when the
+   user-facing status actually changes.
+
+Host oracle test
+----------------
+
+The checked-in `tests/test_v40_stream.c` oracle was built with GCC against the
+same `third_party/qrcodegen.c`.
+
+- all QR masks 0..7
+- 250 deterministic random frame transitions per mask
+- frame lengths 0..2952 bytes
+- specialized pack + block-ECC + sequential emitter compared against
+  `qrcodegen_dosferEncodeFrameV40L()`
+- all 3706 codewords compared byte-for-byte
+- persistent 8000-byte raster compared against a complete canonical matrix
+  redraw after every transition
+
+Result: PASS (2000 transitions).
+
+The direct Open Watcom VGA integration path remains covered by the DOS build;
+the host oracle does not compile the hardware-specific VGA backend.
+
+Build checks
+------------
+
+- Release preprocessing/source syntax: PASS with GCC DOS compatibility stubs.
+- DOSFER_DEVTOOLS + DOSFER_PROFILE preprocessing/source syntax: PASS.
+- The only remaining host warning is expected: GCC cannot see the Open Watcom
+  #pragma-aux implementation of bios_ticks().
+- Open Watcom is not installed in this environment, so DOSFER.EXE was not
+  produced here.
+
+Memory impact
+-------------
+
+Steady state:
+- removed previous_codewords[3706]
+- the 750-byte ECC scratch reuses the unused tail of qr_workspace
+- net near-data reduction: 3706 bytes
+
+First canonical QR / map bootstrap peak:
+- old placement byte map: 59,296 bytes
+- old placement mask map: 29,648 bytes
+- old separately allocated VGA delta map: 59,296 bytes
+- new single transferable/in-place map: 59,296 bytes
+
+Peak map-memory reduction: approximately 88,944 bytes, while retaining the
+same 59,296-byte steady-state packed delta map.

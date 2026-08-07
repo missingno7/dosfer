@@ -31,7 +31,7 @@ void config_defaults(Config *c) {
     c->repetitions=1;
     c->frame_payload=2904;
     c->hold_ms=0;
-    c->window_frames=32;
+    c->window_frames=64;
     c->speaker=1;
     c->redundancy=7;
     c->qr_mask=0;
@@ -119,7 +119,7 @@ int config_parse_option(Config *cfg,const char *arg) {
     p=option_value(arg,"VIDEO");if(p)return config_parse_video(cfg,p);
     rc=option_number(arg,"PAYLOAD","P",96,MAX_FRAME_PAYLOAD,&v);
     if(rc){if(rc>0)cfg->frame_payload=(u16)v;return rc;}
-    rc=option_number(arg,"HOLD","SPEED",0,60000,&v);
+    rc=option_number(arg,"HOLD",0,0,60000,&v);
     if(rc){if(rc>0)cfg->hold_ms=(u16)v;return rc;}
     rc=option_number(arg,"WINDOW","W",4,MAX_WINDOW,&v);
     if(rc){if(rc>0)cfg->window_frames=(u16)v;return rc;}
@@ -147,17 +147,19 @@ int config_is_split_video(const char *arg) {
 void config_print_usage(const Config *cfg) {
     puts("DOSfer legacy V40-L - optimized 16-bit DOS-to-Android sender");
     puts("DOSFER [options] file_or_directory [more paths ...]");
+#ifdef DOSFER_DEVTOOLS
     puts("DOSFER /CAL [options]");
     puts("DOSFER /BENCH file [options]");
+#endif
     puts("");
     puts("Fixed renderer: QR Version 40, 177x177 modules, 1 pixel/module, VGA 320x200.");
-    puts("Default: V40-L, /VIDEO:320_60, payload 2904, hold 0, window 32, /RE:7");
+    puts("Default: V40-L, /VIDEO:320_60, payload 2904, hold 0, window 64, /RE:7");
     puts("/VIDEO:320_60|320_70  CRT refresh mode (default 320_60)");
     puts("/PAYLOAD:n or /P:n    Frame payload 96..2904 bytes for fixed V40-L");
     puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 7)");
     puts("/RE:Ck or /RE Ck      Overlapping chain parity C2..C64 (even k)");
     puts("/ANCHOR:n             Repeat every nth DATA frame in chain mode");
-    puts("/HOLD:ms /SPEED:ms    Minimum visible frame hold 0..60000 ms");
+    puts("/HOLD:ms              Minimum visible frame hold 0..60000 ms");
     puts("/WINDOW:n /W:n        Frames per acknowledged window 4..64");
     puts("/REPEAT:n /R:n        Complete passes per window 1..20");
     puts("/MASK:n               Fixed QR mask 0..7 (default 0)");
@@ -168,5 +170,5 @@ void config_print_usage(const Config *cfg) {
         cfg->repetitions,cfg->qr_mask,config_redundancy_name(cfg),config_video_name(cfg),
         cfg->invert?"/INVERT":"/NOINVERT",cfg->speaker?"/BEEP":"/NOBEEP");
     puts("Example: DOSFER /VIDEO:320_60 /HOLD:50 /RE:C2 FILE.ZIP");
-    puts("The first QR waits for Enter. Window-end controls: Enter/R/M/B/+/-/Esc.");
+    puts("The first QR waits for Enter. Window-end controls: Enter/R/M/Esc.");
 }

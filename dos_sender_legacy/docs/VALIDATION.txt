@@ -48,3 +48,16 @@ Not hardware-validated here:
 
 Open Watcom is not installed in this environment, so DOSFER.EXE was not rebuilt.
 Run build.bat, then use /BENCH and a real transfer on DOSBox/86Box/real hardware.
+
+Single-window / WINDOW64 change
+-------------------------------
+- Default Config.window_frames is now 64.
+- Only one static Window remains in sender.c.
+- previous_window, have_previous, producer_reserve_window(), and the B previous-window replay command were removed.
+- R and M continue to operate on the current unacknowledged window.
+- Enter commits the current window and producer_fill_window() reuses the same PendingFrame payload allocations in place for the next window.
+- The END_WINDOW QR remains resident in VGA while the next window is filled.
+- Payload allocation for one 64-frame window is 64 * 2904 = 185856 bytes, exactly equal to the former two 32-frame replay windows (2 * 32 * 2904 = 185856 bytes).
+- Textual source audit found no remaining references to previous_window, have_previous, or producer_reserve_window.
+
+Open Watcom is not installed in this environment, so the DOS executable was not rebuilt here.

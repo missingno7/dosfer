@@ -1,0 +1,27 @@
+Release cleanup validation
+
+- Source tree based on the working one-window /WINDOW:64 V40-L sender.
+- Runtime +/- HOLD adjustment removed from transfer and calibration code.
+- Stale previous-window B keyboard mapping removed.
+- /SPEED alias removed; /HOLD is the sole cadence option.
+- END_WINDOW prompt is now: Enter R M Esc.
+- Detailed per-frame transfer/XOR/rescue status labels are developer-only.
+- /CAL and /BENCH plus VGA hash/readback/benchmark helpers are gated by
+  DOSFER_DEVTOOLS and are absent from release preprocessing.
+- Profiling counters remain gated by DOSFER_PROFILE.
+- Release build defines NDEBUG, so generic-library assert() checks are removed.
+- Release and DOSFER_DEVTOOLS source paths were syntax-checked with GCC using
+  DOS compatibility stubs. The only host-side warning is expected: the Watcom
+  #pragma-aux bios_ticks implementation is invisible to GCC.
+- Open Watcom is not installed in this environment, so DOSFER.EXE was not built.
+
+Additional fused-stream validation
+- Specialized V40-L pack + block-ECC + sequential emitter compared with the
+  canonical full encoder for 8 masks x 250 random transitions: PASS.
+- Actual vga_apply_v40l_delta() and vga_apply_codeword_delta() compared with
+  complete canonical raster redraws for both inversion modes, 8 masks x 300 transitions: PASS.
+- One persistent codeword buffer replaces the former sender-output + VGA
+  previous-codeword pair.
+- First-render placement storage is transferred and converted in place,
+  reducing bootstrap map peak by approximately 88,944 bytes.
+- Production no-status frames skip repeated status clearing/upload.

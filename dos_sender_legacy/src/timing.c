@@ -67,16 +67,20 @@ u32 timer_ticks(void) {
     timer_total+=delta;last_bios_tick=after;last_phase=(u16)phase;
     return timer_total;
 }
+u32 timer_ticks_from_ms(u16 ms) {
+    return (u32)ms*74UL+((u32)ms*574UL+999UL)/1000UL;
+}
+
+#ifdef DOSFER_DEVTOOLS
 u32 timer_elapsed_ms(u32 a,u32 b) {
     u32 d=b-a;
     return (d/TIMER_TICKS_PER_SECOND)*1000UL+
         ((d%TIMER_TICKS_PER_SECOND)*1000UL)/TIMER_TICKS_PER_SECOND;
 }
-u32 timer_ticks_from_ms(u16 ms) {
-    return (u32)ms*74UL+((u32)ms*574UL+999UL)/1000UL;
-}
+
 void timer_wait_ms(u16 ms) {
     u32 start=timer_ticks();
     u32 need=timer_ticks_from_ms(ms);
-    while (timer_ticks()-start<need) ;
+    while(timer_ticks()-start<need) ;
 }
+#endif

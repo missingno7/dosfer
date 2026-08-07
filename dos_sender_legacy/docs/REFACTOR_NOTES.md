@@ -93,3 +93,41 @@ Unchanged:
 - replay/rescue behavior
 - disk producer and read-ahead model
 - 16-bit large-memory Open Watcom build
+
+## Fused steady-state codeword/raster path
+
+The first QR still uses the canonical matrix path so the fixed function
+patterns and placement geometry are established by the trusted implementation.
+After that, recurring frames no longer build a second complete 3706-byte
+interleaved output and then compare it with a separate previous-codeword array.
+
+The steady-state path is now:
+
+    fixed V40-L pack -> 2956 data codewords
+    proven RS30 kernel -> 25 x 30 block-major ECC bytes
+    sequential final-order emitter
+        -> update persistent current_codewords[3706]
+        -> toggle changed modules in screen_320[8000]
+
+C2-derived and cached complete codeword streams use a separate generic
+in-place codeword-delta function, preserving the affine shortcut without
+corrupting the current baseline.
+
+This is deliberately not an input-delta Reed-Solomon redesign. Every block is
+still encoded by the same proven full RS recurrence. The optimization removes
+intermediate storage and duplicate traversal around the RS calculation.
+
+## Placement-map ownership
+
+The first canonical render now creates one `u16` linear module index for every
+codeword bit. The VGA backend takes ownership of this allocation and converts
+it in place into its packed raster offset/pixel-selector format. This removes
+the old 8-bit mask array and avoids allocating another equally-sized VGA map
+while the QR cache is still resident.
+
+## Status rows
+
+Release DATA/XOR frames normally have no text label. The status rows are no
+longer cleared and uploaded on every such frame. A generation counter copies
+the 320-byte status area only when the focus or END_WINDOW prompt is added,
+changed, or cleared on a VGA page.

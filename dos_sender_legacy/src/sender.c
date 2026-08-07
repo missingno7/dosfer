@@ -21,11 +21,16 @@ extern u32 dosferVgaProfileTicks[5];
 
 #define MANIFEST_NAME "DOSFER.$$$"
 #define QR_BUFFER qrcodegen_BUFFER_LEN_FOR_VERSION(DOSFER_QR_VERSION)
+#define QR_DATA_CODEWORDS 2956
+#define QR_ECC_BLOCK_BYTES (25*30)
+#if QR_DATA_CODEWORDS + QR_ECC_BLOCK_BYTES > QR_BUFFER
+#error V40 QR workspace must hold data plus block-major ECC scratch
+#endif
 
 static Producer producer;
-static Window current_window, previous_window;
-static int have_previous;
-static u8 qr_codewords[DOSFER_QR_CODEWORDS], qr_workspace[QR_BUFFER+1], raw_frame[DOSFER_MAX_FRAME_BYTES];
+static Window current_window;
+static u8 qr_codewords[DOSFER_QR_CODEWORDS], qr_workspace[QR_BUFFER+1],
+    raw_frame[DOSFER_MAX_FRAME_BYTES];
 static SelectionStats selection;
 static u32 completed_session,completed_frames,completed_bytes;
 static u32 last_visible_tick;
@@ -48,7 +53,6 @@ static void free_chain_cache(void) {
 static void sender_cleanup(void) {
     producer_close(&producer);
     producer_free_window(&current_window);
-    producer_free_window(&previous_window);
     free_chain_cache();
     vga_leave();
 }
@@ -71,15 +75,34 @@ static int can_delta(u8 display_mask) {
     return qr_delta_ready&&display_mask==encoded_qr_mask;
 }
 
-static int qr_encode_mask(const u8 *data,u16 n,int delta_only,u8 mask) {
-    int ok=qrcodegen_dosferEncodeFrameV40L(data,n,qr_codewords,qr_workspace,
-        (enum qrcodegen_Mask)mask,delta_only!=0);
+static int qr_prepare_mask(const u8 *data,u16 n,int delta_only,u8 mask) {
+    int ok;
+
+    if(delta_only) {
+#ifdef DOSFER_PROFILE
+        u32 t=timer_ticks(),now;
+#endif
+        if(!qrcodegen_dosferPackFrameV40L(data,n,qr_workspace))return 0;
+#ifdef DOSFER_PROFILE
+        now=timer_ticks();dosferQrProfileTicks[0]+=now-t;t=now;
+#endif
+        qrcodegen_dosferComputeEccBlocksV40L(qr_workspace,
+            qr_workspace+QR_DATA_CODEWORDS);
+#ifdef DOSFER_PROFILE
+        now=timer_ticks();dosferQrProfileTicks[1]+=now-t;
+#endif
+        ok=vga_apply_v40l_delta(qr_workspace,
+            qr_workspace+QR_DATA_CODEWORDS,qr_codewords);
+    } else {
+        ok=qrcodegen_dosferEncodeFrameV40L(data,n,qr_codewords,qr_workspace,
+            (enum qrcodegen_Mask)mask,false);
+    }
     if(ok)encoded_qr_mask=mask;
     return ok;
 }
 
-static int qr_encode(const u8 *data,u16 n,const Config *cfg,int delta_only) {
-    return qr_encode_mask(data,n,delta_only,cfg->qr_mask);
+static int qr_prepare(const u8 *data,u16 n,const Config *cfg,int delta_only) {
+    return qr_prepare_mask(data,n,delta_only,cfg->qr_mask);
 }
 
 static int make_prepacked_data(const Window *w,u16 i,u32 session,u16 flags,u8 mask) {
@@ -89,8 +112,16 @@ static int make_prepacked_data(const Window *w,u16 i,u32 session,u16 flags,u8 ma
     n=make_frame(qr_workspace+4,FK_DATA,flags,session,w->id,f->global_index,
         i,w->count,f->stream_id,f->stream_offset,f->payload,f->payload_len);
     if(n!=2952)return 0;
-    _fmemcpy(raw_frame,qr_workspace+4,FRAME_HEADER_SIZE);
-    if(!qrcodegen_dosferEncodePrepackedV40L(qr_workspace,qr_codewords))return 0;
+#ifdef DOSFER_PROFILE
+    {u32 t=timer_ticks();
+#endif
+    qrcodegen_dosferComputeEccBlocksV40L(qr_workspace,
+        qr_workspace+QR_DATA_CODEWORDS);
+#ifdef DOSFER_PROFILE
+    dosferQrProfileTicks[1]+=timer_ticks()-t;}
+#endif
+    if(!vga_apply_v40l_delta(qr_workspace,
+            qr_workspace+QR_DATA_CODEWORDS,qr_codewords))return 0;
     encoded_qr_mask=mask;
     return n;
 }
@@ -99,8 +130,10 @@ static int display_encoded(const Config *cfg,const char *status,int delta,u16 ho
     u32 earliest=0;
     if(last_visible_tick&&hold_ms)
         earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
-    if(!vga_show_qr_stream_at(qr_workspace,qr_codewords,cfg->invert,
-            status,delta,earliest))return 0;
+    if(delta) {
+        if(!vga_show_prepared_at(cfg->invert,status,earliest))return 0;
+    } else if(!vga_show_full_qr_at(qr_workspace,qr_codewords,cfg->invert,
+            status,earliest))return 0;
     qr_delta_ready=vga_delta_ready();
     last_visible_tick=vga_last_flip_tick();
     return 1;
@@ -109,38 +142,54 @@ static int display_encoded(const Config *cfg,const char *status,int delta,u16 ho
 static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
         int repeated,int waiting,u16 hold_ms,u8 display_mask) {
     const PendingFrame *f=&w->frames[i];
-    char status[41];
+    const char *status=0;
+#ifdef DOSFER_DEVTOOLS
+    char status_buf[41];
+#endif
     u16 n;
     int delta=can_delta(display_mask);
+#ifdef DOSFER_DEVTOOLS
     int rescue=hold_ms!=cfg->hold_ms||display_mask!=cfg->qr_mask;
+#endif
 
     if(delta&&!repeated&&chain_cache_valid&&chain_cache_session==session&&
        chain_cache_window==w->id&&chain_cache_global==f->global_index&&
        chain_cache_index==i&&chain_cache_mask==display_mask) {
         n=chain_cache_rawlen;
         _fmemcpy(raw_frame,chain_cached_raw,FRAME_HEADER_SIZE);
-        _fmemcpy(qr_codewords,chain_right_codewords,DOSFER_QR_CODEWORDS);
+        if(!vga_apply_codeword_delta(chain_right_codewords,qr_codewords))return 0;
         encoded_qr_mask=display_mask;
         chain_cache_valid=0;
     } else if(delta&&f->payload_len==2904) {
         n=(u16)make_prepacked_data(w,i,session,
             (u16)((repeated?FF_REPEATED:0)|FF_WHITENED),display_mask);
         if(!n)return 0;
+        /* The C2 affine shortcut needs the just-displayed DATA header.
+         * Other redundancy modes do not, so avoid this copy in the common
+         * non-chain path. */
+        if(cfg->chain_width==2)
+            _fmemcpy(raw_frame,qr_workspace+4,FRAME_HEADER_SIZE);
     } else {
         n=make_frame(raw_frame,FK_DATA,(repeated?FF_REPEATED:0)|FF_WHITENED,
             session,w->id,f->global_index,i,w->count,f->stream_id,
             f->stream_offset,f->payload,f->payload_len);
-        if(!qr_encode_mask(raw_frame,n,delta,display_mask))return 0;
+        if(!qr_prepare_mask(raw_frame,n,delta,display_mask))return 0;
     }
 
-    if(waiting)
-        strcpy(status,"READY - focus camera - Enter / Esc");
-    else if(rescue)
-        sprintf(status,"W%lu F%u/%u RESCUE %ums M%u",
+    if(waiting) {
+        status="READY - focus camera - Enter / Esc";
+    }
+#ifdef DOSFER_DEVTOOLS
+    else if(rescue) {
+        sprintf(status_buf,"W%lu F%u/%u RESCUE %ums M%u",
             w->id+1,i+1,w->count,hold_ms,display_mask);
-    else
-        sprintf(status,"TRANSFER V40L W%lu F%u/%u",
+        status=status_buf;
+    } else {
+        sprintf(status_buf,"TRANSFER V40L W%lu F%u/%u",
             w->id+1,i+1,w->count);
+        status=status_buf;
+    }
+#endif
 
     return display_encoded(cfg,status,delta,hold_ms);
 }
@@ -165,7 +214,9 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
     u32 lengths=((u32)left->payload_len<<16)|right->payload_len;
     u32 chain_crc;
     u8 left_header[FRAME_HEADER_SIZE],header_xor[FRAME_HEADER_SIZE];
+#ifdef DOSFER_DEVTOOLS
     char status[41];
+#endif
     int delta=can_delta(cfg->qr_mask),cached=0,derived=0;
 
     /* C2 has a V40-L affine shortcut: encode the right DATA frame once,
@@ -179,9 +230,8 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
             right->global_index,i+1,w->count,right->stream_id,right->stream_offset,
             right->payload,right->payload_len);
         _fmemcpy(chain_cached_raw,qr_workspace+4,FRAME_HEADER_SIZE);
-        if(right_rawlen==2952&&qrcodegen_dosferEncodePrepackedV40L(qr_workspace,qr_codewords)) {
-            encoded_qr_mask=cfg->qr_mask;
-            _fmemcpy(chain_right_codewords,qr_codewords,DOSFER_QR_CODEWORDS);
+        if(right_rawlen==2952&&qrcodegen_dosferEncodePrepackedV40L(
+                qr_workspace,chain_right_codewords)) {
             chain_cache_valid=1;
             chain_cache_session=session;
             chain_cache_window=w->id;
@@ -201,19 +251,26 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
         for(j=0;j<FRAME_HEADER_SIZE;++j)
             header_xor[j]=(u8)(left_header[j]^chain_cached_raw[j]^raw_frame[j]);
         derived=qrcodegen_dosferDeriveXorV40L(chain_left_codewords,
-            chain_right_codewords,header_xor,qr_codewords);
-        if(derived)encoded_qr_mask=cfg->qr_mask;
+            chain_right_codewords,header_xor,qr_workspace);
+        if(derived) {
+            derived=vga_apply_codeword_delta(qr_workspace,qr_codewords);
+            if(derived)encoded_qr_mask=cfg->qr_mask;
+        }
     }
 
     if(!derived) {
         n=xor_frame_payload(left,right);
         rawlen=make_frame(raw_frame,FK_CHAIN_XOR,FF_PAIR_WHITENED,session,w->id,
             left->global_index,i,w->count,lengths,0,chain_payload,n);
-        if(!qr_encode_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
+        if(!qr_prepare_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
     }
 
+#ifdef DOSFER_DEVTOOLS
     sprintf(status,"TRANSFER V40L XOR %u-%u/%u",i+1,i+2,w->count);
     return display_encoded(cfg,status,delta,hold_ms);
+#else
+    return display_encoded(cfg,0,delta,hold_ms);
+#endif
 }
 
 static u16 xor_block_payload(const Window *w,u16 first,u16 count) {
@@ -232,17 +289,23 @@ static u16 xor_block_payload(const Window *w,u16 first,u16 count) {
 static int show_block_parity(const Window *w,u16 first,u16 count,const Config *cfg,
         u32 session,u16 hold_ms) {
     const PendingFrame *base=&w->frames[first];
+#ifdef DOSFER_DEVTOOLS
     char status[41];
+#endif
     u16 n=xor_block_payload(w,first,count),rawlen;
     int delta=can_delta(cfg->qr_mask);
 
     rawlen=make_frame(raw_frame,FK_BLOCK_XOR,FF_WHITENED,session,w->id,
         base->global_index,first,w->count,count,0,chain_payload,n);
-    if(!qr_encode_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
+    if(!qr_prepare_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
 
+#ifdef DOSFER_DEVTOOLS
     sprintf(status,"TRANSFER V40L XOR %u-%u/%u",
         first+1,first+count,w->count);
     return display_encoded(cfg,status,delta,hold_ms);
+#else
+    return display_encoded(cfg,0,delta,hold_ms);
+#endif
 }
 
 static void flush_keys(void) {
@@ -255,11 +318,8 @@ static int decision_key(void) {
     u8 ascii=(u8)key;
     u8 scan=(u8)(key>>8);
 
-    if(scan==0x0D||scan==0x4E)return '+';
-    if(scan==0x0C||scan==0x4A)return '-';
     if(scan==0x13)return 'R';
     if(scan==0x32)return 'M';
-    if(scan==0x30)return 'B';
     if(scan==0x01)return 27;
     if(scan==0x1C)return 13;
     return ascii;
@@ -321,17 +381,15 @@ static int transmit(const Window *w,const Config *cfg,u32 session,
     return 1;
 }
 
-static void show_eow(const Window *w,const Config *cfg,u32 session,int filtered) {
+static void show_eow(const Window *w,const Config *cfg,u32 session) {
     char status[41];
     u16 n;
     int delta;
-    (void)filtered;
-
     n=make_frame(raw_frame,FK_END_WINDOW,0,session,w->id,
         w->frames[w->count-1].global_index,0,w->count,0,0,0,0);
     delta=can_delta(cfg->qr_mask);
-    if(qr_encode(raw_frame,n,cfg,delta)) {
-        sprintf(status,"W%lu DONE  Enter R M B +/- Esc",w->id+1);
+    if(qr_prepare(raw_frame,n,cfg,delta)) {
+        sprintf(status,"W%lu DONE  Enter R M Esc",w->id+1);
         display_encoded(cfg,status,delta,cfg->hold_ms);
     }
     if(cfg->speaker)speaker_beep();
@@ -392,7 +450,7 @@ static int enter_transfer_vga(const Config *cfg) {
     return 1;
 }
 
-static int run_transfer(FILE *mf,Config *cfg) {
+static int run_transfer(FILE *mf,const Config *cfg) {
     u32 session=(timer_ticks()^(u32)time(NULL)^selection.bytes)|1UL;
     u32 window_id=0;
     int key,have_selection=0;
@@ -403,9 +461,9 @@ static int run_transfer(FILE *mf,Config *cfg) {
     producer_init(&producer,mf);
     if(!producer_fill_window(&producer,&current_window,cfg,session,window_id))return 0;
 
-    /* Reserve the next window before entering graphics mode. This prevents a
-       large /WINDOW setting from failing only after the first batch is sent. */
-    if(!producer.finished&&!producer_reserve_window(&previous_window,cfg))return 0;
+    /* Only the current acknowledged window is retained. Its payload buffers
+       are recycled in place after Enter commits the window, allowing the
+       default 64-frame window without paying for a second replay window. */
     if(cfg->chain_width==2)ensure_chain_cache();
     if(!enter_transfer_vga(cfg))return 0;
 
@@ -435,14 +493,10 @@ wait_ack:
         /* A window is uninterrupted; controls are accepted only after this
            fresh prompt is visible. */
         flush_keys();
-        show_eow(&current_window,cfg,session,have_selection);
+        show_eow(&current_window,cfg,session);
         key=decision_key();
 
         if(key=='r'||key=='R')goto replay;
-        if(key=='b'||key=='B') {
-            if(have_previous)transmit(&previous_window,cfg,session,0,0,0);
-            goto wait_ack;
-        }
         if(key=='m'||key=='M') {
             vga_leave();
             printf("Missing frames in window %lu (example 1,3-5; blank = all): ",
@@ -471,16 +525,6 @@ wait_ack:
                 have_selection?selected:0,chosen,rescue_round);
             goto wait_ack;
         }
-        if(key=='+'||key=='=') {
-            if(cfg->hold_ms>=50)cfg->hold_ms-=50;
-            else cfg->hold_ms=0;
-            goto replay;
-        }
-        if(key=='-') {
-            if(cfg->hold_ms<=59950)cfg->hold_ms+=50;
-            else cfg->hold_ms=60000;
-            goto replay;
-        }
         if(key==27) {
             vga_leave();
             puts("PAUSED. C cancels; any other key resumes.");
@@ -491,12 +535,9 @@ wait_ack:
         }
         if(key!=13)goto wait_ack;
 
-        {
-            Window swap=previous_window;
-            previous_window=current_window;
-            current_window=swap;
-        }
-        have_previous=1;
+        /* Enter commits the current window. Keep its END_WINDOW QR visible
+           while producer_fill_window() recycles the same payload buffers for
+           the next window; no previous-window copy is retained. */
         have_selection=0;
         chosen=0;
         rescue_round=0;
@@ -518,6 +559,7 @@ replay:
     }
 }
 
+#ifdef DOSFER_DEVTOOLS
 static int calibration(Config *cfg) {
     u32 session=(timer_ticks()^(u32)time(NULL))|1UL,seq=0;
     u16 key,n,i;
@@ -541,7 +583,7 @@ static int calibration(Config *cfg) {
             (u16)(seq&0xFFFF),100,0,0,payload,n);
         {
             int delta=can_delta(cfg->qr_mask);
-            if(!qr_encode(raw_frame,n,cfg,delta)){vga_leave();return 0;}
+            if(!qr_prepare(raw_frame,n,cfg,delta)){vga_leave();return 0;}
             sprintf(status,"CAL V40L %s hold %u",
                 config_video_name(cfg),cfg->hold_ms);
             if(!display_encoded(cfg,status,delta,cfg->hold_ms)){vga_leave();return 0;}
@@ -553,10 +595,6 @@ static int calibration(Config *cfg) {
         ascii=(u8)key;
         scan=(u8)(key>>8);
         if(ascii==27||scan==0x01)break;
-        if(ascii=='+'||ascii=='='||scan==0x0D||scan==0x4E) {
-            if(cfg->hold_ms>=50)cfg->hold_ms-=50;else cfg->hold_ms=0;
-        }
-        if(ascii=='-'||scan==0x0C||scan==0x4A)cfg->hold_ms+=50;
         if(ascii=='i'||ascii=='I'||scan==0x17)cfg->invert=!cfg->invert;
     }
     vga_leave();
@@ -621,7 +659,7 @@ static void benchmark(const char *path,Config *cfg) {
     memset(dosferQrProfileTicks,0,sizeof(dosferQrProfileTicks));
 #endif
     t0=timer_ticks();
-    for(i=0;i<25;++i)if(qr_encode(raw_frame,rawlen,cfg,0))++encoded;
+    for(i=0;i<25;++i)if(qr_prepare(raw_frame,rawlen,cfg,0))++encoded;
     t1=timer_ticks();
     if(encoded!=25){printf("QR encode: FAILED (%d/25)\n",encoded);return;}
     elapsed=timer_elapsed_ms(t0,t1);
@@ -647,8 +685,8 @@ static void benchmark(const char *path,Config *cfg) {
     qr_delta_ready=0;
     rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,0,0,1,0,0,b,cfg->frame_payload);
     t0=timer_ticks();
-    if(!qr_encode(raw_frame,rawlen,cfg,0)||
-       !vga_show_qr_stream(qr_workspace,qr_codewords,cfg->invert,
+    if(!qr_prepare(raw_frame,rawlen,cfg,0)||
+       !vga_show_full_qr_at(qr_workspace,qr_codewords,cfg->invert,
             "BENCH first V40 frame",0))ok=0;
     t1=timer_ticks();
     first_ms=timer_elapsed_ms(t0,t1);
@@ -664,9 +702,8 @@ static void benchmark(const char *path,Config *cfg) {
     for(i=1;i<25&&ok;++i){
         rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,(u32)i,0,1,0,0,
             b,cfg->frame_payload);
-        if(!qr_encode(raw_frame,rawlen,cfg,qr_delta_ready)||
-           !vga_show_qr_stream(qr_workspace,qr_codewords,cfg->invert,
-                "BENCH delta V40 frame",qr_delta_ready))ok=0;
+        if(!qr_prepare(raw_frame,rawlen,cfg,qr_delta_ready)||
+           !vga_show_prepared_at(cfg->invert,"BENCH delta V40 frame",0))ok=0;
         qr_delta_ready=vga_delta_ready();
     }
     t1=timer_ticks();
@@ -675,8 +712,8 @@ static void benchmark(const char *path,Config *cfg) {
     if(ok){
         dirty_hash=vga_screen_hash();
         display_ok=vga_display_matches();
-        if(qr_encode(raw_frame,rawlen,cfg,0)&&
-           vga_show_qr_stream(qr_workspace,qr_codewords,cfg->invert,
+        if(qr_prepare(raw_frame,rawlen,cfg,0)&&
+           vga_show_full_qr_at(qr_workspace,qr_codewords,cfg->invert,
                 "BENCH canonical redraw",0)) {
             full_hash=vga_screen_hash();
             redraw_ok=dirty_hash==full_hash;
@@ -713,45 +750,146 @@ static void benchmark(const char *path,Config *cfg) {
             fps100/100UL,fps100%100UL,file_rate);
     }
 }
+#endif /* DOSFER_DEVTOOLS */
 
 int main(int argc,char **argv) {
-    Config cfg;FILE *mf;int i,rc,action=0,path_count=0;char path[PATH_BYTES],again[8];const char *bench_path=0;u32 est;
+    Config cfg;
+    FILE *mf;
+    int i,rc,path_count=0;
+    char path[PATH_BYTES],again[8];
+    u32 est;
+#ifdef DOSFER_DEVTOOLS
+    int action=0;
+    const char *bench_path=0;
+#endif
+
     config_defaults(&cfg);
+
     for(i=1;i<argc;++i) {
-        if(!stricmp(argv[i],"/?")||!stricmp(argv[i],"/HELP")||!stricmp(argv[i],"-HELP")){config_print_usage(&cfg);return 0;}
-        if(!stricmp(argv[i],"/CAL")||!stricmp(argv[i],"-CAL")){if(action&&action!=1){puts("Choose either /CAL or /BENCH.");return 1;}action=1;continue;}
-        if(!stricmp(argv[i],"/BENCH")||!stricmp(argv[i],"-BENCH")){if(action&&action!=2){puts("Choose either /CAL or /BENCH.");return 1;}action=2;continue;}
+        if(!stricmp(argv[i],"/?")||!stricmp(argv[i],"/HELP")||!stricmp(argv[i],"-HELP")){
+            config_print_usage(&cfg);
+            return 0;
+        }
+#ifdef DOSFER_DEVTOOLS
+        if(!stricmp(argv[i],"/CAL")||!stricmp(argv[i],"-CAL")){
+            if(action&&action!=1){puts("Choose either /CAL or /BENCH.");return 1;}
+            action=1;
+            continue;
+        }
+        if(!stricmp(argv[i],"/BENCH")||!stricmp(argv[i],"-BENCH")){
+            if(action&&action!=2){puts("Choose either /CAL or /BENCH.");return 1;}
+            action=2;
+            continue;
+        }
+#endif
         if(config_is_split_re(argv[i])) {
-            if(i+1>=argc||config_parse_re(&cfg,argv[++i])<0){puts("Invalid /RE value.");return 1;}
+            if(i+1>=argc||config_parse_re(&cfg,argv[++i])<0){
+                puts("Invalid /RE value.");
+                return 1;
+            }
             continue;
         }
         if(config_is_split_video(argv[i])) {
-            if(i+1>=argc||config_parse_video(&cfg,argv[++i])<0){puts("Invalid /VIDEO value.");return 1;}
+            if(i+1>=argc||config_parse_video(&cfg,argv[++i])<0){
+                puts("Invalid /VIDEO value.");
+                return 1;
+            }
             continue;
         }
-        rc=config_parse_option(&cfg,argv[i]);if(rc<0){printf("Invalid option value: %s\n",argv[i]);return 1;}if(rc)continue;
-        if(argv[i][0]=='/'||argv[i][0]=='-'){printf("Unknown option: %s\n",argv[i]);return 1;}
-        if(action==2&&!bench_path)bench_path=argv[i];else path_count++;
+
+        rc=config_parse_option(&cfg,argv[i]);
+        if(rc<0){printf("Invalid option value: %s\n",argv[i]);return 1;}
+        if(rc)continue;
+
+        if(argv[i][0]=='/'||argv[i][0]=='-'){
+            printf("Unknown option: %s\n",argv[i]);
+            return 1;
+        }
+
+#ifdef DOSFER_DEVTOOLS
+        if(action==2&&!bench_path)bench_path=argv[i];
+        else
+#endif
+            ++path_count;
     }
+
     if(!config_validate(&cfg))return 1;
-    if(action==1){if(path_count||bench_path){puts("/CAL does not take a file path.");return 1;}return calibration(&cfg)?0:1;}
-    if(action==2){if(!bench_path||path_count){puts("Usage: DOSFER /BENCH file [options]");return 1;}benchmark(bench_path,&cfg);free_chain_cache();vga_leave();return 0;}
-    mf=fopen(MANIFEST_NAME,"w+b");if(!mf){puts("Cannot create DOSFER.$$$ in current directory.");return 1;}
-    if(path_count){for(i=1;i<argc;++i){if(config_is_split_re(argv[i])||config_is_split_video(argv[i])){++i;continue;}
-        if(argv[i][0]!='/'&&argv[i][0]!='-')if(!manifest_add_selection(mf,argv[i],&selection)){fclose(mf);remove(MANIFEST_NAME);return 1;}}}
-    else do {printf("File or directory: ");if(!fgets(path,sizeof(path),stdin))break;path[strcspn(path,"\r\n")]=0;
-        if(!manifest_add_selection(mf,path,&selection)){fclose(mf);remove(MANIFEST_NAME);return 1;}
-        printf("Add another? [y/N] ");fgets(again,sizeof(again),stdin);
-    } while(again[0]=='y'||again[0]=='Y');
-    if(!selection.files&&!selection.dirs){config_print_usage(&cfg);fclose(mf);remove(MANIFEST_NAME);return 1;}
+
+#ifdef DOSFER_DEVTOOLS
+    if(action==1){
+        if(path_count||bench_path){puts("/CAL does not take a file path.");return 1;}
+        return calibration(&cfg)?0:1;
+    }
+    if(action==2){
+        if(!bench_path||path_count){puts("Usage: DOSFER /BENCH file [options]");return 1;}
+        benchmark(bench_path,&cfg);
+        free_chain_cache();
+        vga_leave();
+        return 0;
+    }
+#endif
+
+    mf=fopen(MANIFEST_NAME,"w+b");
+    if(!mf){
+        puts("Cannot create DOSFER.$$$ in current directory.");
+        return 1;
+    }
+
+    if(path_count){
+        for(i=1;i<argc;++i){
+            if(config_is_split_re(argv[i])||config_is_split_video(argv[i])){
+                ++i;
+                continue;
+            }
+            if(argv[i][0]!='/'&&argv[i][0]!='-'){
+                if(!manifest_add_selection(mf,argv[i],&selection)){
+                    fclose(mf);
+                    remove(MANIFEST_NAME);
+                    return 1;
+                }
+            }
+        }
+    } else {
+        do {
+            printf("File or directory: ");
+            if(!fgets(path,sizeof(path),stdin))break;
+            path[strcspn(path,"\r\n")]=0;
+            if(!manifest_add_selection(mf,path,&selection)){
+                fclose(mf);
+                remove(MANIFEST_NAME);
+                return 1;
+            }
+            printf("Add another? [y/N] ");
+            fgets(again,sizeof(again),stdin);
+        } while(again[0]=='y'||again[0]=='Y');
+    }
+
+    if(!selection.files&&!selection.dirs){
+        config_print_usage(&cfg);
+        fclose(mf);
+        remove(MANIFEST_NAME);
+        return 1;
+    }
+
     est=1+selection.dirs+selection.files*2+selection.bytes/(cfg.frame_payload-28)+1;
-    printf("Selected: %lu files, %lu directories, %lu bytes, approximately %lu QR frames.\n",selection.files,selection.dirs,selection.bytes,est);
+    printf("Selected: %lu files, %lu directories, %lu bytes, approximately %lu QR frames.\n",
+        selection.files,selection.dirs,selection.bytes,est);
     printf("Settings: V40-L mask %u, video %s, %u ms hold, window %u, repeats %u, redundancy %s.\n",
         cfg.qr_mask,config_video_name(&cfg),cfg.hold_ms,cfg.window_frames,
         cfg.repetitions,config_redundancy_name(&cfg));
     puts("Preparing the first QR code...");
-    rc=run_transfer(mf,&cfg);sender_cleanup();fclose(mf);remove(MANIFEST_NAME);
-    if(rc){printf("Transfer complete. Session %08lX, %lu frames, %lu bytes. Returning to DOS.\n",
-        completed_session,completed_frames,completed_bytes);fflush(stdout);exit_to_dos(0);return 0;}
+
+    rc=run_transfer(mf,&cfg);
+    sender_cleanup();
+    fclose(mf);
+    remove(MANIFEST_NAME);
+
+    if(rc){
+        printf("Transfer complete. Session %08lX, %lu frames, %lu bytes. Returning to DOS.\n",
+            completed_session,completed_frames,completed_bytes);
+        fflush(stdout);
+        exit_to_dos(0);
+        return 0;
+    }
     return 1;
 }

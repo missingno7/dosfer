@@ -56,15 +56,22 @@ static int scan_path(FILE *mf,const char *path,const char *rel,SelectionStats *s
         return manifest_write(mf,1,path,rel,&d,stats->files+1,stats);
 
     if(!manifest_write(mf,2,path,rel,&d,0,stats))return 0;
-    if(strlen(path)+5>=PATH_BYTES)return 0;
-    sprintf(spec,"%s\\*.*",path);
+    {
+        size_t path_len=strlen(path);
+        if(path_len+5>=PATH_BYTES)return 0;
+        memcpy(spec,path,path_len);
+        memcpy(spec+path_len,"\\*.*",5);
+    }
     rc=_dos_findfirst(spec,_A_NORMAL|_A_RDONLY|_A_HIDDEN|_A_SYSTEM|_A_SUBDIR|_A_ARCH,&child);
     while(!rc) {
         if(strcmp(child.name,".")&&strcmp(child.name,"..")&&stricmp(child.name,MANIFEST_NAME)) {
-            if(strlen(path)+strlen(child.name)+2>=PATH_BYTES||
-               strlen(rel)+strlen(child.name)+2>=PATH_BYTES)return 0;
-            sprintf(src,"%s\\%s",path,child.name);
-            sprintf(dst,"%s/%s",rel,child.name);
+            size_t path_len=strlen(path),rel_len=strlen(rel),name_len=strlen(child.name);
+            if(path_len+name_len+2>=PATH_BYTES||
+               rel_len+name_len+2>=PATH_BYTES)return 0;
+            memcpy(src,path,path_len);src[path_len]='\\';
+            memcpy(src+path_len+1,child.name,name_len+1);
+            memcpy(dst,rel,rel_len);dst[rel_len]='/';
+            memcpy(dst+rel_len+1,child.name,name_len+1);
             if(!scan_path(mf,src,dst,stats))return 0;
         }
         rc=_dos_findnext(&child);
@@ -290,20 +297,4 @@ int producer_fill_window(Producer *p,Window *w,const Config *cfg,u32 session,u32
         ++w->count;
     }
     return w->count>0;
-}
-
-int producer_reserve_window(Window *w,const Config *cfg) {
-    u16 i;
-    for(i=0;i<cfg->window_frames;++i)if(w->frames[i].payload_capacity<cfg->frame_payload) {
-        u8 far *payload=(u8 far *)_fmalloc(cfg->frame_payload);
-        if(!payload) {
-            printf("Not enough DOS memory for two %u-frame replay windows; reduce /WINDOW.\n",
-                cfg->window_frames);
-            return 0;
-        }
-        if(w->frames[i].payload)_ffree(w->frames[i].payload);
-        w->frames[i].payload=payload;
-        w->frames[i].payload_capacity=cfg->frame_payload;
-    }
-    return 1;
 }

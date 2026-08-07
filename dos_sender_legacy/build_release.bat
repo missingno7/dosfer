@@ -1,7 +1,6 @@
 @echo off
 setlocal
 if "%WATCOM%"=="" set WATCOM=C:\tmp\WATCOM
-if "%DOSFER_PROFILE_EXE%"=="" set DOSFER_PROFILE_EXE=DOSFERP
 if not exist "%WATCOM%\binnt64\wcl.exe" if not exist "%WATCOM%\binnt\wcl.exe" (
   echo Open Watcom not found. Set WATCOM to its installation directory.
   exit /b 1
@@ -11,9 +10,10 @@ if exist "%WATCOM%\binnt\wcl.exe" set PATH=%WATCOM%\binnt;%PATH%
 set INCLUDE=%WATCOM%\h;include;third_party
 if not exist build mkdir build
 
-rem Profiling build is intentionally a developer build.
-wcl -q -bt=dos -ml -3 -ot -ol -oi -or -oh -s -za99 -dDOSFER_DEVTOOLS -dDOSFER_PROFILE %EXTRA_CFLAGS% -Iinclude -Ithird_party ^
-  -fe=build\%DOSFER_PROFILE_EXE%.EXE -fm=build\%DOSFER_PROFILE_EXE%.MAP ^
+rem Production build: no calibration/benchmark code, no profiling counters,
+rem and C library assertions are compiled out.
+wcl -q -bt=dos -ml -3 -ot -ol -oi -or -oh -s -za99 -dNDEBUG %EXTRA_CFLAGS% -Iinclude -Ithird_party ^
+  -fe=build\DOSFER.EXE -fm=build\DOSFER.MAP ^
   src\sender.c src\sender_config.c src\producer.c src\protocol.c src\vga.c src\timing.c third_party\qrcodegen.c
 if errorlevel 1 exit /b 1
-echo Built profiling build\%DOSFER_PROFILE_EXE%.EXE
+echo Built release build\DOSFER.EXE

@@ -388,15 +388,18 @@ bool qrcodegen_getModule(const uint8_t qrcode[], int x, int y);
  * cache so a persistent VGA framebuffer can apply codeword deltas directly. */
 void qrcodegen_dosferSetCodewordsOnly(bool enabled);
 void qrcodegen_dosferSetAlignedFast(bool enabled);
-const uint16_t *qrcodegen_dosferPlacementBytes(void);
-const uint8_t *qrcodegen_dosferPlacementMasks(void);
 int qrcodegen_dosferPlacementBits(void);
+uint16_t *qrcodegen_dosferTakePlacementModules(void);
 int qrcodegen_dosferCodewordBytes(int version);
 int qrcodegen_dosferDataCodewordBytes(int version, enum qrcodegen_Ecc ecl);
 void qrcodegen_dosferReleaseMatrixCache(void);
 bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[], const uint8_t encodedRight[],
 		const uint8_t protocolHeaderXor[48], uint8_t result[]);
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[], uint8_t result[]);
+bool qrcodegen_dosferPackFrameV40L(const uint8_t frame[], uint16_t frameLen,
+		uint8_t dataCodewords[]);
+void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
+		uint8_t eccBlocks[]);
 bool qrcodegen_dosferEncodeFrameV40L(const uint8_t frame[], uint16_t frameLen,
 		uint8_t codewords[], uint8_t workspace[], enum qrcodegen_Mask mask,
 		bool codewordsOnly);
