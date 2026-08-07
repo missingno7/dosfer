@@ -71,4 +71,45 @@ class ProtocolTest(unittest.TestCase):
                     known[start+missing[0]]=recover_block(equation,members,missing[0]);changed=True
         self.assertEqual(known,payloads)
 
+    def test_rgb3_stride3_whitening_fixed_sequence(self):
+        parity=Frame(BLOCK_XOR,FLAG_GROUP_XOR_WHITENED,0x6A67C69D,0,120,0,66,3,3,b"\0"*16)
+        self.assertEqual(parity.encode()[FRAME_HEADER:].hex(),"3c7276a924f50981b274084a5dc95cd7")
+        self.assertEqual(Frame.decode(parity.encode()),parity)
+
+    def test_rgb3_stride3_wire_payload_is_xor_of_data_wires(self):
+        session=0x6A67C69D
+        payloads=[Record(SESSION,i+1,0,bytes([i+1])*24).encode() for i in range(3)]
+        frames=[Frame(DATA,FLAG_WHITENED,session,7,120+i*3,i*3,66,i+1,0,payloads[i]) for i in range(3)]
+        parity=group_block_frame(frames,3)
+        data_wires=[frame.encode()[FRAME_HEADER:] for frame in frames]
+        parity_wire=parity.encode()[FRAME_HEADER:]
+        self.assertEqual(parity_wire,bytes(a^b^c for a,b,c in zip(*data_wires)))
+        self.assertEqual(Frame.decode(parity.encode()).payload,bytes(a^b^c for a,b,c in zip(payloads[0],payloads[1],payloads[2])))
+
+    def test_rgb3_stride3_recovers_lost_physical_image(self):
+        session=0x6A67C69D
+        payloads=[Record(SESSION,i+1,0,bytes([i+1])*(11+i)).encode() for i in range(9)]
+        frames=[Frame(DATA,FLAG_WHITENED,session,9,120+i,i,9,i+1,0,payloads[i]) for i in range(9)]
+        equations=[Frame.decode(group_block_frame([frames[channel],frames[channel+3],frames[channel+6]],3).encode()) for channel in range(3)]
+        recovered=list(payloads)
+        recovered[3]=recovered[4]=recovered[5]=None
+        for channel,equation in enumerate(equations):
+            indices=[channel,channel+3,channel+6]
+            members=[recovered[index] for index in indices]
+            recovered[indices[1]]=recover_block(equation,members,1)
+        self.assertEqual(recovered,payloads)
+
+    def test_rgb3_tail_equations_support_one_or_two_members(self):
+        session=0x12345678
+        payloads=[Record(FILE_DATA,i+1,7,struct.pack(">I",i*10)+bytes([i+1])*(3+i)).encode() for i in range(2)]
+        frames=[Frame(DATA,FLAG_WHITENED,session,4,60+i*3,i*3,8,0,0,payloads[i]) for i in range(2)]
+        one=Frame.decode(group_block_frame(frames[:1],3).encode())
+        two=Frame.decode(group_block_frame(frames,3).encode())
+        self.assertEqual(recover_block(one,[None],0),payloads[0])
+        self.assertEqual(recover_block(two,[payloads[0],None],1),payloads[1])
+
+    def test_rgb3_group_outside_window_is_rejected(self):
+        with self.assertRaisesRegex(ValueError,"group XOR"):
+            Frame(BLOCK_XOR,FLAG_GROUP_XOR_WHITENED,1,0,10,4,6,2,3,b"x").encode()
+
 if __name__=="__main__": unittest.main()

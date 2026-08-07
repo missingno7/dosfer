@@ -1,10 +1,11 @@
 # Interrupted transfers and recovery
 
 The Android app atomically retains every validated QR frame in private storage.
-After restart it scans those files and restores the active session and missing
-ranges. Relaunch the DOS sender with the same still-running session, replay the
-current/previous window, and continue. Restarting DOS creates a new session ID;
-reset the phone session before accepting it.
+After an Android-app restart it scans those files and restores the active
+session and missing ranges. Keep the DOS sender running, return to the current
+unacknowledged window, use `R` or `M`, and continue. A DOS-program restart creates
+a new session ID; in that case reset the phone session before accepting the new
+transfer.
 
 If reconstruction stops (storage full, permission revoked, CRC mismatch), the
 destination contains an explicitly named `.partial` file. Free storage or

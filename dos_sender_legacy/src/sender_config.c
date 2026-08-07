@@ -31,9 +31,10 @@ void config_defaults(Config *c) {
     c->repetitions=1;
     c->frame_payload=2904;
     c->hold_ms=0;
-    c->window_frames=64;
+    c->window_frames=66;
     c->speaker=1;
-    c->redundancy=7;
+    c->rgb3=1;
+    c->redundancy=3;
     c->qr_mask=0;
     c->chain_anchor=0;
     c->video_mode=VIDEO_320_60;
@@ -131,6 +132,9 @@ int config_parse_option(Config *cfg,const char *arg) {
     if(rc){if(rc>0)cfg->chain_anchor=(u16)v;return rc;}
     if(!stricmp(arg,"/INVERT")||!stricmp(arg,"-INVERT")){cfg->invert=1;return 1;}
     if(!stricmp(arg,"/NOINVERT")||!stricmp(arg,"-NOINVERT")){cfg->invert=0;return 1;}
+    if(!stricmp(arg,"/RGB3")||!stricmp(arg,"-RGB3")){cfg->rgb3=1;return 1;}
+    if(!stricmp(arg,"/BW")||!stricmp(arg,"-BW")||
+       !stricmp(arg,"/MONO")||!stricmp(arg,"-MONO")){cfg->rgb3=0;return 1;}
     if(!stricmp(arg,"/BEEP")||!stricmp(arg,"-BEEP")){cfg->speaker=1;return 1;}
     if(!stricmp(arg,"/NOBEEP")||!stricmp(arg,"-NOBEEP")){cfg->speaker=0;return 1;}
     return 0;
@@ -152,23 +156,24 @@ void config_print_usage(const Config *cfg) {
     puts("DOSFER /BENCH file [options]");
 #endif
     puts("");
-    puts("Fixed renderer: QR Version 40, 177x177 modules, 1 pixel/module, VGA 320x200.");
-    puts("Default: V40-L, /VIDEO:320_60, payload 2904, hold 0, window 64, /RE:7");
+    puts("Fixed renderer: QR Version 40, 177x177 modules, 1 pixel/module, planar EGA/VGA 320x200.");
+    puts("Default: RGB3 V40-L, /VIDEO:320_60, payload 2904, hold 0, window 66, /RE:3");
+    puts("/RGB3 /BW             Three QR color planes or legacy monochrome output");
     puts("/VIDEO:320_60|320_70  CRT refresh mode (default 320_60)");
     puts("/PAYLOAD:n or /P:n    Frame payload 96..2904 bytes for fixed V40-L");
-    puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 7)");
-    puts("/RE:Ck or /RE Ck      Overlapping chain parity C2..C64 (even k)");
+    puts("/RE:n or /RE n        n DATA + 1 XOR parity; 0 disables (default 3)");
+    puts("/RE:Ck or /RE Ck      Overlapping chain parity C2..C66 (even k)");
     puts("/ANCHOR:n             Repeat every nth DATA frame in chain mode");
-    puts("/HOLD:ms              Minimum visible frame hold 0..60000 ms");
-    puts("/WINDOW:n /W:n        Frames per acknowledged window 4..64");
+    puts("/HOLD:ms              Minimum visible physical frame hold 0..60000 ms");
+    puts("/WINDOW:n /W:n        Logical frames per acknowledged window 4..66");
     puts("/REPEAT:n /R:n        Complete passes per window 1..20");
     puts("/MASK:n               Fixed QR mask 0..7 (default 0)");
     puts("/INVERT /NOINVERT     Black/white polarity");
     puts("/BEEP /NOBEEP         End-of-window sound");
-    printf("Current: V40-L /PAYLOAD:%u /HOLD:%u /WINDOW:%u /REPEAT:%u /MASK:%u /RE:%s /VIDEO:%s %s %s\n",
-        cfg->frame_payload,cfg->hold_ms,cfg->window_frames,
+    printf("Current: %s V40-L /PAYLOAD:%u /HOLD:%u /WINDOW:%u /REPEAT:%u /MASK:%u /RE:%s /VIDEO:%s %s %s\n",
+        cfg->rgb3?"RGB3":"BW",cfg->frame_payload,cfg->hold_ms,cfg->window_frames,
         cfg->repetitions,cfg->qr_mask,config_redundancy_name(cfg),config_video_name(cfg),
         cfg->invert?"/INVERT":"/NOINVERT",cfg->speaker?"/BEEP":"/NOBEEP");
-    puts("Example: DOSFER /VIDEO:320_60 /HOLD:50 /RE:C2 FILE.ZIP");
-    puts("The first QR waits for Enter. Window-end controls: Enter/R/M/Esc.");
+    puts("Example: DOSFER /RGB3 /VIDEO:320_60 /HOLD:50 /RE:3 FILE.ZIP");
+    puts("The first physical QR frame waits for Enter. Window-end controls: Enter/R/M/Esc.");
 }

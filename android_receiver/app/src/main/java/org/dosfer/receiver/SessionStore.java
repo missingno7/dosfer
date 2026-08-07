@@ -29,6 +29,20 @@ public final class SessionStore {
     private static boolean isXorName(String n){return n.startsWith("xor_")&&n.endsWith(".dqr");}
     private static boolean isParityName(String n){return n.startsWith("parity_")&&n.endsWith(".dqr");}
     private static boolean isPlaneName(String n){return n.startsWith("plane_")&&n.endsWith(".dqr");}
+    private static int blockStride(Protocol.Frame f){
+        return f.flags==Protocol.FLAG_GROUP_XOR_WHITENED?
+                (int)(f.streamOffset==0?1:f.streamOffset):1;
+    }
+    private static boolean validBlockFrame(Protocol.Frame f){
+        if(f.kind!=Protocol.BLOCK_XOR)return false;
+        int count=(int)f.streamId,stride=blockStride(f);
+        if(count<1||count>Protocol.MAX_WINDOW)return false;
+        if(f.flags==Protocol.FLAG_GROUP_XOR_WHITENED)
+            return count<=3&&stride>=1&&stride<=Protocol.MAX_WINDOW&&
+                    f.windowIndex+(count-1L)*stride<f.windowCount;
+        return f.flags==Protocol.FLAG_WHITENED&&f.streamOffset==0&&
+                f.windowIndex+count<=f.windowCount;
+    }
     private void activate(long session){active=session;windowExpected.clear();windowSeen.clear();totalPayload=0;endIndex=-1;firstStoredNanos=0;context.getSharedPreferences("dosfer",0).edit().putLong("active",active).apply();}
     public synchronized Result accept(byte[] raw,long latencyNanos){
         Protocol.Frame f;
@@ -49,8 +63,8 @@ public final class SessionStore {
             if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
             if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverAvailable();return Result.STORED;
         }
-        if(f.kind==Protocol.BLOCK_XOR){int count=(int)f.streamId;
-            if(count<1||count>64||f.flags!=Protocol.FLAG_WHITENED||f.streamOffset!=0||f.windowIndex+count>f.windowCount){invalid++;return Result.INVALID;}
+        if(f.kind==Protocol.BLOCK_XOR){
+            if(!validBlockFrame(f)){invalid++;return Result.INVALID;}
             windowExpected.put(f.window,f.windowCount);File target=parityFile(f.globalIndex);
             if(target.exists()){try{if(Arrays.equals(readAll(target),raw)){duplicates++;return Result.DUPLICATE;}}catch(IOException ignored){}invalid++;return Result.INVALID;}
             if(!storeRaw(target,raw)){invalid++;return Result.INVALID;}recoverAvailable();return Result.STORED;
@@ -107,12 +121,8 @@ public final class SessionStore {
                     left>=Protocol.RECORD_HEADER&&right>=Protocol.RECORD_HEADER&&
                     f.windowIndex+1<f.windowCount&&f.payloadLength==Math.max(left,right);
         }
-        if(f.kind==Protocol.BLOCK_XOR) {
-            int count=(int)f.streamId;
-            return f.flags==Protocol.FLAG_WHITENED&&f.streamOffset==0&&
-                    count>=1&&count<=64&&f.windowIndex+count<=f.windowCount&&
-                    f.payloadLength>=Protocol.RECORD_HEADER;
-        }
+        if(f.kind==Protocol.BLOCK_XOR)
+            return validBlockFrame(f)&&f.payloadLength>=Protocol.RECORD_HEADER;
         return false;
     }
     private static boolean isSessionStart(Protocol.Frame f) {
@@ -139,16 +149,19 @@ public final class SessionStore {
     }
     private long recoverBlockEquation(File eq) {
         try{Protocol.Frame parity=Protocol.parseFrame(readAll(eq));int count=(int)parity.streamId;
-            if(parity.kind!=Protocol.BLOCK_XOR||count<1||count>64||parity.streamOffset!=0||parity.windowIndex+count>parity.windowCount)return -1;
+            if(!validBlockFrame(parity))return -1;
+            int stride=blockStride(parity);
             byte[][] members=new byte[count][];int missing=-1,missingCount=0;
-            for(int i=0;i<count;i++){File source=file(parity.globalIndex+i);if(!source.exists()){missing=i;missingCount++;continue;}
+            for(int i=0;i<count;i++){long index=parity.globalIndex+(long)i*stride;
+                File source=file(index);if(!source.exists()){missing=i;missingCount++;continue;}
                 Protocol.Frame known=Protocol.parseFrame(readAll(source));
                 if(known.kind!=Protocol.DATA||known.session!=parity.session||known.window!=parity.window||
-                   known.globalIndex!=parity.globalIndex+i||known.windowIndex!=parity.windowIndex+i)return -1;
+                   known.globalIndex!=index||known.windowIndex!=parity.windowIndex+i*stride)return -1;
                 members[i]=known.payload;}
             if(missingCount!=1)return -1;
-            byte[] recovered=Protocol.recoverBlock(parity,members,missing);long index=parity.globalIndex+missing;
-            return storeRecovered(parity,index,parity.windowIndex+missing,recovered)==Recovered.STORED?index:-1;
+            byte[] recovered=Protocol.recoverBlock(parity,members,missing);
+            long index=parity.globalIndex+(long)missing*stride;
+            return storeRecovered(parity,index,parity.windowIndex+missing*stride,recovered)==Recovered.STORED?index:-1;
         }catch(Exception ignored){return -1;}
     }
     private long recoverPlaneEquation(File eq) {

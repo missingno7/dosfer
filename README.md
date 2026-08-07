@@ -1,34 +1,62 @@
 # DOSfer
 
 DOSfer is an offline optical file-transfer system for recovering files from an
-80386 DOS PC with a VGA CRT. `DOSFER.EXE` shows a manually acknowledged stream
-of binary QR frames; the Android app scans, validates, persists, and reconstructs
-the files through Android's Storage Access Framework.
+80386 DOS PC through a CRT and an Android phone. The DOS sender shows standard
+binary QR frames; the Android app scans, validates, persists, repairs, and
+reconstructs the original files through Android's Storage Access Framework.
 
-Release 1.3 uses the optimized V40-L path by default: 320x200 output,
-2,904-byte DATA payloads, zero artificial hold, 32-frame windows, and 7+1 XOR
-parity. A normal transfer is simply `DOSFER.EXE FILE.DAT`. `/RE:n` selects an
-independent parity group and `/RE:Ck` an overlapping even chain width.
+## RGB3 legacy sender
+
+`dos_sender_legacy` now defaults to **RGB3**. One physical EGA/VGA image carries
+three independent standard QR Version 40-L symbols in the red, green and blue
+bitplanes. The Android receiver separates the camera image into R/G/B grayscale
+views and sends each view to ZXing-C++. Legacy monochrome remains available with
+`/BW` and is detected automatically by three equal frame IDs.
+
+Current legacy defaults are:
+
+- QR V40-L, 177 × 177 modules, one display pixel per module;
+- EGA/VGA Mode 0Dh, 320 × 200;
+- 2,904-byte logical DATA payload;
+- 66 logical frames per acknowledged window;
+- `/RE:3` stride-3 RGB parity across three physical DATA images;
+- `/RGB3`, with `/HOLD` applying to one physical colour image.
+
+A normal run is:
+
+```text
+DOSFER.EXE FILE.DAT
+```
+
+Use `DOSFER.EXE /BW FILE.DAT` for the original monochrome optical path. The
+architecture, bitplane mapping and optimized XOR3 derivation are documented in
+[RGB3_IMPLEMENTATION.md](RGB3_IMPLEMENTATION.md).
 
 Start with [docs/QUICKSTART.md](docs/QUICKSTART.md). The wire format is defined
-authoritatively in [protocol/PROTOCOL.md](protocol/PROTOCOL.md).
+in [protocol/PROTOCOL.md](protocol/PROTOCOL.md).
 
 ## Repository
 
-- `dos_sender`: C89/Open Watcom sender, VGA planar renderer and benchmark
-- `android_receiver`: Java/Camera2 receiver with two native ZXing-C++ workers
+- `dos_sender_legacy`: optimized 16-bit Open Watcom V40-L sender with RGB3/BW
+- `android_receiver`: Java/Camera2 receiver with native ZXing-C++ workers
+- `dos_sender`, `dos_sender32`: newer experimental sender implementations
 - `protocol`: wire-format constants and specification
-- `tools`: host reference codec, vector generator and payload replay tools
+- `tools`: host reference codec, vector generation and replay tools
 - `test_vectors`: deterministic conformance fixtures
 - `docs`: build, operation, calibration, performance and recovery guides
 
-## One-command verification
+## Verification
 
 ```powershell
+dos_sender_legacy\tests\run_host_tests.bat
 python tools\generate_vectors.py --check
 python -m unittest discover -s tools\tests -v
-android_receiver\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
-dos_sender\build.bat
+android_receiver\gradlew.bat :app:testDebugUnitTest :app:assembleDebug
+
+dos_sender_legacy\build.bat
 ```
 
-The DOS and Android artifacts are copied to `build/artifacts` by `build.ps1`.
+The C host oracles under `dos_sender_legacy/tests` can also be built with a C99
+host compiler without DOS or Open Watcom. The exact checks completed for this
+source package and the remaining target-hardware steps are listed in
+[VERIFICATION.md](VERIFICATION.md).

@@ -20,6 +20,8 @@
 
 static u8 far *font8;
 static int vga_active;
+static int rgb3_active;
+static int vga_dac_present;
 static int screen_invert=-1;
 static int write_page;
 #ifdef DOSFER_DEVTOOLS
@@ -39,7 +41,9 @@ static u8
 #ifdef __WATCOMC__
     __near
 #endif
-    screen_320[VGA_VISIBLE_BYTES];
+    screen_320[VGA_VISIBLE_BYTES],
+    screen_green[VGA_VISIBLE_BYTES],
+    screen_blue[VGA_VISIBLE_BYTES];
 /* One 16-bit entry per QR codeword bit: low 13 bits are the 0..7999
  * shadow-raster byte offset, high 3 bits select the pixel bit in that byte.
  * This replaces the old 16-bit offset + separate 8-bit mask tables, saving
@@ -106,6 +110,16 @@ static void dosferCopyStatus320(const u8 far *src,u8 far *dest);
     "add di,4" \
     "loop copy320_status" \
     parm [fs si] [es di] modify [ax cx si di];
+
+static void dosferClearFull320(u8 far *dest);
+#pragma aux dosferClearFull320 = \
+    "xor eax,eax" \
+    "mov cx,2000" \
+    "clear320_loop:" \
+    "mov es:[di],eax" \
+    "add di,4" \
+    "loop clear320_loop" \
+    parm [es di] modify [ax cx di];
 #else
 static u8 far *dosferFont8(void) { return 0; }
 static void dosferCopyFull320(const u8 far *src,u8 far *dest) {
@@ -119,6 +133,9 @@ static void dosferCopyQr320(const u8 far *src,u8 far *dest) {
 }
 static void dosferCopyStatus320(const u8 far *src,u8 far *dest) {
     _fmemcpy(dest,src,VGA_STATUS_ROWS*VGA_BYTES_PER_LINE);
+}
+static void dosferClearFull320(u8 far *dest) {
+    _fmemset(dest,0,VGA_VISIBLE_BYTES);
 }
 #endif
 
@@ -153,6 +170,47 @@ static u16 read_crtc_start(void) {
     return start;
 }
 
+static int bios_vga_present(void) {
+    union REGS r;
+    memset(&r,0,sizeof(r));
+    r.x.ax=0x1A00;
+    int86(0x10,&r,&r);
+    return r.h.al==0x1A;
+}
+
+static void set_map_mask(u8 mask) {
+    outp(0x3C4,2);
+    outp(0x3C5,mask);
+}
+
+/* Logical pixel indexes 0..7 are the three RGB QR bits.  Keep the EGA
+ * secondary/intensity bits clear so an inactive channel emits no light from
+ * that primary: 000 black, 001 blue, 010 green, ... 111 white.  VGA maps the
+ * same eight Attribute Controller entries to full-intensity DAC primaries. */
+static void setup_rgb3_palette(void) {
+    static const u8 ega[8]={0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07};
+    static const u8 rgb[8][3]={
+        {0,0,0},{0,0,63},{0,63,0},{0,63,63},
+        {63,0,0},{63,0,63},{63,63,0},{63,63,63}
+    };
+    int i;
+
+    (void)inp(0x3DA);
+    for(i=0;i<8;++i) {
+        outp(0x3C0,i);
+        outp(0x3C0,ega[i]);
+    }
+    outp(0x3C0,0x20); /* re-enable video */
+
+    if(!vga_dac_present)return;
+    for(i=0;i<8;++i) {
+        outp(0x3C8,ega[i]);
+        outp(0x3C9,rgb[i][0]);
+        outp(0x3C9,rgb[i][1]);
+        outp(0x3C9,rgb[i][2]);
+    }
+}
+
 /* Mode 0Dh is normally ~70 Hz.  Keep its 320x200 planar memory layout and
  * double-scanned 400-line active image, but extend the vertical period to
  * 525 physical scanlines: ~59.94 Hz with the standard 25.175 MHz VGA clock. */
@@ -166,7 +224,7 @@ static void set_320x200_60hz(void) {
 }
 
 static void setup_planar_write(void) {
-    outp(0x3C4,2);outp(0x3C5,0x0F); /* write all four planes */
+    set_map_mask(0x0F); /* legacy BW writes all four planes */
     outp(0x3CE,0);outp(0x3CF,0);
     outp(0x3CE,1);outp(0x3CF,0);
     outp(0x3CE,3);outp(0x3CF,0);
@@ -174,12 +232,15 @@ static void setup_planar_write(void) {
     outp(0x3CE,8);outp(0x3CF,0xFF);
 }
 
-int vga_enter(VideoMode mode) {
+int vga_enter(VideoMode mode,int rgb3) {
     free_delta();
+    vga_dac_present=bios_vga_present();
     bios_mode(0x0D);
     crtc_port=(inp(0x3CC)&1)?0x3D4:0x3B4;
-    if(mode==VIDEO_320_60)set_320x200_60hz();
-    else if(mode!=VIDEO_320_70){bios_mode(3);return 0;}
+    /* The custom 59.94-Hz timing uses VGA CRTC semantics.  A real EGA keeps
+     * its native Mode 0Dh timing instead of being programmed with VGA values. */
+    if(mode==VIDEO_320_60&&vga_dac_present)set_320x200_60hz();
+    else if(mode!=VIDEO_320_60&&mode!=VIDEO_320_70){bios_mode(3);return 0;}
 
     /* Ask the BIOS for the two page starts once, then use the measured CRTC
      * values directly during streaming. This preserves adapter-specific page
@@ -190,6 +251,7 @@ int vga_enter(VideoMode mode) {
     if(page_start[0]==page_start[1]){bios_mode(3);return 0;}
 
     vga_active=1;
+    rgb3_active=rgb3!=0;
 #ifdef DOSFER_DEVTOOLS
     display_page=0;
 #endif
@@ -205,12 +267,14 @@ int vga_enter(VideoMode mode) {
      * graphics mode is active, so program the planar-write state once rather
      * than repeating the same VGA port writes for every QR upload. */
     setup_planar_write();
+    if(rgb3_active)setup_rgb3_palette();
     return 1;
 }
 
 void vga_leave(void) {
     free_delta();
     screen_invert=-1;
+    rgb3_active=0;
     if(vga_active){
         bios_mode(3);
         vga_active=0;
@@ -263,49 +327,98 @@ static void select_display_page(unsigned page) {
 
 u32 vga_last_flip_tick(void) { return last_flip_tick; }
 
-static void status_text_320(const char *s) {
+static u8 *rgb_screen(int channel) {
+    if(channel==VGA_RGB_GREEN)return screen_green;
+    if(channel==VGA_RGB_BLUE)return screen_blue;
+    return screen_320;
+}
+
+static void status_text_buffer(u8 *screen,const char *s) {
     int x,y;
     u8 far *glyph;
     u8 bg=screen_invert?0x00:0xFF;
 
-    if(!s&&!status_active)return;
     for(y=VGA_STATUS_ROW;y<VGA_HEIGHT;++y)
-        memset(screen_320+y*VGA_BYTES_PER_LINE,bg,VGA_BYTES_PER_LINE);
-    status_active=s!=0;
-    ++status_generation;
+        memset(screen+y*VGA_BYTES_PER_LINE,bg,VGA_BYTES_PER_LINE);
     if(!font8||!s)return;
-
-    for(x=0;s[x]&&x<40;++x){
+    for(x=0;s[x]&&x<40;++x) {
         glyph=font8+(u16)(u8)s[x]*8;
         for(y=0;y<8;++y)
-            screen_320[(VGA_STATUS_ROW+y)*VGA_BYTES_PER_LINE+x]=
+            screen[(VGA_STATUS_ROW+y)*VGA_BYTES_PER_LINE+x]=
                 screen_invert?glyph[y]:(u8)~glyph[y];
     }
 }
 
-static int build_qr_image_320(const u8 *qr,int invert) {
+static void status_text_320(const char *s) {
+    if(!s&&!status_active)return;
+    status_text_buffer(screen_320,s);
+    status_active=s!=0;
+    ++status_generation;
+}
+
+static void status_text_rgb3(const char *s) {
+    int channel;
+    if(!s&&!status_active)return;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+        status_text_buffer(rgb_screen(channel),s);
+    status_active=s!=0;
+    ++status_generation;
+}
+
+static int build_qr_image_buffer(u8 *screen,const u8 *qr,int invert) {
     int my,mx,index,dark,px;
     u8 mask;
 
-    if(!qr)return 0;
-    memset(screen_320,invert?0x00:0xFF,sizeof(screen_320));
-    screen_invert=invert;
-
-    for(my=0;my<DOSFER_QR_SIZE;++my){
+    if(!screen||!qr)return 0;
+    memset(screen,invert?0x00:0xFF,VGA_VISIBLE_BYTES);
+    for(my=0;my<DOSFER_QR_SIZE;++my) {
         index=my*DOSFER_QR_SIZE;
-        for(mx=0;mx<DOSFER_QR_SIZE;++mx){
+        for(mx=0;mx<DOSFER_QR_SIZE;++mx) {
             dark=(qr[(index>>3)+1]>>(index&7))&1;
             ++index;
             if(!dark)continue;
             px=QR_X0+DOSFER_QR_QUIET+mx;
             mask=(u8)(0x80>>(px&7));
             if(invert)
-                screen_320[(QR_Y0+my)*VGA_BYTES_PER_LINE+(px>>3)]|=mask;
+                screen[(QR_Y0+my)*VGA_BYTES_PER_LINE+(px>>3)]|=mask;
             else
-                screen_320[(QR_Y0+my)*VGA_BYTES_PER_LINE+(px>>3)]&=(u8)~mask;
+                screen[(QR_Y0+my)*VGA_BYTES_PER_LINE+(px>>3)]&=(u8)~mask;
         }
     }
     return 1;
+}
+
+static int build_qr_image_320(const u8 *qr,int invert) {
+    screen_invert=invert;
+    return build_qr_image_buffer(screen_320,qr,invert);
+}
+
+static int build_qr_image_rgb3(const u8 *const qr[VGA_RGB_CHANNELS],int invert) {
+    int channel;
+    screen_invert=invert;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+        if(!build_qr_image_buffer(rgb_screen(channel),qr[channel],invert))return 0;
+    return 1;
+}
+
+static void finish_page_flip(u32 earliest_tick) {
+#ifdef DOSFER_PROFILE
+    u32 profile_start=timer_ticks(),profile_now;
+#endif
+    wait_retrace_at_or_after(earliest_tick);
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[2]+=profile_now-profile_start;
+    profile_start=profile_now;
+#endif
+    select_display_page((unsigned)write_page);
+    last_flip_tick=timer_ticks();
+#ifdef DOSFER_PROFILE
+    profile_now=last_flip_tick;dosferVgaProfileTicks[3]+=profile_now-profile_start;
+#endif
+#ifdef DOSFER_DEVTOOLS
+    display_page=write_page;
+#endif
+    write_page^=1;
 }
 
 static void copy_320_flip(u32 earliest_tick) {
@@ -315,6 +428,7 @@ static void copy_320_flip(u32 earliest_tick) {
     u32 profile_start=timer_ticks(),profile_now;
 #endif
 
+    set_map_mask(0x0F);
     if(!page_initialized[write_page]||page_invert[write_page]!=(u8)screen_invert) {
         dosferCopyFull320(screen_320,vram+base);
         page_status_generation[write_page]=status_generation;
@@ -328,26 +442,48 @@ static void copy_320_flip(u32 earliest_tick) {
     }
     page_initialized[write_page]=1;
     page_invert[write_page]=(u8)screen_invert;
-
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[1]+=profile_now-profile_start;
-    profile_start=profile_now;
 #endif
-    wait_retrace_at_or_after(earliest_tick);
+    finish_page_flip(earliest_tick);
+}
+
+static void copy_rgb3_flip(u32 earliest_tick) {
+    static const u8 plane_mask[VGA_RGB_CHANNELS]={0x04,0x02,0x01};
+    u8 far *vram=(u8 far *)MK_FP(0xA000,0);
+    u16 base=(u16)(write_page<<13);
+    int channel;
+    int reset=!page_initialized[write_page]||
+              page_invert[write_page]!=(u8)screen_invert;
+    int status_changed=page_status_generation[write_page]!=status_generation;
 #ifdef DOSFER_PROFILE
-    profile_now=timer_ticks();dosferVgaProfileTicks[2]+=profile_now-profile_start;
-    profile_start=profile_now;
+    u32 profile_start=timer_ticks(),profile_now;
 #endif
 
-    select_display_page((unsigned)write_page);
-    last_flip_tick=timer_ticks();
+    if(reset) {
+        set_map_mask(0x08); /* fourth plane must never leak into RGB indexes */
+        dosferClearFull320(vram+base);
+    }
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+        u8 *screen=rgb_screen(channel);
+        set_map_mask(plane_mask[channel]);
+        /* The first RGB image on each VGA page used to take the full-copy
+           path. On real hardware/DOSBox that path can leave two colour
+           planes stale. Initialise the page explicitly, then use the exact
+           QR/status copy routine that all later RGB images use. */
+        if(reset)_fmemset(vram+base,screen_invert?0x00:0xFF,VGA_VISIBLE_BYTES);
+        dosferCopyQr320(screen,vram+base);
+        if(reset||status_changed)
+            dosferCopyStatus320(screen+(u32)VGA_STATUS_ROW*VGA_BYTES_PER_LINE,
+                vram+base+(u32)VGA_STATUS_ROW*VGA_BYTES_PER_LINE);
+    }
+    page_initialized[write_page]=1;
+    page_invert[write_page]=(u8)screen_invert;
+    page_status_generation[write_page]=status_generation;
 #ifdef DOSFER_PROFILE
-    profile_now=last_flip_tick;dosferVgaProfileTicks[3]+=profile_now-profile_start;
+    profile_now=timer_ticks();dosferVgaProfileTicks[1]+=profile_now-profile_start;
 #endif
-#ifdef DOSFER_DEVTOOLS
-    display_page=write_page;
-#endif
-    write_page^=1;
+    finish_page_flip(earliest_tick);
 }
 
 static int prepare_delta(void) {
@@ -467,10 +603,134 @@ int vga_apply_v40l_delta(const u8 *data_codewords,const u8 *ecc_blocks,
     return cw==DOSFER_QR_CODEWORDS;
 }
 
+
+#define APPLY_RGB_MODULE(bit_index,bit_mask) do { \
+    if((changed_r|changed_g|changed_b)&(bit_mask)) { \
+        u16 entry__=(map)[bit_index]; \
+        u16 offset__=(u16)(entry__&0x1FFF); \
+        u8 pixel__=pixel_mask[entry__>>13]; \
+        if(changed_r&(bit_mask))screen_320[offset__]^=pixel__; \
+        if(changed_g&(bit_mask))screen_green[offset__]^=pixel__; \
+        if(changed_b&(bit_mask))screen_blue[offset__]^=pixel__; \
+    } \
+} while(0)
+
+#define APPLY_CHANGED_BYTE3(map) do { \
+    APPLY_RGB_MODULE(0,0x80); APPLY_RGB_MODULE(1,0x40); \
+    APPLY_RGB_MODULE(2,0x20); APPLY_RGB_MODULE(3,0x10); \
+    APPLY_RGB_MODULE(4,0x08); APPLY_RGB_MODULE(5,0x04); \
+    APPLY_RGB_MODULE(6,0x02); APPLY_RGB_MODULE(7,0x01); \
+} while(0)
+
+int vga_apply_codeword_delta3(
+        const u8 *const next_codewords[VGA_RGB_CHANNELS],
+        u8 *const current_codewords[VGA_RGB_CHANNELS]) {
+    const u16 far *map=delta_entry;
+    const u8 far *next_r,*next_g,*next_b;
+    u8 far *current_r,*current_g,*current_b;
+    u16 i;
+    u8 changed_r,changed_g,changed_b;
+#ifdef DOSFER_PROFILE
+    u32 profile_start=timer_ticks();
+#endif
+
+    if(!rgb3_active||!delta_entry||!next_codewords||!current_codewords||
+       !next_codewords[VGA_RGB_RED]||!next_codewords[VGA_RGB_GREEN]||
+       !next_codewords[VGA_RGB_BLUE]||!current_codewords[VGA_RGB_RED]||
+       !current_codewords[VGA_RGB_GREEN]||!current_codewords[VGA_RGB_BLUE])return 0;
+    next_r=next_codewords[VGA_RGB_RED];
+    next_g=next_codewords[VGA_RGB_GREEN];
+    next_b=next_codewords[VGA_RGB_BLUE];
+    current_r=current_codewords[VGA_RGB_RED];
+    current_g=current_codewords[VGA_RGB_GREEN];
+    current_b=current_codewords[VGA_RGB_BLUE];
+    for(i=0;i<DOSFER_QR_CODEWORDS;++i,map+=8) {
+        changed_r=(u8)(*next_r^*current_r);
+        changed_g=(u8)(*next_g^*current_g);
+        changed_b=(u8)(*next_b^*current_b);
+        *current_r++=*next_r++;
+        *current_g++=*next_g++;
+        *current_b++=*next_b++;
+        if(changed_r|changed_g|changed_b)APPLY_CHANGED_BYTE3(map);
+    }
+#ifdef DOSFER_PROFILE
+    dosferVgaProfileTicks[0]+=timer_ticks()-profile_start;
+#endif
+    return 1;
+}
+
+int vga_apply_v40l_delta3(
+        const u8 *const data_codewords[VGA_RGB_CHANNELS],
+        const u8 *const ecc_blocks[VGA_RGB_CHANNELS],
+        u8 *const current_codewords[VGA_RGB_CHANNELS]) {
+    static const u16 block_offset[25]={
+        0,118,236,354,472,590,708,826,944,1062,
+        1180,1298,1416,1534,1652,1770,1888,2006,2124,
+        2242,2361,2480,2599,2718,2837
+    };
+    const u16 far *map=delta_entry;
+    u8 far *current_r,*current_g,*current_b;
+    u16 cw=0;
+    int row,block;
+    u8 value_r,value_g,value_b,changed_r,changed_g,changed_b;
+#ifdef DOSFER_PROFILE
+    u32 profile_start=timer_ticks();
+#endif
+
+    if(!rgb3_active||!delta_entry||!data_codewords||!ecc_blocks||
+       !current_codewords)return 0;
+    for(block=0;block<VGA_RGB_CHANNELS;++block)
+        if(!data_codewords[block]||!ecc_blocks[block]||
+           !current_codewords[block])return 0;
+    current_r=current_codewords[VGA_RGB_RED];
+    current_g=current_codewords[VGA_RGB_GREEN];
+    current_b=current_codewords[VGA_RGB_BLUE];
+
+#define EMIT_VALUE3(vr,vg,vb) do { \
+        value_r=(u8)(vr); value_g=(u8)(vg); value_b=(u8)(vb); \
+        changed_r=(u8)(value_r^*current_r); \
+        changed_g=(u8)(value_g^*current_g); \
+        changed_b=(u8)(value_b^*current_b); \
+        *current_r++=value_r; *current_g++=value_g; *current_b++=value_b; \
+        if(changed_r|changed_g|changed_b)APPLY_CHANGED_BYTE3(map); \
+        ++cw; map+=8; \
+    } while(0)
+
+    for(row=0;row<118;++row)
+        for(block=0;block<25;++block)
+            EMIT_VALUE3(
+                data_codewords[VGA_RGB_RED][block_offset[block]+row],
+                data_codewords[VGA_RGB_GREEN][block_offset[block]+row],
+                data_codewords[VGA_RGB_BLUE][block_offset[block]+row]);
+    for(block=19;block<25;++block)
+        EMIT_VALUE3(
+            data_codewords[VGA_RGB_RED][block_offset[block]+118],
+            data_codewords[VGA_RGB_GREEN][block_offset[block]+118],
+            data_codewords[VGA_RGB_BLUE][block_offset[block]+118]);
+    for(row=0;row<30;++row)
+        for(block=0;block<25;++block)
+            EMIT_VALUE3(
+                ecc_blocks[VGA_RGB_RED][block*30+row],
+                ecc_blocks[VGA_RGB_GREEN][block*30+row],
+                ecc_blocks[VGA_RGB_BLUE][block*30+row]);
+
+#undef EMIT_VALUE3
+#ifdef DOSFER_PROFILE
+    dosferVgaProfileTicks[0]+=timer_ticks()-profile_start;
+#endif
+    return cw==DOSFER_QR_CODEWORDS;
+}
+
+#undef APPLY_CHANGED_BYTE3
+#undef APPLY_RGB_MODULE
 #undef APPLY_CHANGED_BYTE
 
 int vga_delta_ready(void) {
     return delta_entry!=0;
+}
+
+int vga_rgb3_active(void) {
+    return rgb3_active;
 }
 
 #ifdef DOSFER_DEVTOOLS
@@ -480,18 +740,34 @@ void vga_delta_stats(u16 *bits) {
 
 u32 vga_screen_hash(void) {
     u32 i,h=2166136261UL;
+    int channel,channels=rgb3_active?VGA_RGB_CHANNELS:1;
     /* Ignore status rows so full redraw and streaming hashes are comparable. */
-    for(i=0;i<7680;++i){h^=screen_320[i];h*=16777619UL;}
+    for(channel=0;channel<channels;++channel) {
+        u8 *screen=rgb_screen(channel);
+        for(i=0;i<7680;++i){h^=screen[i];h*=16777619UL;}
+    }
     return h;
 }
 
 int vga_display_matches(void) {
-    u8 far *vram;
+    static const u8 read_plane[VGA_RGB_CHANNELS]={2,1,0};
+    u8 far *vram=(u8 far *)MK_FP(0xA000,(u16)(display_page<<13));
     u16 i;
-    outp(0x3CE,4);outp(0x3CF,0); /* all four display planes are identical */
-    vram=(u8 far *)MK_FP(0xA000,(u16)(display_page<<13));
-    for(i=0;i<VGA_VISIBLE_BYTES;++i)
-        if(vram[i]!=screen_320[i])return 0;
+    int channel;
+    if(!rgb3_active) {
+        outp(0x3CE,4);outp(0x3CF,0);
+        for(i=0;i<VGA_VISIBLE_BYTES;++i)
+            if(vram[i]!=screen_320[i])return 0;
+        return 1;
+    }
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+        u8 *screen=rgb_screen(channel);
+        outp(0x3CE,4);outp(0x3CF,read_plane[channel]);
+        for(i=0;i<VGA_VISIBLE_BYTES;++i)
+            if(vram[i]!=screen[i])return 0;
+    }
+    outp(0x3CE,4);outp(0x3CF,3);
+    for(i=0;i<VGA_VISIBLE_BYTES;++i)if(vram[i])return 0;
     return 1;
 }
 #endif
@@ -534,6 +810,49 @@ int vga_show_prepared_at(int invert,const char *status,u32 earliest_tick) {
     profile_now=timer_ticks();dosferVgaProfileTicks[4]+=profile_now-profile_start;
 #endif
     copy_320_flip(earliest_tick);
+    return 1;
+}
+
+int vga_show_full_qr3_at(const u8 *const qr[VGA_RGB_CHANNELS],
+                         u8 *const codewords[VGA_RGB_CHANNELS],
+                         int invert,const char *status,u32 earliest_tick) {
+#ifdef DOSFER_PROFILE
+    u32 profile_start,profile_now;
+#endif
+    int channel;
+    if(!vga_active||!rgb3_active||!qr||!codewords)return 0;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+        if(!qr[channel]||!codewords[channel])return 0;
+#ifdef DOSFER_PROFILE
+    profile_start=timer_ticks();
+#endif
+    if(!build_qr_image_rgb3(qr,invert))return 0;
+    prepare_delta();
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;
+    profile_start=profile_now;
+#endif
+    status_text_rgb3(status);
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[4]+=profile_now-profile_start;
+#endif
+    copy_rgb3_flip(earliest_tick);
+    return 1;
+}
+
+int vga_show_prepared3_at(int invert,const char *status,u32 earliest_tick) {
+#ifdef DOSFER_PROFILE
+    u32 profile_start,profile_now;
+#endif
+    if(!vga_active||!rgb3_active||!delta_entry||screen_invert!=invert)return 0;
+#ifdef DOSFER_PROFILE
+    profile_start=timer_ticks();
+#endif
+    status_text_rgb3(status);
+#ifdef DOSFER_PROFILE
+    profile_now=timer_ticks();dosferVgaProfileTicks[4]+=profile_now-profile_start;
+#endif
+    copy_rgb3_flip(earliest_tick);
     return 1;
 }
 

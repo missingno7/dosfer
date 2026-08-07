@@ -13,6 +13,12 @@ static u8 timer_initialized,pending_bios_tick;
 
 /* OpenWatcom's far dereference uses DS in the large memory model. Preserve it
  * explicitly because the optimized QR assembly expects DS to remain DGROUP. */
+#ifdef DOSFER_HOST_TEST
+/* Host syntax/oracle builds do not execute the DOS timer path, but providing a
+ * definition keeps the complete release/dev/profile source set compilable by
+ * normal C compilers that do not understand Open Watcom's #pragma aux. */
+static u32 bios_ticks(void) { return 0; }
+#else
 static u32 bios_ticks(void);
 #pragma aux bios_ticks = \
     "push ds" \
@@ -25,6 +31,7 @@ static u32 bios_ticks(void);
     "pop bx" \
     "pop ds" \
     value [dx ax] modify [ax dx];
+#endif
 u32 timer_ticks(void) {
     u32 before,after,count_value,phase,bios_delta,delta;
     u16 count;u8 status,lo,hi,mode;

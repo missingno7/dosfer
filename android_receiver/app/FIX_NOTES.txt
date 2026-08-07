@@ -1,21 +1,36 @@
-DOSfer Receiver 1.3.1 - UI/preview repair
+DOSfer Receiver 1.4.0-rgb3
 
-Fixed:
-- The preview overlay no longer expands a WRAP_CONTENT FrameLayout to the full
-  remaining screen height. Preview + overlay are now measured together as one
-  exact square, so the scan status/result/buttons remain below the camera.
-- The receiver page has no horizontal padding around the preview, so a
-  1440-pixel-wide app window produces a 1440x1440 preview.
-- TextureView now uses a centered FILL_CENTER transform. Raw camera-buffer
-  coordinates are no longer passed directly as a view transform, and sensor
-  orientation is no longer applied twice.
-- Camera output is centered, fills the whole square, and display rotation is
-  handled separately.
-- Diagnostics are shown below the preview, followed by the result and a single
-  four-button action row matching the intended receiver layout.
-- Corrected Camera2 front/back relative-rotation calculation.
-- Added geometry regression tests for square, 4:3, and 16:9 capture streams.
+RGB3 changes:
+- Camera2 YUV_420_888 crops are converted directly into reusable
+  one-byte-per-pixel red, green and blue grayscale buffers; no Bitmap or ARGB
+  frame is allocated. The hot loop shares aligned 2x2 chroma samples, uses
+  precomputed BT.601 terms and reads the original plane buffers without making
+  per-image duplicate views.
+- Each colour channel is decoded independently by ZXing-C++ and valid DOSfer
+  frame IDs are de-duplicated before entering SessionStore.
+- One failed colour channel no longer discards the other two successful QRs.
+- Two distinct equal R/G/B DATA frames select a direct Camera2 Y-plane BW fast
+  path for the rest of the window. A single repeated focus frame cannot cause a
+  false BW classification. END_WINDOW re-enables detection.
+- Added strided RGB3 group-whitening/parity support and recovery.
+- Added physical-frame, channel, logical-frame, conversion-time and transport-
+  mode diagnostics.
 
-The old build/ directory was intentionally not included because it contains
-APKs compiled from the broken source. Rebuild this app module in the containing
-Android Studio/Gradle project.
+The previous square-preview/rotation fixes remain in place. Rebuild the app
+module; old APKs are not included in this source archive.
+
+GPU latency fix:
+- Kept the corrected square GPU crop/aspect-ratio path unchanged.
+- SurfaceTexture frame notifications are now coalesced so stale camera callbacks
+  cannot build an ever-growing GL work queue; updateTexImage() latches the latest
+  frame and old signals are intentionally dropped.
+- GPU plane dispatch/readback is skipped while both ZXing workers are busy.
+- Scanner work is dispatched before preview eglSwapBuffers(), and preview swap
+  interval is set to 0 so display presentation cannot pace the decode path.
+- PBO ring reduced from 3 to 2 slots to match the two decode workers and cap
+  in-flight stale work.
+- The GPU streaming path no longer runs expensive ZXing TryHarder recovery on
+  old frames; a miss is dropped in favor of the next camera frame.
+- GPU timing no longer subtracts SurfaceTexture.getTimestamp() from
+  System.nanoTime(). SurfaceTexture timestamps have a source-defined zero point,
+  so local latch time is used for valid latency measurements.

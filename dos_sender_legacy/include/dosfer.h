@@ -3,9 +3,19 @@
 
 #include <stdio.h>
 
+#ifdef DOSFER_HOST_TEST
+#include <stdint.h>
+#ifndef far
+#define far
+#endif
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+#else
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned long u32;
+#endif
 
 /* Sender scope is intentionally fixed to QR Version 40. */
 #define DOSFER_QR_VERSION 40
@@ -17,12 +27,16 @@ typedef unsigned long u32;
 #define RECORD_HEADER_SIZE 24
 #define MAX_FRAME_PAYLOAD 2904
 #define DOSFER_MAX_FRAME_BYTES (FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD)
-#define MAX_WINDOW 64
+#define MAX_WINDOW 66
 #define PATH_BYTES 128
 
 enum { FK_DATA=1, FK_END_WINDOW=2, FK_CALIBRATION=3, FK_CHAIN_XOR=4,
        FK_BLOCK_XOR=5 };
-enum { FF_REPEATED=0x0001, FF_PAIR_WHITENED=0x0004, FF_WHITENED=0x0008 };
+enum { FF_REPEATED=0x0001, FF_PAIR_WHITENED=0x0004, FF_WHITENED=0x0008,
+       /* BLOCK_XOR whitened by the XOR of up to three DATA streams.
+        * stream_id is the member count and stream_offset is their logical
+        * stride (RGB3 uses stride 3 across physical screen frames). */
+       FF_GROUP_XOR_WHITENED=0x0020 };
 enum { RT_SESSION=1, RT_DIRECTORY=2, RT_FILE_BEGIN=3,
        RT_FILE_DATA=4, RT_FILE_END=5, RT_TRANSFER_END=6 };
 
@@ -38,6 +52,7 @@ typedef struct {
     u16 window_frames;
     u8 invert;
     u8 speaker;
+    u8 rgb3;             /* standard QR codes in VGA/EGA red/green/blue planes */
     u8 redundancy;       /* 0=none, otherwise DATA frames per block parity */
     u8 chain_width;      /* 0=block parity, otherwise even overlap width */
     u8 qr_mask;          /* fixed QR mask 0..7 */

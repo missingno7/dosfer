@@ -90,18 +90,32 @@ void put_u32(u8 *p,u32 value) {
  * one xorshift32 word per four bytes, which is cheap on a 386 and prevents
  * low-entropy file regions from creating camera-hostile QR patterns. */
 static u32 copy_payload_crc(u8 *dst,const u8 *src,u16 len,u16 flags,
-        u32 session,u32 global_index) {
+        u32 session,u32 global_index,u32 stream_id,u32 stream_offset) {
     u32 crc=0xFFFFFFFFUL;
     u32 left=whitening_seed(session,global_index);
-    u32 right=0;
+    u32 middle=0,right=0;
+    u16 group_count=(u16)stream_id;
+    u32 group_stride=stream_offset?stream_offset:1UL;
 
     if(!crc_ready)crc_init();
-    if(flags&FF_PAIR_WHITENED)
+    if(flags&FF_GROUP_XOR_WHITENED) {
+        /* RGB3 parity uses the XOR of up to three DATA whitening streams.
+         * stream_id is the member count and stream_offset is their logical
+         * stride (3 for channel-wise parity across three RGB images). */
+        if(group_count>=2)middle=whitening_seed(session,global_index+group_stride);
+        if(group_count>=3)right=whitening_seed(session,global_index+group_stride*2UL);
+    } else if(flags&FF_PAIR_WHITENED) {
         right=whitening_seed(session,global_index+1UL);
+    }
 
     while(len>=4) {
         u32 value=*(const u32 *)src;
-        if(flags&FF_PAIR_WHITENED) {
+        if(flags&FF_GROUP_XOR_WHITENED) {
+            left=xorshift32(left);
+            value^=left;
+            if(group_count>=2){middle=xorshift32(middle);value^=middle;}
+            if(group_count>=3){right=xorshift32(right);value^=right;}
+        } else if(flags&FF_PAIR_WHITENED) {
             left=xorshift32(left);
             right=xorshift32(right);
             value^=left^right;
@@ -118,7 +132,11 @@ static u32 copy_payload_crc(u8 *dst,const u8 *src,u16 len,u16 flags,
 
     if(len) {
         u32 key=0;
-        if(flags&FF_PAIR_WHITENED) {
+        if(flags&FF_GROUP_XOR_WHITENED) {
+            left=xorshift32(left);key=left;
+            if(group_count>=2){middle=xorshift32(middle);key^=middle;}
+            if(group_count>=3){right=xorshift32(right);key^=right;}
+        } else if(flags&FF_PAIR_WHITENED) {
             left=xorshift32(left);
             right=xorshift32(right);
             key=left^right;
@@ -128,7 +146,7 @@ static u32 copy_payload_crc(u8 *dst,const u8 *src,u16 len,u16 flags,
         }
         while(len--) {
             u8 value=*src++;
-            if(flags&(FF_PAIR_WHITENED|FF_WHITENED)) {
+            if(flags&(FF_PAIR_WHITENED|FF_WHITENED|FF_GROUP_XOR_WHITENED)) {
                 value^=(u8)key;
                 key>>=8;
             }
@@ -204,7 +222,7 @@ u16 make_frame(u8 *out,u8 kind,u16 flags,u32 session,u32 window,u32 global_index
 #endif
     if(payload_len)
         payload_crc=copy_payload_crc(out+FRAME_HEADER_SIZE,payload,payload_len,
-            flags,session,global_index);
+            flags,session,global_index,stream_id,stream_offset);
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();
     dosferProtocolProfileTicks[1]+=profile_now-profile_start;

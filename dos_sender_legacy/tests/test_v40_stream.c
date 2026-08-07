@@ -76,15 +76,19 @@ static void apply_delta(const uint8_t *next,uint8_t *current,
 }
 
 int main(void) {
-    uint8_t *frame=malloc(2952),*canonical=malloc(CODEWORDS),
+    uint8_t *frame=malloc(2952),*frame_b=malloc(2952),*frame_c=malloc(2952),
+        *desired=malloc(2952),*canonical=malloc(CODEWORDS),
         *emitted=malloc(CODEWORDS),*current=malloc(CODEWORDS),
+        *cw_a=malloc(CODEWORDS),*cw_b=malloc(CODEWORDS),*cw_c=malloc(CODEWORDS),
+        *derived=malloc(CODEWORDS),
         *workspace=malloc(qrcodegen_BUFFER_LEN_FOR_VERSION(40)),
         *qr=malloc(qrcodegen_BUFFER_LEN_FOR_VERSION(40)),
         *raster=malloc(RASTER_BYTES),*expected=malloc(RASTER_BYTES);
     uint8_t *data=workspace,*ecc=workspace+DATA_CODEWORDS;
     int mask,test,i;
 
-    if(!frame||!canonical||!emitted||!current||!workspace||!qr||
+    if(!frame||!frame_b||!frame_c||!desired||!canonical||!emitted||!current||
+            !cw_a||!cw_b||!cw_c||!derived||!workspace||!qr||
             !raster||!expected)return 2;
 
     for(mask=0;mask<8;mask++) {
@@ -120,8 +124,38 @@ int main(void) {
         }
         free(modules);
         qrcodegen_dosferReleaseMatrixCache();
+
+        /* An odd three-way XOR keeps the common QR prefix and pad stream.
+         * Only the 48-byte DOSfer header differs from the source-header XOR. */
+        for(test=0;test<40;test++) {
+            uint8_t header_xor[48];
+            for(i=0;i<2952;i++) {
+                frame[i]=(uint8_t)next_random();
+                frame_b[i]=(uint8_t)next_random();
+                frame_c[i]=(uint8_t)next_random();
+                desired[i]=(uint8_t)(i<48?next_random():
+                    frame[i]^frame_b[i]^frame_c[i]);
+            }
+            for(i=0;i<48;i++)header_xor[i]=(uint8_t)(frame[i]^frame_b[i]^
+                frame_c[i]^desired[i]);
+            if(!qrcodegen_dosferEncodeFrameV40L(frame,2952,cw_a,workspace,
+                    (enum qrcodegen_Mask)mask,true)||
+               !qrcodegen_dosferEncodeFrameV40L(frame_b,2952,cw_b,workspace,
+                    (enum qrcodegen_Mask)mask,true)||
+               !qrcodegen_dosferEncodeFrameV40L(frame_c,2952,cw_c,workspace,
+                    (enum qrcodegen_Mask)mask,true)||
+               !qrcodegen_dosferEncodeFrameV40L(desired,2952,canonical,workspace,
+                    (enum qrcodegen_Mask)mask,true)||
+               !qrcodegen_dosferDeriveXor3V40L(cw_a,cw_b,cw_c,header_xor,derived))
+                return 9;
+            if(memcmp(canonical,derived,CODEWORDS))return 10;
+        }
     }
 
-    puts("PASS: fixed V40-L emitter matches canonical codewords and raster");
+    free(frame);free(frame_b);free(frame_c);free(desired);
+    free(canonical);free(emitted);free(current);
+    free(cw_a);free(cw_b);free(cw_c);free(derived);
+    free(workspace);free(qr);free(raster);free(expected);
+    puts("PASS: V40-L emitter/raster and XOR3 affine derivation match canonical output");
     return 0;
 }

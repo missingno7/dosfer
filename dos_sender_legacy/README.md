@@ -1,141 +1,124 @@
-# DOSfer legacy V40-L sender
+# DOSfer legacy RGB3 V40-L sender
 
-This tree keeps the proven 16-bit legacy sender architecture and specializes it
-for the actual optical-transfer target instead of carrying old generic modes.
+This tree keeps the proven 16-bit Open Watcom sender architecture and extends
+it with an optimized RGB3 optical transport for real 386-class DOS machines.
+Every colour channel remains a complete standard QR code.
 
 ## Fixed scope
 
-- **QR Version 40-L only** (`177 x 177` modules)
-- one VGA pixel per QR module
-- VGA BIOS Mode `0Dh`, `320 x 200`, 16-color planar memory
-- `/VIDEO:320_60` is the default
-- `/VIDEO:320_70` keeps the original BIOS timing
-- maximum DOSfer frame payload: 2904 bytes
-- no 640x480 renderer
-- no QR version/ECC/scale selection
+- QR Version 40-L only (`177 × 177` modules)
+- one display pixel per QR module
+- planar EGA/VGA BIOS Mode `0Dh`, `320 × 200`
+- `/VIDEO:320_60` default; VGA receives custom ~59.94-Hz timing
+- real EGA retains native Mode 0Dh timing
+- maximum DOSfer frame payload: 2,904 bytes
+- no custom colour barcode and no 8-bpp chunky framebuffer
+
+## Output modes
+
+`/RGB3` is the default:
+
+- plane 2 = red QR
+- plane 1 = green QR
+- plane 0 = blue QR
+- plane 3 = zero
+
+The hidden page receives three packed 1-bpp uploads and is then flipped once.
+`/BW` writes one QR to all display planes and remains wire-compatible with the
+existing receiver.
+
+The default logical window contains 66 frames, exactly 22 RGB images. If a tuple
+is incomplete, the final valid logical QR is repeated in unused channels.
 
 ## Retained transfer features
 
 - ordinary DATA frames
-- block XOR redundancy (`/RE:n`)
+- block XOR redundancy (`/RE:n`), default `/RE:3`
 - overlapping chain redundancy (`/RE:C2`, `/RE:C4`, ...)
-- the optimized affine C2 shortcut
+- optimized affine C2 and XOR3 codeword derivation
 - optional chain anchors
 - current-window replay and selective missing-frame rescue
 - fixed QR mask selection and rescue mask rotation
 - inversion and end-of-window beep
-- calibration and benchmark modes in developer builds only
+- calibration and benchmark modes in developer builds
 
+## RGB3 hot path
+
+Three persistent codeword streams and three 1-bpp shadow rasters share one
+packed V40 placement map. The steady-state loop processes the same codeword
+position for R/G/B together, loads each placement entry once, and toggles only
+the affected channel rasters.
+
+For the optimized RGB3 `/RE:3` schedule, three successive physical DATA images
+`[D0,D1,D2]`, `[D3,D4,D5]`, and `[D6,D7,D8]` produce one parity image containing
+`D0^D3^D6`, `D1^D4^D7`, and `D2^D5^D8`. Each parity QR is derived from the three
+already encoded QR codeword streams. The common QR prefix and Reed-Solomon
+codewords combine linearly; only the DOSfer header difference and its
+first-block RS correction are patched. Unequal or short groups fall back to
+canonical V40-L encoding.
+
+See the repository-level `RGB3_IMPLEMENTATION.md` for the complete pipeline and
+memory budget.
 
 ## Single-window memory model
 
-The sender retains only the **current unacknowledged window** in DOS memory.
-`/WINDOW:64` is the default. `R` and `M` can replay or selectively rescue the
-current window until Enter is pressed. Enter commits that window; the same 64
-payload buffers are then recycled in place for the next window while the last
-END_WINDOW QR remains visible in VGA memory.
+Only the current unacknowledged window is retained. `/WINDOW:66` is the default.
+`R` and `M` replay or selectively rescue it until Enter commits it. The same 66
+far payload allocations are then recycled in place while the END_WINDOW image
+remains visible.
 
-There is intentionally no previous-window `B` replay command. Runtime `+/-`
-hold adjustment has also been removed; transfer cadence is configured only with
-`/HOLD:n`. This changes the largest payload allocation from two replay windows
-to one and makes one 64-frame window use approximately the same payload RAM
-that two 32-frame windows used.
+There is no previous-window `B` command and no runtime `+/-` timing change.
+Configure cadence with `/HOLD:n` before transfer.
 
-## Safe hot-path optimizations
+## Existing V40 optimizations retained
 
-The sender remains a 16-bit Open Watcom DOS program. No DOS/4GW or 32-bit port
-was introduced.
-
-- A dedicated **fixed V40-L frame encoder** replaces generic segment/version/ECC
-  dispatch in the sender hot path.
-- V40-L Reed-Solomon uses the existing proven degree-30 two-byte assembly
-  recurrence and the fixed 25-block layout.
-- After the first canonical QR, the encoder computes only the 2956 data
-  codewords plus 750 block-major ECC bytes held in the unused tail of the
-  existing QR workspace. A sequential emitter updates one persistent
-  current-codeword stream and the RAM shadow raster directly; it no longer
-  creates a second complete 3706-byte output and scans it again.
-- Full 2952-byte DATA frames use the prepacked ECI/byte representation directly,
-  including repeated/rescue DATA frames once delta rendering is active.
-- The first-render placement cache stores one 16-bit linear module index per
-  codeword bit. VGA takes that allocation and converts it in place to the final
-  packed delta map, removing the old 8-bit mask table and duplicate 59 KiB map
-  allocation.
-- Production DATA/XOR frames with no status label skip status-row clearing and
-  the associated 320-byte VGA upload; the focus and END_WINDOW prompts remain.
-- `/HOLD` no longer waits for the millisecond target and then waits for another
-  retrace. The next page is uploaded early and flips on the **first retrace at or
-  after the requested absolute deadline**. On `320_60`, `/HOLD:50` therefore
-  naturally lands on the third refresh (~50.05 ms).
-- BIOS page switching is used only during VGA initialization to discover the
-  adapter's actual page start addresses. Streaming flips pages by writing those
-  measured CRTC start values directly, avoiding `INT 10h AH=05h` per QR.
-- VGA planar write mode and the all-plane map mask are programmed once when the
-  graphics mode is entered instead of repeating identical port writes for every
-  hidden-page upload.
-- Calibration uses the same delta renderer and retrace/deadline scheduling as a
-  real transfer, so camera tuning reflects actual playback cadence.
-
-
-## Production UI
-
-The release build does not render diagnostic text under every DATA/XOR QR.
-It keeps only the initial camera-focus prompt and the END_WINDOW controls.
-Detailed per-frame labels remain available in developer/profile builds.
-Runtime `+/-` cadence changes are removed; use `/HOLD:n` before starting.
-
-## Source layout
-
-- `src/sender.c` - transfer/session orchestration and redundancy scheduling
-- `src/producer.c` - manifest scanning, disk read-ahead and record production
-- `src/sender_config.c` - command-line parsing for the fixed V40-L sender
-- `src/protocol.c` - DOSfer records, frames, CRC and whitening
-- `src/vga.c` - V40 320x200 delta renderer, deadline-aware retrace and page flip
-- `src/timing.c` - PIT-based high-resolution timing
-- `third_party/qrcodegen.*` - canonical QR library plus fixed V40-L fast helpers
-
-The upstream QR implementation remains in the tree as the correctness oracle,
-but normal sender encoding uses only the fixed V40-L helper.
+- dedicated fixed V40-L packing and block layout;
+- degree-30 two-input-byte Open Watcom Reed-Solomon kernel;
+- persistent codeword streams and fused codeword/raster delta application;
+- one 59,296-byte placement map instead of duplicate maps;
+- status-row upload suppression in release builds;
+- direct CRTC page flips and retrace-aware absolute `/HOLD` deadlines;
+- 32-bit sequential VGA copies on 386+.
 
 ## Build
 
 Open Watcom is required.
 
-Release build (default):
-
 ```bat
-build.bat
+build.bat          rem release DOSFER.EXE
+build_dev.bat      rem DOSFERD.EXE with /CAL and /BENCH
+build_profile.bat  rem DOSFERP.EXE with timing counters
 ```
-
-Developer build with `/CAL` and `/BENCH`:
-
-```bat
-build_dev.bat
-```
-
-Profiling build:
-
-```bat
-build_profile.bat
-```
-
-See `BUILD_PROFILES.md` for the exact compile-time split. The release EXE does
-not contain calibration/benchmark loops, VGA readback/hash verification, or
-profiling counters.
-
-Validation notes and host-side oracle tests are kept under `docs/` and
-`tests/`.
 
 ## Examples
 
-Default 320x200 ~60 Hz:
+Default RGB3 transfer:
 
 ```bat
-DOSFER.EXE /WINDOW:64 /HOLD:50 /RE:C2 FILE.ZIP
+DOSFER.EXE FILE.ZIP
 ```
 
-Original ~70 Hz Mode 0Dh timing:
+Explicit 50-ms physical hold:
 
 ```bat
-DOSFER.EXE /VIDEO:320_70 /WINDOW:64 /HOLD:50 FILE.ZIP
+DOSFER.EXE /RGB3 /WINDOW:66 /HOLD:50 /RE:3 FILE.ZIP
+```
+
+Legacy monochrome:
+
+```bat
+DOSFER.EXE /BW /VIDEO:320_70 /WINDOW:66 /HOLD:50 FILE.ZIP
+```
+
+## Host oracle tests
+
+```sh
+cc -O2 -std=c99 -Ithird_party tests/test_v40_stream.c \
+  third_party/qrcodegen.c -o test_v40_stream
+./test_v40_stream
+
+cc -O2 -std=c99 -DDOSFER_HOST_TEST -Iinclude -Ithird_party \
+  tests/test_rgb3_protocol.c src/protocol.c third_party/qrcodegen.c \
+  -o test_rgb3_protocol
+./test_rgb3_protocol
 ```

@@ -11,7 +11,7 @@ from pyfatfs.PyFatFS import PyFatFS  # noqa: E402
 
 
 IMAGE = ROOT / "tools" / "86box" / "vm" / "dosfer-486" / "DOSFER46.img"
-EXE = ROOT / "dos_sender" / "build" / "DOSFER.EXE"
+EXE = ROOT / "dos_sender_legacy" / "build" / "DOSFER.EXE"
 PARTITION_OFFSET = 17 * 512
 
 

@@ -78,6 +78,65 @@ public class ProtocolTest {
     @Test public void chainPeelsForwardAndBackward(){byte[] a=record(20,9),b=record(21,27),c=record(22,13);Protocol.Frame ab=chain(a,b,20),bc=chain(b,c,21);
         byte[] forwardB=Protocol.recoverChain(ab,a,true);assertArrayEquals(c,Protocol.recoverChain(bc,forwardB,true));
         byte[] backwardB=Protocol.recoverChain(bc,c,false);assertArrayEquals(a,Protocol.recoverChain(ab,backwardB,false));}
+    @Test public void rgb3Stride3WhiteningHasFixedCrossLanguageSequence(){byte[] b=new byte[16];
+        Protocol.whitenPayloadXorGroup(b,0,b.length,0x6A67C69DL,120,3,3);
+        assertArrayEquals(hex("3c7276a924f50981b274084a5dc95cd7"),b);}
+    @Test public void rgb3Stride3ParityWireIsXorAndRecoversWholePhysicalImage(){
+        byte[][] payloads=new byte[9][];byte[][] dataWire=new byte[9][];
+        for(int i=0;i<9;i++){payloads[i]=record(41+i,32);dataWire[i]=Protocol.encodeFrame(
+                Protocol.DATA,Protocol.FLAG_WHITENED,0x6A67C69DL,8,120+i,i,66,0,0,payloads[i]);}
+        Protocol.Frame[] parity=new Protocol.Frame[3];
+        for(int channel=0;channel<3;channel++){
+            byte[] plain=new byte[payloads[channel].length];
+            for(int image=0;image<3;image++)for(int j=0;j<plain.length;j++)plain[j]^=payloads[channel+image*3][j];
+            byte[] wire=Protocol.encodeFrame(Protocol.BLOCK_XOR,Protocol.FLAG_GROUP_XOR_WHITENED,
+                    0x6A67C69DL,8,120+channel,channel,66,3,3,plain);
+            for(int j=Protocol.FRAME_HEADER;j<wire.length;j++)assertEquals(
+                    (byte)(dataWire[channel][j]^dataWire[channel+3][j]^dataWire[channel+6][j]),wire[j]);
+            parity[channel]=Protocol.parseFrame(wire);assertArrayEquals(plain,parity[channel].payload);
+        }
+        /* Losing one camera image removes three DATA frames at once.  The
+           three independent channel equations recover all of them. */
+        for(int missingImage=0;missingImage<3;missingImage++)for(int channel=0;channel<3;channel++){
+            byte[][] members={payloads[channel],payloads[channel+3],payloads[channel+6]};
+            members[missingImage]=null;
+            assertArrayEquals(payloads[channel+missingImage*3],
+                    Protocol.recoverBlock(parity[channel],members,missingImage));
+        }
+    }
+    @Test public void rgb3Stride3ParityRecoversEveryUnequalMember(){int[] sizes={3,29,7};
+        byte[][] payloads=new byte[sizes.length][];int max=0;
+        for(int i=0;i<sizes.length;i++){payloads[i]=record(i+71,sizes[i]);max=Math.max(max,payloads[i].length);}
+        byte[] parityPayload=new byte[max];for(byte[] payload:payloads)for(int j=0;j<payload.length;j++)parityPayload[j]^=payload[j];
+        Protocol.Frame parity=Protocol.parseFrame(Protocol.encodeFrame(Protocol.BLOCK_XOR,Protocol.FLAG_GROUP_XOR_WHITENED,
+                0x6A67C69DL,5,200,2,66,3,3,parityPayload));
+        for(int missing=0;missing<payloads.length;missing++){byte[][] members=payloads.clone();members[missing]=null;
+            assertArrayEquals(payloads[missing],Protocol.recoverBlock(parity,members,missing));}}
+    @Test public void rgb3TailParitySupportsOneAndTwoMembers(){
+        byte[] a=record(91,11),b=record(92,27);
+        Protocol.Frame one=Protocol.parseFrame(Protocol.encodeFrame(Protocol.BLOCK_XOR,
+                Protocol.FLAG_GROUP_XOR_WHITENED,0x6A67C69DL,5,300,60,66,1,3,a));
+        assertArrayEquals(a,Protocol.recoverBlock(one,new byte[][]{null},0));
+        byte[] x=new byte[Math.max(a.length,b.length)];for(int i=0;i<x.length;i++)x[i]=(byte)((i<a.length?a[i]:0)^(i<b.length?b[i]:0));
+        Protocol.Frame two=Protocol.parseFrame(Protocol.encodeFrame(Protocol.BLOCK_XOR,
+                Protocol.FLAG_GROUP_XOR_WHITENED,0x6A67C69DL,5,300,60,66,2,3,x));
+        assertArrayEquals(a,Protocol.recoverBlock(two,new byte[][]{null,b},0));
+        assertArrayEquals(b,Protocol.recoverBlock(two,new byte[][]{a,null},1));
+    }
+    @Test(expected=IllegalArgumentException.class)public void rgb3StrideOutsideWindowRejected(){
+        Protocol.encodeFrame(Protocol.BLOCK_XOR,Protocol.FLAG_GROUP_XOR_WHITENED,
+                0x6A67C69DL,5,300,64,66,2,3,new byte[Protocol.RECORD_HEADER]);}
+    @Test public void frameKeyDistinguishesStridedParityEquations(){
+        byte[] payload=record(88,12);
+        Protocol.Frame contiguous=Protocol.parseFrame(Protocol.encodeFrame(Protocol.BLOCK_XOR,
+                Protocol.FLAG_WHITENED,0x1234,0,10,0,9,3,0,payload));
+        Protocol.Frame strided=Protocol.parseFrame(Protocol.encodeFrame(Protocol.BLOCK_XOR,
+                Protocol.FLAG_GROUP_XOR_WHITENED,0x1234,0,10,0,9,3,3,payload));
+        assertFalse(new Protocol.FrameKey(contiguous).equals(new Protocol.FrameKey(strided)));
+    }
+
+    @Test(expected=IllegalArgumentException.class)public void unknownFrameFlagRejected(){
+        Protocol.encodeFrame(Protocol.DATA,0x0002,0x12345678L,0,0,0,1,0,0,new byte[0]);}
     @Test public void blockParityRecoversEveryUnequalMember(){int[] sizes={3,29,7,51,1,18,37};byte[][] payloads=new byte[sizes.length][];int max=0;
         for(int i=0;i<sizes.length;i++){payloads[i]=record(i+1,sizes[i]);max=Math.max(max,payloads[i].length);}
         byte[] parityPayload=new byte[max];for(byte[] payload:payloads)for(int j=0;j<payload.length;j++)parityPayload[j]^=payload[j];

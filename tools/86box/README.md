@@ -21,9 +21,11 @@ Run `run_386sx16.bat` for the conservative childhood-PC baseline:
 
 At the FreeDOS prompt:
 
-- `RUN.BAT` starts a default V40-L transfer of the 4 MB deterministic sample.
-- `BENCH.BAT` runs the DOSFER benchmark and writes `BENCH.TXT`.
-- `DOSFER.EXE /?` shows all sender options.
+- `RUN.BAT` starts the default RGB3 V40-L transfer of the 4 MB deterministic sample.
+- `BENCH.BAT` runs the developer sender benchmark and writes `BENCH.TXT` when
+  `DOSFERD.EXE` was present while preparing the image.
+- `DOSFER.EXE /?` shows the production sender options.
 
-Rebuild DOSFER, then run `python tools\prepare_86box_disk.py` to refresh the
-executable inside the disk image.
+Build `dos_sender_legacy\build.bat`; also run `build_dev.bat` when the benchmark
+is needed. Then run `python tools\prepare_86box_disk.py` to refresh the
+executable(s) inside the disk image.

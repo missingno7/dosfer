@@ -21,6 +21,7 @@
 /dos_sender_legacy/*.map
 /dos_sender_legacy/build/*
 !/dos_sender_legacy/build/run.bat
+/dos_sender_legacy/build_host/
 
 # Android/Gradle local state
 .gradle/

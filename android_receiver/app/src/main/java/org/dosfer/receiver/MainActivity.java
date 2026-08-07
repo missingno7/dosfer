@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Canvas;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.hardware.camera2.CameraCharacteristics;
@@ -24,6 +25,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -36,8 +38,9 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
     private static final int CAMERA_PERMISSION = 10, DESTINATION = 20;
     private TextureView preview;
+    private ImageView decoderPreview;
     private TextView status, result, modesText;
-    private Button reconstruct;
+    private Button reconstruct, decoderView, decoderSize;
     private Spinner cameraSelector, fpsSelector, resolutionSelector;
     private CheckBox automaticSelector;
     private LinearLayout cameraPage, receiverPage;
@@ -51,6 +54,10 @@ public final class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private String lastMessage = "";
     private boolean receiverVisible;
+    private int decoderViewChannel = -1;
+    private int highResolutionDownsample = 3;
+    private Bitmap decoderBitmap;
+    private int[] decoderPixels;
     private final Runnable refresh = new Runnable() {
         public void run() { showStats(); ui.postDelayed(this, 250); }
     };
@@ -183,6 +190,11 @@ public final class MainActivity extends Activity {
         SquarePreviewFrame previewFrame = new SquarePreviewFrame(this);
         preview = new TextureView(this);
         previewFrame.addView(preview, new FrameLayout.LayoutParams(-1, -1));
+        decoderPreview = new ImageView(this);
+        decoderPreview.setBackgroundColor(Color.BLACK);
+        decoderPreview.setScaleType(ImageView.ScaleType.FIT_XY);
+        decoderPreview.setVisibility(View.GONE);
+        previewFrame.addView(decoderPreview, new FrameLayout.LayoutParams(-1, -1));
         previewFrame.addView(new PreviewOverlayView(this), new FrameLayout.LayoutParams(-1, -1));
         page.addView(previewFrame, new LinearLayout.LayoutParams(-1, -2));
 
@@ -210,7 +222,7 @@ public final class MainActivity extends Activity {
         row.addView(choose, new LinearLayout.LayoutParams(0, -2, 1));
 
         Button lock = new Button(this);
-        lock.setText("Lock focus/exposure");
+        lock.setText("Lock focus/exposure/WB");
         lock.setOnClickListener(x -> { if (scanner != null) scanner.lockStability(); });
         row.addView(lock, new LinearLayout.LayoutParams(0, -2, 1));
 
@@ -218,6 +230,16 @@ public final class MainActivity extends Activity {
         reconstruct.setText("Reconstruct");
         reconstruct.setOnClickListener(x -> reconstruct());
         row.addView(reconstruct, new LinearLayout.LayoutParams(0, -2, 1));
+
+        decoderView = new Button(this);
+        decoderView.setText("View: camera");
+        decoderView.setOnClickListener(x -> cycleDecoderView());
+        row.addView(decoderView, new LinearLayout.LayoutParams(0, -2, 1));
+
+        decoderSize = new Button(this);
+        decoderSize.setText("Decode: 1020");
+        decoderSize.setOnClickListener(x -> cycleDecoderSize());
+        row.addView(decoderSize, new LinearLayout.LayoutParams(0, -2, 1));
 
         Button reset = new Button(this);
         reset.setText("Reset session");
@@ -336,12 +358,46 @@ public final class MainActivity extends Activity {
             }
             public void error(String m) { runOnUiThread(() -> lastMessage = "Camera: " + m); }
             public void modes(List<CameraMode> modes) { runOnUiThread(() -> updateModes(modes)); }
+            public void decoderPlane(int channel, int width, int height, byte[] pixels) {
+                runOnUiThread(() -> showDecoderPlane(channel,width,height,pixels));
+            }
         }, cameraSelection);
         scanner.start();
+        scanner.setDiagnosticChannel(decoderViewChannel);
+        scanner.setHighResolutionDownsample(highResolutionDownsample);
     }
 
     private void stopCamera() {
         if (scanner != null) { scanner.stop(); scanner = null; }
+    }
+
+    private void cycleDecoderView() {
+        decoderViewChannel++;
+        if (decoderViewChannel >= Rgb3Yuv.CHANNELS) decoderViewChannel = -1;
+        String label = decoderViewChannel < 0 ? "camera" : decoderViewChannel == Rgb3Yuv.RED ? "R" :
+                decoderViewChannel == Rgb3Yuv.GREEN ? "G" : "B";
+        decoderView.setText("View: " + label);
+        decoderPreview.setVisibility(decoderViewChannel < 0 ? View.GONE : View.VISIBLE);
+        if (decoderViewChannel < 0) decoderPreview.setImageBitmap(null);
+        if (scanner != null) scanner.setDiagnosticChannel(decoderViewChannel);
+    }
+
+    private void showDecoderPlane(int channel, int width, int height, byte[] source) {
+        if (channel != decoderViewChannel || decoderPreview == null || source == null || source.length != width*height) return;
+        int pixels=width*height;
+        if (decoderBitmap == null || decoderBitmap.getWidth() != width || decoderBitmap.getHeight() != height) {
+            decoderBitmap=Bitmap.createBitmap(width,height,Bitmap.Config.ARGB_8888);
+            decoderPixels=new int[pixels];
+        }
+        for (int i=0;i<pixels;i++) { int value=source[i]&255;decoderPixels[i]=0xff000000|(value<<16)|(value<<8)|value; }
+        decoderBitmap.setPixels(decoderPixels,0,width,0,0,width,height);
+        decoderPreview.setImageBitmap(decoderBitmap);
+    }
+
+    private void cycleDecoderSize() {
+        highResolutionDownsample = highResolutionDownsample == 3 ? 4 : 3;
+        decoderSize.setText("Decode: " + (highResolutionDownsample == 3 ? "1020" : "765"));
+        if (scanner != null) scanner.setHighResolutionDownsample(highResolutionDownsample);
     }
 
     private void updateModes(List<CameraMode> modes) {
@@ -408,14 +464,26 @@ public final class MainActivity extends Activity {
         CameraScanner.Stats c = scanner == null ? new CameraScanner.Stats() : scanner.stats();
         if (status == null) return;
         status.setText(String.format(Locale.US,
-                "Session: %08X    DOS window: %d\nUnique: %d / %d in window    Missing: %s\nDuplicate: %d    Invalid: %d    Other session: %d\nDecoded: %.2f fps    Useful: %.0f B/s    Latency: %.1f ms\nCalibration: %d unique    %d missed\nCapture buffer: %dx%d    Decoder crop: %s\nDecode size: %dx%d    Preview view: %dx%d square\nDisplay rotation: %d    Sensor orientation: %d    Relative rotation: %d    Scale: %.3f\nRequested FPS: %s    request range: %s\nSensor FPS: %.1f    ImageReader FPS: %.1f    Attempts: %.1f/s\nNative workers: %d    Busy drops: %d\nQR reads: %d    No QR: %d    Hard fallback: %d/%d\nFull detector: %d    Recovery: %d/%d    %.1f/%.1f ms avg/max\nAttempt time: %.1f ms avg / %.1f ms max\nExposure: %.3f ms    Sensor frame duration: %.3f ms\nCamera state: %s    Classification: %s\nPayload received: %d bytes    Total frames: %d\nDestination: %s\nIntegrity: %s",
+                "Session: %08X    DOS window: %d\nUnique: %d / %d in window    Missing: %s\nDuplicate: %d    Invalid: %d    Other session: %d\nDecoded: %.2f fps    Useful: %.0f B/s    Latency: %.1f ms\nCalibration: %d unique    %d missed\nCapture buffer: %dx%d    Decoder crop: %s\nDecode size: %dx%d    RGB downsample: %dx\nPreview view: %dx%d square\nDisplay rotation: %d    Sensor orientation: %d    Relative rotation: %d    Scale: %.3f\nRequested FPS: %s    request range: %s\nSensor FPS: %.1f    ImageReader FPS: %.1f    Attempts: %.1f/s\nNative workers: %d    Busy drops: %d\nPhysical QR frames: %d    No QR: %d    Hard fallback: %d/%d\nTransport mode: %s    RGB channels: %d/%d decoded    Logical frames: %d\nRGB conversion: %d frames    %.1f ms avg\nGPU RGB path: %s    Frames: %d    Busy drops: %d\nGPU arrival->dispatch: %.2f ms    command: %.2f ms    ready: %.2f ms    plane copy: %.2f ms    total: %.2f ms    queue: %.1f\nZXing R/G/B: %.2f / %.2f / %.2f ms\nFull detector: %d    Recovery: %d/%d    %.1f/%.1f ms avg/max\nAttempt time: %.1f ms avg / %.1f ms max\nExposure: %.3f ms    Sensor frame duration: %.3f ms\nCamera state: %s    Classification: %s\nPayload received: %d bytes    Total frames: %d\nDestination: %s\nIntegrity: %s",
                 s.session, s.window + 1, s.uniqueWindow, s.expected, s.missing, s.duplicates, s.invalid, s.other,
                 s.decodedFps, s.usefulBps, s.avgLatencyMs, s.calibrationUnique, s.calibrationMissed,
-                c.width, c.height, c.decoderCrop, c.decodeWidth, c.decodeHeight, c.previewWidth, c.previewHeight,
+                c.width, c.height, c.decoderCrop, c.decodeWidth, c.decodeHeight, c.downsampleFactor, c.previewWidth, c.previewHeight,
                 c.displayRotation, c.sensorOrientation, c.relativeRotation, c.previewScale,
                 c.requestedFps, c.requestRange,
                 c.sensorFps, c.imageReaderFps, c.attemptFps, c.workerCount, c.busyDrops, c.successes, c.failures,
                 c.fallbackSuccesses, c.fallbackAttempts,
+                c.rgbMode, c.channelSuccesses, c.channelAttempts, c.logicalFrames,
+                c.rgbConversions, c.rgbConversions == 0 ? 0 : c.rgbConversionNanos / 1e6 / c.rgbConversions,
+                c.gpuRgb ? "GLES3/PBO" : "CPU fallback", c.gpuFrames, c.gpuBusyDrops,
+                c.gpuDispatches == 0 ? 0 : c.gpuArrivalToDispatchNanos / 1e6 / c.gpuDispatches,
+                c.gpuDispatches == 0 ? 0 : c.gpuCommandNanos / 1e6 / c.gpuDispatches,
+                c.gpuReadbacks == 0 ? 0 : c.gpuReadbackNanos / 1e6 / c.gpuReadbacks,
+                c.gpuReadbacks == 0 ? 0 : c.gpuCopyNanos / 1e6 / c.gpuReadbacks,
+                c.gpuDecodedFrames == 0 ? 0 : c.gpuEndToEndNanos / 1e6 / c.gpuDecodedFrames,
+                c.gpuReadbacks == 0 ? 0 : (double) c.gpuQueueDepth / c.gpuReadbacks,
+                c.channelDecodeAttempts[Rgb3Yuv.RED] == 0 ? 0 : c.channelDecodeNanos[Rgb3Yuv.RED] / 1e6 / c.channelDecodeAttempts[Rgb3Yuv.RED],
+                c.channelDecodeAttempts[Rgb3Yuv.GREEN] == 0 ? 0 : c.channelDecodeNanos[Rgb3Yuv.GREEN] / 1e6 / c.channelDecodeAttempts[Rgb3Yuv.GREEN],
+                c.channelDecodeAttempts[Rgb3Yuv.BLUE] == 0 ? 0 : c.channelDecodeNanos[Rgb3Yuv.BLUE] / 1e6 / c.channelDecodeAttempts[Rgb3Yuv.BLUE],
                 c.fullDetectorAttempts, c.recoveryAttempts, c.recoverySuccesses, c.recoveryAttempts == 0 ? 0 : c.recoveryTotalNanos / 1e6 / c.recoveryAttempts, c.recoveryMaxNanos / 1e6,
                 c.avgAttemptMs, c.maxAttemptMs, c.exposureTimeNanos / 1e6, c.sensorFrameDurationNanos / 1e6,
                 c.sessionStatus, c.classification, s.totalPayload, s.uniqueTotal,

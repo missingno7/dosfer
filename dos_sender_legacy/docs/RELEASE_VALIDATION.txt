@@ -1,6 +1,9 @@
+HISTORICAL PRE-RGB3 RELEASE-CLEANUP RECORD
+Current RGB3 validation is documented in VALIDATION.txt and the repository-level RGB3_IMPLEMENTATION.md.
+
 Release cleanup validation
 
-- Source tree based on the working one-window /WINDOW:64 V40-L sender.
+- That cleanup pass was based on the then-current one-window /WINDOW:64 V40-L sender.
 - Runtime +/- HOLD adjustment removed from transfer and calibration code.
 - Stale previous-window B keyboard mapping removed.
 - /SPEED alias removed; /HOLD is the sole cadence option.

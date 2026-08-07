@@ -395,6 +395,10 @@ int qrcodegen_dosferDataCodewordBytes(int version, enum qrcodegen_Ecc ecl);
 void qrcodegen_dosferReleaseMatrixCache(void);
 bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[], const uint8_t encodedRight[],
 		const uint8_t protocolHeaderXor[48], uint8_t result[]);
+bool qrcodegen_dosferDeriveXor3V40L(const uint8_t encodedA[], const uint8_t encodedB[],
+		const uint8_t encodedC[], const uint8_t protocolHeaderXor[48], uint8_t result[]);
+bool qrcodegen_dosferCorrectXorV40L(const uint8_t encodedXor[], uint16_t xorCount,
+		const uint8_t protocolHeaderXor[48], uint8_t result[]);
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[], uint8_t result[]);
 bool qrcodegen_dosferPackFrameV40L(const uint8_t frame[], uint16_t frameLen,
 		uint8_t dataCodewords[]);

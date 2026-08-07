@@ -37,6 +37,12 @@ static u32 last_visible_tick;
 static int qr_delta_ready;
 static int encoded_qr_mask=-1;
 static u8 chain_payload[MAX_FRAME_PAYLOAD];
+static u8 far *rgb_codewords[VGA_RGB_CHANNELS];
+static u8 far *rgb_workspace[VGA_RGB_CHANNELS];
+static u8 far *rgb_parity_codewords[VGA_RGB_CHANNELS];
+static u8 rgb_headers[VGA_RGB_CHANNELS][FRAME_HEADER_SIZE];
+static int rgb_delta_ready;
+static int rgb_encoded_mask=-1;
 static u8 far *chain_left_codewords,*chain_right_codewords,*chain_cached_raw;
 static int chain_cache_valid;
 static u32 chain_cache_session,chain_cache_window,chain_cache_global;
@@ -50,10 +56,44 @@ static void free_chain_cache(void) {
     chain_left_codewords=chain_right_codewords=chain_cached_raw=0;
     chain_cache_valid=0;
 }
+
+static void free_rgb_state(void) {
+    int channel;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+        if(rgb_codewords[channel])_ffree(rgb_codewords[channel]);
+        if(rgb_workspace[channel])_ffree(rgb_workspace[channel]);
+        if(rgb_parity_codewords[channel])_ffree(rgb_parity_codewords[channel]);
+        rgb_codewords[channel]=0;
+        rgb_workspace[channel]=0;
+        rgb_parity_codewords[channel]=0;
+    }
+    rgb_delta_ready=0;
+    rgb_encoded_mask=-1;
+}
+
+static int ensure_rgb_state(void) {
+    int channel;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+        if(!rgb_codewords[channel])
+            rgb_codewords[channel]=(u8 far *)_fmalloc(DOSFER_QR_CODEWORDS);
+        if(!rgb_workspace[channel])
+            rgb_workspace[channel]=(u8 far *)_fmalloc(QR_BUFFER+1);
+        if(!rgb_parity_codewords[channel])
+            rgb_parity_codewords[channel]=(u8 far *)_fmalloc(DOSFER_QR_CODEWORDS);
+        if(!rgb_codewords[channel]||!rgb_workspace[channel]||
+           !rgb_parity_codewords[channel]) {
+            free_rgb_state();
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void sender_cleanup(void) {
     producer_close(&producer);
     producer_free_window(&current_window);
     free_chain_cache();
+    free_rgb_state();
     vga_leave();
 }
 
@@ -140,7 +180,7 @@ static int display_encoded(const Config *cfg,const char *status,int delta,u16 ho
 }
 
 static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
-        int repeated,int waiting,u16 hold_ms,u8 display_mask) {
+        int repeated,u16 hold_ms,u8 display_mask) {
     const PendingFrame *f=&w->frames[i];
     const char *status=0;
 #ifdef DOSFER_DEVTOOLS
@@ -176,11 +216,8 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
         if(!qr_prepare_mask(raw_frame,n,delta,display_mask))return 0;
     }
 
-    if(waiting) {
-        status="READY - focus camera - Enter / Esc";
-    }
 #ifdef DOSFER_DEVTOOLS
-    else if(rescue) {
+    if(rescue) {
         sprintf(status_buf,"W%lu F%u/%u RESCUE %ums M%u",
             w->id+1,i+1,w->count,hold_ms,display_mask);
         status=status_buf;
@@ -308,6 +345,414 @@ static int show_block_parity(const Window *w,u16 first,u16 count,const Config *c
 #endif
 }
 
+
+enum { RGB_ITEM_DATA=1, RGB_ITEM_CHAIN=2, RGB_ITEM_BLOCK=3, RGB_ITEM_EOW=4 };
+typedef struct {
+    u8 kind;
+    u8 repeated;
+    u8 group_xor;
+    u16 first;
+    u16 count;
+    u16 stride;
+} RgbItem;
+
+typedef struct {
+    u16 batches;
+    u16 first[VGA_RGB_CHANNELS];
+    u16 count[VGA_RGB_CHANNELS];
+    u8 header_xor[VGA_RGB_CHANNELS][FRAME_HEADER_SIZE];
+} RgbParityAccumulator;
+
+static int rgb_item_same(const RgbItem *a,const RgbItem *b) {
+    return a->kind==b->kind&&a->repeated==b->repeated&&
+        a->group_xor==b->group_xor&&a->first==b->first&&
+        a->count==b->count&&a->stride==b->stride;
+}
+
+static u16 xor_strided_payload(const Window *w,u16 first,u16 count,u16 stride) {
+    u16 i,j,k,words,n=0;
+    if(!stride)stride=1;
+    for(i=0;i<count;++i) {
+        const PendingFrame *f=&w->frames[first+i*stride];
+        if(f->payload_len>n)n=f->payload_len;
+    }
+    memset(chain_payload,0,n);
+    for(i=0;i<count;++i) {
+        const PendingFrame *f=&w->frames[first+i*stride];
+        words=(u16)(f->payload_len>>2);
+        for(k=0;k<words;++k)
+            ((u32 *)chain_payload)[k]^=((const u32 far *)f->payload)[k];
+        j=(u16)(words<<2);
+        for(;j<f->payload_len;++j)chain_payload[j]^=f->payload[j];
+    }
+    return n;
+}
+
+static u16 make_rgb_item_frame(const Window *w,const RgbItem *item,u32 session) {
+    const PendingFrame *base;
+    u16 n,flags,stride;
+    u32 lengths;
+
+    if(!w||!item||item->first>=w->count)return 0;
+    base=&w->frames[item->first];
+    if(item->kind==RGB_ITEM_DATA) {
+        return make_frame(raw_frame,FK_DATA,
+            (u16)(FF_WHITENED|(item->repeated?FF_REPEATED:0)),
+            session,w->id,base->global_index,item->first,w->count,
+            base->stream_id,base->stream_offset,base->payload,base->payload_len);
+    }
+    if(item->kind==RGB_ITEM_CHAIN) {
+        const PendingFrame *right;
+        if(item->first+1>=w->count)return 0;
+        right=&w->frames[item->first+1];
+        n=xor_frame_payload(base,right);
+        lengths=((u32)base->payload_len<<16)|right->payload_len;
+        return make_frame(raw_frame,FK_CHAIN_XOR,FF_PAIR_WHITENED,
+            session,w->id,base->global_index,item->first,w->count,
+            lengths,0,chain_payload,n);
+    }
+    if(item->kind==RGB_ITEM_BLOCK) {
+        stride=item->stride?item->stride:1;
+        if(!item->count||item->first+(item->count-1)*stride>=w->count)return 0;
+        n=xor_strided_payload(w,item->first,item->count,stride);
+        flags=item->group_xor?FF_GROUP_XOR_WHITENED:FF_WHITENED;
+        return make_frame(raw_frame,FK_BLOCK_XOR,flags,session,w->id,
+            base->global_index,item->first,w->count,item->count,
+            item->group_xor?stride:0,chain_payload,n);
+    }
+    if(item->kind==RGB_ITEM_EOW) {
+        return make_frame(raw_frame,FK_END_WINDOW,0,session,w->id,
+            w->frames[w->count-1].global_index,0,w->count,0,0,0,0);
+    }
+    return 0;
+}
+
+static int rgb_prepare_items(const Window *w,const RgbItem items[VGA_RGB_CHANNELS],
+        const Config *cfg,u32 session,u8 display_mask,int delta) {
+    const u8 *data[VGA_RGB_CHANNELS],*ecc[VGA_RGB_CHANNELS];
+    u8 *current[VGA_RGB_CHANNELS];
+    int channel,source;
+    u16 rawlen;
+
+    (void)cfg;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+        source=-1;
+        if(channel>0&&rgb_item_same(&items[channel],&items[0]))source=0;
+        else if(channel>1&&rgb_item_same(&items[channel],&items[1]))source=1;
+        if(source>=0) {
+            _fmemcpy(rgb_headers[channel],rgb_headers[source],FRAME_HEADER_SIZE);
+            _fmemcpy(rgb_workspace[channel],rgb_workspace[source],QR_BUFFER+1);
+            if(!delta)
+                _fmemcpy(rgb_codewords[channel],rgb_codewords[source],DOSFER_QR_CODEWORDS);
+            continue;
+        }
+        rawlen=make_rgb_item_frame(w,&items[channel],session);
+        if(!rawlen)return 0;
+        _fmemcpy(rgb_headers[channel],raw_frame,FRAME_HEADER_SIZE);
+        if(delta) {
+            if(!qrcodegen_dosferPackFrameV40L(raw_frame,rawlen,
+                    rgb_workspace[channel]))return 0;
+            qrcodegen_dosferComputeEccBlocksV40L(rgb_workspace[channel],
+                rgb_workspace[channel]+QR_DATA_CODEWORDS);
+        } else if(!qrcodegen_dosferEncodeFrameV40L(raw_frame,rawlen,
+                rgb_codewords[channel],rgb_workspace[channel],
+                (enum qrcodegen_Mask)display_mask,false))return 0;
+    }
+    if(delta) {
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+            data[channel]=rgb_workspace[channel];
+            ecc[channel]=rgb_workspace[channel]+QR_DATA_CODEWORDS;
+            current[channel]=rgb_codewords[channel];
+        }
+        if(!vga_apply_v40l_delta3(data,ecc,current))return 0;
+    }
+    rgb_encoded_mask=display_mask;
+    return 1;
+}
+
+static int display_rgb_items(const Window *w,const RgbItem items[VGA_RGB_CHANNELS],
+        const Config *cfg,u32 session,u16 hold_ms,u8 display_mask,
+        const char *status) {
+    const u8 *qr[VGA_RGB_CHANNELS];
+    u8 *current[VGA_RGB_CHANNELS];
+    u32 earliest=0;
+    int channel;
+    int delta=rgb_delta_ready&&display_mask==rgb_encoded_mask;
+
+    if(!rgb_prepare_items(w,items,cfg,session,display_mask,delta))return 0;
+    if(last_visible_tick&&hold_ms)
+        earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
+    if(delta) {
+        if(!vga_show_prepared3_at(cfg->invert,status,earliest))return 0;
+    } else {
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+            qr[channel]=rgb_workspace[channel];
+            current[channel]=rgb_codewords[channel];
+        }
+        if(!vga_show_full_qr3_at(qr,current,cfg->invert,status,earliest))return 0;
+    }
+    rgb_delta_ready=vga_delta_ready();
+    last_visible_tick=vga_last_flip_tick();
+    return 1;
+}
+
+static int display_rgb_codewords(const Config *cfg,u8 *const next[VGA_RGB_CHANNELS],
+        u16 hold_ms,const char *status) {
+    u8 *current[VGA_RGB_CHANNELS];
+    const u8 *source[VGA_RGB_CHANNELS];
+    u32 earliest=0;
+    int channel;
+
+    if(!rgb_delta_ready)return 0;
+    for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+        source[channel]=next[channel];
+        current[channel]=rgb_codewords[channel];
+    }
+    if(!vga_apply_codeword_delta3(source,current))return 0;
+    if(last_visible_tick&&hold_ms)
+        earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
+    if(!vga_show_prepared3_at(cfg->invert,status,earliest))return 0;
+    last_visible_tick=vga_last_flip_tick();
+    return 1;
+}
+
+static void xor_codeword_stream(u8 far *dest,const u8 far *source) {
+    u16 i;
+    for(i=0;i+4<=DOSFER_QR_CODEWORDS;i+=4)
+        *(u32 far *)(dest+i)^=*(const u32 far *)(source+i);
+    for(;i<DOSFER_QR_CODEWORDS;++i)dest[i]^=source[i];
+}
+
+static void reset_rgb_parity_accumulator(RgbParityAccumulator *acc) {
+    memset(acc,0,sizeof(*acc));
+}
+
+static int accumulate_rgb_data(const RgbItem batch[VGA_RGB_CHANNELS],u16 actual,
+        RgbParityAccumulator *acc) {
+    u16 channel,i;
+    for(channel=0;channel<actual;++channel) {
+        if(acc->count[channel]) {
+            if(batch[channel].first!=acc->first[channel]+acc->count[channel]*3)
+                return 0;
+            xor_codeword_stream(rgb_parity_codewords[channel],rgb_codewords[channel]);
+            for(i=0;i<FRAME_HEADER_SIZE;++i)
+                acc->header_xor[channel][i]^=rgb_headers[channel][i];
+        } else {
+            acc->first[channel]=batch[channel].first;
+            _fmemcpy(rgb_parity_codewords[channel],rgb_codewords[channel],
+                DOSFER_QR_CODEWORDS);
+            memcpy(acc->header_xor[channel],rgb_headers[channel],FRAME_HEADER_SIZE);
+        }
+        ++acc->count[channel];
+    }
+    ++acc->batches;
+    return 1;
+}
+
+static int rgb_parity_same_length(const Window *w,u16 first,u16 count,u16 stride) {
+    u16 i,length=w->frames[first].payload_len;
+    for(i=1;i<count;++i)
+        if(w->frames[first+i*stride].payload_len!=length)return 0;
+    return 1;
+}
+
+static int finalize_rgb_parity_channel(const Window *w,u16 channel,
+        const Config *cfg,u32 session,const RgbParityAccumulator *acc) {
+    const PendingFrame *base;
+    u8 header_correction[FRAME_HEADER_SIZE];
+    u16 i,n,rawlen,count=acc->count[channel],first=acc->first[channel];
+    int affine;
+
+    if(!count)return 0;
+    base=&w->frames[first];
+    n=xor_strided_payload(w,first,count,3);
+    rawlen=make_frame(raw_frame,FK_BLOCK_XOR,FF_GROUP_XOR_WHITENED,
+        session,w->id,base->global_index,first,w->count,count,3,
+        chain_payload,n);
+    if(!rawlen)return 0;
+    affine=rgb_parity_same_length(w,first,count,3)&&
+        (count!=2||rawlen==2952);
+    if(affine) {
+        for(i=0;i<FRAME_HEADER_SIZE;++i)
+            header_correction[i]=(u8)(acc->header_xor[channel][i]^raw_frame[i]);
+        if(qrcodegen_dosferCorrectXorV40L(rgb_parity_codewords[channel],count,
+                header_correction,rgb_parity_codewords[channel]))return 1;
+    }
+    return qrcodegen_dosferEncodeFrameV40L(raw_frame,rawlen,
+        rgb_parity_codewords[channel],rgb_workspace[channel],
+        (enum qrcodegen_Mask)cfg->qr_mask,true);
+}
+
+static int flush_rgb_channel_parity(const Window *w,const Config *cfg,u32 session,
+        u16 hold_ms,u8 display_mask,RgbParityAccumulator *acc) {
+    RgbItem items[VGA_RGB_CHANNELS];
+    u8 *next[VGA_RGB_CHANNELS];
+    int channel,last=-1;
+#ifdef DOSFER_DEVTOOLS
+    char status[41];
+    sprintf(status,"RGB3 PARITY stride3 x%u",acc->batches);
+#endif
+    if(!acc->batches)return 1;
+    if(rgb_delta_ready&&display_mask==rgb_encoded_mask) {
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)if(acc->count[channel]) {
+            if(!finalize_rgb_parity_channel(w,(u16)channel,cfg,session,acc))return 0;
+            next[channel]=rgb_parity_codewords[channel];last=channel;
+        }
+        if(last<0)return 0;
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            if(!acc->count[channel])next[channel]=next[last];
+#ifdef DOSFER_DEVTOOLS
+        if(!display_rgb_codewords(cfg,next,hold_ms,status))return 0;
+#else
+        if(!display_rgb_codewords(cfg,next,hold_ms,0))return 0;
+#endif
+    } else {
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)if(acc->count[channel]) {
+            items[channel].kind=RGB_ITEM_BLOCK;items[channel].repeated=0;
+            items[channel].group_xor=1;items[channel].first=acc->first[channel];
+            items[channel].count=acc->count[channel];items[channel].stride=3;
+            last=channel;
+        }
+        if(last<0)return 0;
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            if(!acc->count[channel])items[channel]=items[last];
+#ifdef DOSFER_DEVTOOLS
+        if(!display_rgb_items(w,items,cfg,session,hold_ms,display_mask,status))return 0;
+#else
+        if(!display_rgb_items(w,items,cfg,session,hold_ms,display_mask,0))return 0;
+#endif
+    }
+    reset_rgb_parity_accumulator(acc);
+    return 1;
+}
+
+static int show_rgb_batch(const Window *w,RgbItem batch[VGA_RGB_CHANNELS],u16 used,
+        const Config *cfg,u32 session,u16 hold_ms,u8 display_mask,
+        const char *status) {
+    u16 channel;
+    if(!used)return 1;
+    for(channel=used;channel<VGA_RGB_CHANNELS;++channel)
+        batch[channel]=batch[used-1];
+    return display_rgb_items(w,batch,cfg,session,hold_ms,display_mask,status);
+}
+
+static int transmit_rgb3(const Window *w,const Config *cfg,u32 session,
+        const u8 *selected,u16 chosen,u16 rescue_round,u16 first_data) {
+    RgbItem batch[VGA_RGB_CHANNELS];
+    RgbParityAccumulator parity;
+    u16 r,i,used,first,count,group=config_redundancy_group(cfg);
+    u16 half=(u16)(cfg->chain_width/2);
+    u16 hold_ms=cfg->hold_ms;
+    u32 adjusted;
+    u8 display_mask=cfg->qr_mask;
+    int factor=1;
+#ifdef DOSFER_DEVTOOLS
+    char status[41];
+#endif
+
+    if(selected&&chosen) {
+        if((u32)chosen*16UL<=w->count)factor=4;
+        else if((u32)chosen*8UL<=w->count)factor=3;
+        else if((u32)chosen*2UL<=w->count)factor=2;
+        adjusted=(cfg->hold_ms<100?100UL:cfg->hold_ms)*(u32)factor;
+        hold_ms=(u16)(adjusted>60000UL?60000UL:adjusted);
+        display_mask=(u8)((cfg->qr_mask+1+(rescue_round?rescue_round-1:0)%7)&7);
+    }
+
+    for(r=0;r<cfg->repetitions;++r) {
+        used=0;reset_rgb_parity_accumulator(&parity);
+        for(i=r==0?first_data:0;i<w->count;++i) {
+            if(selected&&!selected[i])continue;
+            batch[used].kind=RGB_ITEM_DATA;
+            batch[used].repeated=(u8)(r>0);
+            batch[used].group_xor=0;
+            batch[used].first=i;
+            batch[used].count=1;
+            batch[used].stride=1;
+            ++used;
+            if(used==VGA_RGB_CHANNELS) {
+#ifdef DOSFER_DEVTOOLS
+                sprintf(status,"RGB3 DATA %u-%u/%u",batch[0].first+1,
+                    batch[2].first+1,w->count);
+                if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,status))return 0;
+#else
+                if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+#endif
+                if(!selected&&!cfg->chain_width&&group==3) {
+                    if(!accumulate_rgb_data(batch,used,&parity))return 0;
+                    if(parity.batches==3&&!flush_rgb_channel_parity(w,cfg,session,
+                            hold_ms,display_mask,&parity))return 0;
+                }
+                used=0;
+            }
+        }
+        if(used) {
+            u16 actual=used;
+#ifdef DOSFER_DEVTOOLS
+            sprintf(status,"RGB3 DATA tail %u/%u",batch[0].first+1,w->count);
+            if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,status))return 0;
+#else
+            if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+#endif
+            if(!selected&&!cfg->chain_width&&group==3) {
+                if(!accumulate_rgb_data(batch,actual,&parity))return 0;
+            }
+        }
+        if(selected)continue;
+        if(!cfg->chain_width&&group==3) {
+            if(!flush_rgb_channel_parity(w,cfg,session,hold_ms,display_mask,&parity))return 0;
+            continue;
+        }
+
+        /* Optional anchors remain DATA frames and are therefore batched
+         * separately from all parity symbols. */
+        if(cfg->chain_width&&cfg->chain_anchor) {
+            used=0;
+            for(i=(u16)(cfg->chain_anchor-1);i<w->count;i=(u16)(i+cfg->chain_anchor)) {
+                batch[used].kind=RGB_ITEM_DATA;batch[used].repeated=1;
+                batch[used].group_xor=0;batch[used].first=i;
+                batch[used].count=1;batch[used].stride=1;++used;
+                if(used==VGA_RGB_CHANNELS) {
+                    if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+                    used=0;
+                }
+            }
+            if(used&&!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+        }
+
+        /* Parity is a separate homogeneous RGB phase: never DATA/DATA/PARITY. */
+        used=0;
+        if(cfg->chain_width) {
+            for(i=(u16)(half-1);i<w->count;i=(u16)(i+half)) {
+                first=(u16)(i+1-half);
+                if(first+half>=w->count)continue;
+                count=(u16)(w->count-first);
+                if(count>cfg->chain_width)count=cfg->chain_width;
+                batch[used].kind=cfg->chain_width==2?RGB_ITEM_CHAIN:RGB_ITEM_BLOCK;
+                batch[used].repeated=0;batch[used].group_xor=0;
+                batch[used].first=first;batch[used].count=count;
+                batch[used].stride=1;++used;
+                if(used==VGA_RGB_CHANNELS) {
+                    if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+                    used=0;
+                }
+            }
+        } else if(group) {
+            for(first=0;first<w->count;first=(u16)(first+group)) {
+                count=(u16)(w->count-first);if(count>group)count=group;
+                batch[used].kind=RGB_ITEM_BLOCK;batch[used].repeated=0;
+                batch[used].group_xor=0;batch[used].first=first;
+                batch[used].count=count;batch[used].stride=1;++used;
+                if(used==VGA_RGB_CHANNELS) {
+                    if(!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+                    used=0;
+                }
+            }
+        }
+        if(used&&!show_rgb_batch(w,batch,used,cfg,session,hold_ms,display_mask,0))return 0;
+    }
+    return 1;
+}
 static void flush_keys(void) {
     while(_bios_keybrd(_KEYBRD_READY))
         _bios_keybrd(_KEYBRD_READ);
@@ -326,8 +771,9 @@ static int decision_key(void) {
 }
 
 static int transmit(const Window *w,const Config *cfg,u32 session,
-        const u8 *selected,u16 chosen,u16 rescue_round) {
+        const u8 *selected,u16 chosen,u16 rescue_round,u16 first_data) {
     u16 r,i,first,count;
+    if(cfg->rgb3)return transmit_rgb3(w,cfg,session,selected,chosen,rescue_round,first_data);
     u16 group=config_redundancy_group(cfg);
     u16 half=(u16)(cfg->chain_width/2);
     u16 hold_ms=cfg->hold_ms;
@@ -350,7 +796,7 @@ static int transmit(const Window *w,const Config *cfg,u32 session,
         count=0;
         for(i=0;i<w->count;++i) {
             if(selected&& !selected[i])continue;
-            if(!show_frame(w,i,cfg,session,r>0,0,hold_ms,display_mask))return 0;
+            if(!show_frame(w,i,cfg,session,r>0,hold_ms,display_mask))return 0;
 
             if(!selected&&half&&((i+1)%half)==0) {
                 first=(u16)(i+1-half);
@@ -363,7 +809,7 @@ static int transmit(const Window *w,const Config *cfg,u32 session,
                         return 0;
                     }
                     if(cfg->chain_anchor&&((i+1)%cfg->chain_anchor)==0) {
-                        if(!show_frame(w,i,cfg,session,0,0,hold_ms,display_mask))return 0;
+                        if(!show_frame(w,i,cfg,session,0,hold_ms,display_mask))return 0;
                     }
                 }
             }
@@ -385,12 +831,22 @@ static void show_eow(const Window *w,const Config *cfg,u32 session) {
     char status[41];
     u16 n;
     int delta;
-    n=make_frame(raw_frame,FK_END_WINDOW,0,session,w->id,
-        w->frames[w->count-1].global_index,0,w->count,0,0,0,0);
-    delta=can_delta(cfg->qr_mask);
-    if(qr_prepare(raw_frame,n,cfg,delta)) {
-        sprintf(status,"W%lu DONE  Enter R M Esc",w->id+1);
-        display_encoded(cfg,status,delta,cfg->hold_ms);
+    sprintf(status,"W%lu DONE  Enter R M Esc",w->id+1);
+    if(cfg->rgb3) {
+        RgbItem items[VGA_RGB_CHANNELS];
+        int channel;
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+            items[channel].kind=RGB_ITEM_EOW;items[channel].repeated=0;
+            items[channel].group_xor=0;items[channel].first=0;
+            items[channel].count=0;items[channel].stride=1;
+        }
+        display_rgb_items(w,items,cfg,session,cfg->hold_ms,cfg->qr_mask,status);
+    } else {
+        n=make_frame(raw_frame,FK_END_WINDOW,0,session,w->id,
+            w->frames[w->count-1].global_index,0,w->count,0,0,0,0);
+        delta=can_delta(cfg->qr_mask);
+        if(qr_prepare(raw_frame,n,cfg,delta))
+            display_encoded(cfg,status,delta,cfg->hold_ms);
     }
     if(cfg->speaker)speaker_beep();
 }
@@ -441,11 +897,18 @@ static void exit_to_dos(u8 status) {
 }
 
 static int enter_transfer_vga(const Config *cfg) {
-    if(!vga_enter(cfg->video_mode)) {
-        puts("Could not enter VGA 320x200 mode");
+    if(cfg->rgb3&&!ensure_rgb_state()) {
+        puts("Not enough DOS memory for RGB3 state; use /BW.");
+        return 0;
+    }
+    if(!vga_enter(cfg->video_mode,cfg->rgb3)) {
+        puts("Could not enter planar EGA/VGA 320x200 mode");
         return 0;
     }
     qr_delta_ready=0;
+    encoded_qr_mask=-1;
+    rgb_delta_ready=0;
+    rgb_encoded_mask=-1;
     last_visible_tick=0;
     return 1;
 }
@@ -455,6 +918,10 @@ static int run_transfer(FILE *mf,const Config *cfg) {
     u32 window_id=0;
     int key,have_selection=0;
     u16 chosen=0,rescue_round=0;
+    /* The initial RGB image is ordinary DATA, not an out-of-band control
+     * symbol. It contains logical frames 1/2/3; the streamed schedule then
+     * resumes at frame 3 in red (zero-based index 2), giving R3/G4/B5. */
+    u16 first_data=0;
     u8 selected[MAX_WINDOW];
     char line[80];
 
@@ -463,16 +930,31 @@ static int run_transfer(FILE *mf,const Config *cfg) {
 
     /* Only the current acknowledged window is retained. Its payload buffers
        are recycled in place after Enter commits the window, allowing the
-       default 64-frame window without paying for a second replay window. */
+       default 66-frame window without paying for a second replay window. */
     if(cfg->chain_width==2)ensure_chain_cache();
     if(!enter_transfer_vga(cfg))return 0;
-
-    if(!show_frame(&current_window,0,cfg,session,0,1,cfg->hold_ms,cfg->qr_mask)) {
+    if(cfg->rgb3) {
+        RgbItem initial_data[VGA_RGB_CHANNELS];
+        int channel;
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+            initial_data[channel].kind=RGB_ITEM_DATA;
+            initial_data[channel].repeated=0;
+            initial_data[channel].group_xor=0;
+            initial_data[channel].first=(u16)channel;
+            initial_data[channel].count=1;
+            initial_data[channel].stride=1;
+        }
+        if(!display_rgb_items(&current_window,initial_data,cfg,session,
+                cfg->hold_ms,cfg->qr_mask,"DATA 1-3 - Enter / Esc")) {
+            vga_leave();
+            puts("Could not build the first RGB3 V40-L QR; check /PAYLOAD or use /BW.");
+            return 0;
+        }
+    } else if(!show_frame(&current_window,0,cfg,session,0,cfg->hold_ms,cfg->qr_mask)) {
         vga_leave();
         puts("Could not build the first V40-L QR; check /PAYLOAD.");
         return 0;
     }
-
     flush_keys();
     do {
         key=decision_key();
@@ -481,13 +963,15 @@ static int run_transfer(FILE *mf,const Config *cfg) {
         vga_leave();
         return 0;
     }
+    if(cfg->rgb3)first_data=(u16)(VGA_RGB_CHANNELS-1);
 
     for(;;) {
-        if(!transmit(&current_window,cfg,session,0,0,0)) {
+        if(!transmit(&current_window,cfg,session,0,0,0,first_data)) {
             vga_leave();
             puts("QR frame does not fit fixed V40-L; reduce /PAYLOAD.");
             return 0;
         }
+        first_data=0;
 
 wait_ack:
         /* A window is uninterrupted; controls are accepted only after this
@@ -522,7 +1006,7 @@ wait_ack:
 
             if(!enter_transfer_vga(cfg))return 0;
             transmit(&current_window,cfg,session,
-                have_selection?selected:0,chosen,rescue_round);
+                have_selection?selected:0,chosen,rescue_round,0);
             goto wait_ack;
         }
         if(key==27) {
@@ -554,7 +1038,7 @@ wait_ack:
 replay:
         if(have_selection)++rescue_round;
         transmit(&current_window,cfg,session,
-            have_selection?selected:0,chosen,rescue_round);
+            have_selection?selected:0,chosen,rescue_round,0);
         goto wait_ack;
     }
 }
@@ -567,7 +1051,7 @@ static int calibration(Config *cfg) {
     u8 payload[256];
     char status[41];
 
-    if(!vga_enter(cfg->video_mode))return 0;
+    if(!vga_enter(cfg->video_mode,0))return 0;
     last_visible_tick=0;
     qr_delta_ready=0;
     encoded_qr_mask=-1;
@@ -672,7 +1156,7 @@ static void benchmark(const char *path,Config *cfg) {
         timer_elapsed_ms(0,dosferQrProfileTicks[4]),timer_elapsed_ms(0,dosferQrProfileTicks[5]));
 #endif
 
-    if(!vga_enter(cfg->video_mode)){puts("VGA benchmark unavailable.");return;}
+    if(!vga_enter(cfg->video_mode,0)){puts("VGA benchmark unavailable.");return;}
     {
         u32 hz100=vga_measure_refresh_hz100(60);
         printf("Measured VGA refresh: %lu.%02lu Hz\n",hz100/100UL,hz100%100UL);
@@ -824,6 +1308,7 @@ int main(int argc,char **argv) {
         if(!bench_path||path_count){puts("Usage: DOSFER /BENCH file [options]");return 1;}
         benchmark(bench_path,&cfg);
         free_chain_cache();
+        free_rgb_state();
         vga_leave();
         return 0;
     }
@@ -874,9 +1359,9 @@ int main(int argc,char **argv) {
     est=1+selection.dirs+selection.files*2+selection.bytes/(cfg.frame_payload-28)+1;
     printf("Selected: %lu files, %lu directories, %lu bytes, approximately %lu QR frames.\n",
         selection.files,selection.dirs,selection.bytes,est);
-    printf("Settings: V40-L mask %u, video %s, %u ms hold, window %u, repeats %u, redundancy %s.\n",
-        cfg.qr_mask,config_video_name(&cfg),cfg.hold_ms,cfg.window_frames,
-        cfg.repetitions,config_redundancy_name(&cfg));
+    printf("Settings: %s V40-L mask %u, video %s, %u ms physical hold, window %u, repeats %u, redundancy %s.\n",
+        cfg.rgb3?"RGB3":"BW",cfg.qr_mask,config_video_name(&cfg),cfg.hold_ms,
+        cfg.window_frames,cfg.repetitions,config_redundancy_name(&cfg));
     puts("Preparing the first QR code...");
 
     rc=run_transfer(mf,&cfg);

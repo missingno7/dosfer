@@ -10,7 +10,8 @@ from pyfatfs.PyFatFS import PyFatFS  # noqa: E402
 
 
 IMAGE = ROOT / "tools" / "86box" / "vm" / "dosfer-486" / "FD14LITE.img"
-EXE = ROOT / "dos_sender" / "build" / "DOSFER.EXE"
+EXE = ROOT / "dos_sender_legacy" / "build" / "DOSFER.EXE"
+DEV_EXE = ROOT / "dos_sender_legacy" / "build" / "DOSFERD.EXE"
 PARTITION_OFFSET = 63 * 512
 SAMPLE_SIZE = 4 * 1024 * 1024
 
@@ -29,6 +30,10 @@ def main() -> None:
     fs = PyFatFS(str(IMAGE), offset=PARTITION_OFFSET, read_only=False)
     try:
         put_bytes(fs, "DOSFER.EXE", EXE.read_bytes())
+        if DEV_EXE.is_file():
+            put_bytes(fs, "DOSFERD.EXE", DEV_EXE.read_bytes())
+        elif fs.exists("DOSFERD.EXE"):
+            fs.remove("DOSFERD.EXE")
 
         if fs.exists("SETUP.BAT") and not fs.exists("SETUP.OLD"):
             fs.move("SETUP.BAT", "SETUP.OLD")
@@ -38,19 +43,26 @@ def main() -> None:
             "RUN.BAT",
             b"@ECHO OFF\r\nDOSFER.EXE SAMPLE.BIN\r\n",
         )
-        put_bytes(
-            fs,
-            "BENCH.BAT",
-            b"@ECHO OFF\r\nDOSFER.EXE /BENCH SAMPLE.BIN > BENCH.TXT\r\n"
-            b"TYPE BENCH.TXT\r\n",
-        )
+        if DEV_EXE.is_file():
+            put_bytes(
+                fs,
+                "BENCH.BAT",
+                b"@ECHO OFF\r\nDOSFERD.EXE /BENCH SAMPLE.BIN > BENCH.TXT\r\n"
+                b"TYPE BENCH.TXT\r\n",
+            )
+        elif fs.exists("BENCH.BAT"):
+            fs.remove("BENCH.BAT")
         put_bytes(
             fs,
             "README.TXT",
             b"DOSFER 86Box test disk\r\n\r\n"
-            b"RUN.BAT   - optical transfer, default V40-L mode\r\n"
-            b"BENCH.BAT - CPU, VGA and disk benchmark to BENCH.TXT\r\n"
-            b"DOSFER.EXE /? shows every command-line option.\r\n",
+            b"RUN.BAT   - optical transfer, default RGB3 V40-L mode\r\n"
+            + (
+                b"BENCH.BAT - developer CPU/VGA benchmark to BENCH.TXT\r\n"
+                if DEV_EXE.is_file()
+                else b"BENCH.BAT - unavailable; build DOSFERD.EXE first\r\n"
+            )
+            + b"DOSFER.EXE /? shows production command-line options.\r\n",
         )
 
         if fs.exists("SAMPLE.BIN"):
@@ -62,7 +74,8 @@ def main() -> None:
     finally:
         fs.close()
 
-    print(f"Prepared {IMAGE} with {EXE.name} and {SAMPLE_SIZE} byte SAMPLE.BIN")
+    installed = EXE.name + (" and " + DEV_EXE.name if DEV_EXE.is_file() else "")
+    print(f"Prepared {IMAGE} with {installed} and {SAMPLE_SIZE} byte SAMPLE.BIN")
 
 
 if __name__ == "__main__":

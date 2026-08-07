@@ -8,8 +8,12 @@ import java.util.zip.CRC32;
 public final class Protocol {
     public static final int DATA=1, END_WINDOW=2, CALIBRATION=3, CHAIN_XOR=4, BLOCK_XOR=5, PLANE_CODED=6;
     public static final int SESSION=1, DIRECTORY=2, FILE_BEGIN=3, FILE_DATA=4, FILE_END=5, TRANSFER_END=6;
-    public static final int FRAME_HEADER=48, RECORD_HEADER=24;
-    public static final int FLAG_REPEATED=0x0001, FLAG_PAIR_WHITENED=0x0004, FLAG_WHITENED=0x0008, FLAG_PLANE_WHITENED=0x0010;
+    public static final int FRAME_HEADER=48, RECORD_HEADER=24, MAX_WINDOW=128;
+    public static final int FLAG_REPEATED=0x0001, FLAG_PAIR_WHITENED=0x0004,
+            FLAG_WHITENED=0x0008, FLAG_PLANE_WHITENED=0x0010,
+            FLAG_GROUP_XOR_WHITENED=0x0020;
+    private static final int KNOWN_FLAGS=FLAG_REPEATED|FLAG_PAIR_WHITENED|
+            FLAG_WHITENED|FLAG_PLANE_WHITENED|FLAG_GROUP_XOR_WHITENED;
 
     public static final class Frame {
         public final int kind, flags, window, windowIndex, windowCount, payloadLength;
@@ -25,6 +29,18 @@ public final class Protocol {
         public final int type, flags; public final long recordId,fileId; public final byte[] body;
         Record(int type,int flags,long rid,long fid,byte[] body){this.type=type;this.flags=flags;this.recordId=rid;this.fileId=fid;this.body=body;}
     }
+    public static final class FrameKey {
+        public final int kind,window,windowIndex;
+        public final long session,globalIndex,streamId,streamOffset;
+        FrameKey(Frame f){kind=f.kind;window=f.window;windowIndex=f.windowIndex;
+            session=f.session;globalIndex=f.globalIndex;streamId=f.streamId;streamOffset=f.streamOffset;}
+        @Override public boolean equals(Object value){if(this==value)return true;if(!(value instanceof FrameKey))return false;
+            FrameKey k=(FrameKey)value;return kind==k.kind&&window==k.window&&windowIndex==k.windowIndex&&
+                session==k.session&&globalIndex==k.globalIndex&&streamId==k.streamId&&streamOffset==k.streamOffset;}
+        @Override public int hashCode(){long h=session^(globalIndex<<1)^(streamId<<7)^(streamOffset<<13);int x=(int)(h^(h>>>32));
+            return (((x*31+kind)*31+window)*31+windowIndex);}
+    }
+    public static FrameKey frameKey(byte[] raw){return new FrameKey(parseFrame(raw));}
     private static long u32(ByteBuffer b){return Integer.toUnsignedLong(b.getInt());}
     public static long crc(byte[] b,int off,int len){CRC32 c=new CRC32();c.update(b,off,len);return c.getValue();}
     public static Frame parseFrame(byte[] raw) {
@@ -36,27 +52,43 @@ public final class Protocol {
         long session=u32(b);int window=b.getInt();long global=u32(b);int wi=Short.toUnsignedInt(b.getShort()),wc=Short.toUnsignedInt(b.getShort());
         long sid=u32(b),off=u32(b);int plen=Short.toUnsignedInt(b.getShort()),hlen=Short.toUnsignedInt(b.getShort());
         long pcrc=u32(b),hcrc=u32(b),reserved=u32(b);
-        if(ver!=1||hlen!=48||reserved!=0||session==0||(flags&~0x001f)!=0||kind<1||kind>6||raw.length!=48+plen||
-           ((flags&FLAG_PLANE_WHITENED)!=0&&kind!=PLANE_CODED))
+        int whitening=flags&(FLAG_PAIR_WHITENED|FLAG_WHITENED|FLAG_PLANE_WHITENED|FLAG_GROUP_XOR_WHITENED);
+        long groupStride=off==0?1:off;
+        boolean groupValid=(flags&FLAG_GROUP_XOR_WHITENED)==0||
+                (kind==BLOCK_XOR&&sid>=1&&sid<=3&&groupStride<=MAX_WINDOW&&
+                 wi+(sid-1)*groupStride<wc);
+        if(ver!=1||hlen!=48||reserved!=0||session==0||(flags&~KNOWN_FLAGS)!=0||kind<1||kind>6||raw.length!=48+plen||
+           Integer.bitCount(whitening)>1||
+           ((flags&FLAG_PLANE_WHITENED)!=0&&kind!=PLANE_CODED)||!groupValid)
             throw new IllegalArgumentException("unsupported header");
         byte[] header=raw.clone();header[40]=header[41]=header[42]=header[43]=0;
         if(crc(header,0,48)!=hcrc)throw new IllegalArgumentException("header crc");
         if(crc(raw,48,plen)!=pcrc)throw new IllegalArgumentException("payload crc");
         byte[] payload=new byte[plen];System.arraycopy(raw,48,payload,0,plen);
-        if((flags&FLAG_PLANE_WHITENED)!=0)whitenPayloadGroup(payload,0,plen,session,sid);
+        if((flags&FLAG_GROUP_XOR_WHITENED)!=0)
+            whitenPayloadXorGroup(payload,0,plen,session,global,(int)sid,(int)groupStride);
+        else if((flags&FLAG_PLANE_WHITENED)!=0)whitenPayloadGroup(payload,0,plen,session,sid);
         else if((flags&FLAG_PAIR_WHITENED)!=0)whitenPayloadPair(payload,0,plen,session,global);
         else if((flags&FLAG_WHITENED)!=0)whitenPayload(payload,0,plen,session,global);
         return new Frame(kind,flags,session,window,global,wi,wc,sid,off,payload);
     }
     public static byte[] encodeFrame(int kind,int flags,long session,int window,long global,int wi,int wc,long sid,long off,byte[] plain) {
+        int whitening=flags&(FLAG_PAIR_WHITENED|FLAG_WHITENED|FLAG_PLANE_WHITENED|FLAG_GROUP_XOR_WHITENED);
+        long groupStride=off==0?1:off;
+        boolean groupValid=(flags&FLAG_GROUP_XOR_WHITENED)==0||
+                (kind==BLOCK_XOR&&sid>=1&&sid<=3&&groupStride<=MAX_WINDOW&&
+                 wi+(sid-1)*groupStride<wc);
         if(session==0||kind<1||kind>6||plain==null||plain.length>0xffff||
-           ((flags&FLAG_PLANE_WHITENED)!=0&&kind!=PLANE_CODED))throw new IllegalArgumentException("frame fields");
+           (flags&~KNOWN_FLAGS)!=0||Integer.bitCount(whitening)>1||
+           ((flags&FLAG_PLANE_WHITENED)!=0&&kind!=PLANE_CODED)||!groupValid)throw new IllegalArgumentException("frame fields");
         byte[] raw=new byte[FRAME_HEADER+plain.length];ByteBuffer b=ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
         b.put("DQR1".getBytes(StandardCharsets.US_ASCII));b.put((byte)1);b.put((byte)kind);b.putShort((short)flags);
         b.putInt((int)session);b.putInt(window);b.putInt((int)global);b.putShort((short)wi);b.putShort((short)wc);
         b.putInt((int)sid);b.putInt((int)off);b.putShort((short)plain.length);b.putShort((short)FRAME_HEADER);
         b.putInt(0);b.putInt(0);b.putInt(0);System.arraycopy(plain,0,raw,FRAME_HEADER,plain.length);
-        if((flags&FLAG_PLANE_WHITENED)!=0)whitenPayloadGroup(raw,FRAME_HEADER,plain.length,session,sid);
+        if((flags&FLAG_GROUP_XOR_WHITENED)!=0)
+            whitenPayloadXorGroup(raw,FRAME_HEADER,plain.length,session,global,(int)sid,(int)groupStride);
+        else if((flags&FLAG_PLANE_WHITENED)!=0)whitenPayloadGroup(raw,FRAME_HEADER,plain.length,session,sid);
         else if((flags&FLAG_PAIR_WHITENED)!=0)whitenPayloadPair(raw,FRAME_HEADER,plain.length,session,global);
         else if((flags&FLAG_WHITENED)!=0)whitenPayload(raw,FRAME_HEADER,plain.length,session,global);
         b.putInt(36,(int)crc(raw,FRAME_HEADER,plain.length));b.putInt(40,0);b.putInt(40,(int)crc(raw,0,FRAME_HEADER));return raw;
@@ -71,8 +103,13 @@ public final class Protocol {
         parseRecord(out);return out;
     }
     public static byte[] recoverBlock(Frame parity,byte[][] members,int missing) {
-        if(parity.kind!=BLOCK_XOR||parity.flags!=FLAG_WHITENED||members==null||parity.streamOffset!=0||
-           parity.streamId<1||parity.streamId>64||members.length!=(int)parity.streamId||
+        boolean group=parity.flags==FLAG_GROUP_XOR_WHITENED;
+        int stride=group?(int)(parity.streamOffset==0?1:parity.streamOffset):1;
+        if(parity.kind!=BLOCK_XOR||
+           (parity.flags!=FLAG_WHITENED&&!group)||
+           (group&&(parity.streamId<1||parity.streamId>3||stride<1))||
+           (!group&&parity.streamOffset!=0)||members==null||
+           parity.streamId<1||parity.streamId>MAX_WINDOW||members.length!=(int)parity.streamId||
            missing<0||missing>=members.length||members[missing]!=null)
             throw new IllegalArgumentException("block");
         byte[] out=parity.payload.clone();
@@ -96,6 +133,18 @@ public final class Protocol {
             int key=state;
             for(int i=0;i<4&&offset<end;i++,offset++){data[offset]^=(byte)key;key>>>=8;}
         }
+    }
+    static void whitenPayloadXorGroup(byte[] data,int offset,int length,long session,
+            long globalIndex,int count,int stride) {
+        if(count<1||count>3||stride<1)throw new IllegalArgumentException("group whitening");
+        int[] state=new int[count];
+        for(int i=0;i<count;i++){state[i]=(int)(session^
+                ((globalIndex+(long)i*stride)*0x9E3779B9L)^0xD05FE123L);
+            if(state[i]==0)state[i]=0xA5A5A5A5;}
+        int end=offset+length;
+        while(offset<end){int key=0;for(int i=0;i<count;i++){
+                int x=state[i];x^=x<<13;x^=x>>>17;x^=x<<5;state[i]=x;key^=x;}
+            for(int i=0;i<4&&offset<end;i++,offset++){data[offset]^=(byte)key;key>>>=8;}}
     }
     static void whitenPayloadPair(byte[] data,int offset,int length,long session,long globalIndex) {
         int left=(int)(session^(globalIndex*0x9E3779B9L)^0xD05FE123L);

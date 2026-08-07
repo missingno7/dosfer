@@ -1,8 +1,14 @@
 # Performance report
 
+> **Historical measurements:** the results below describe earlier monochrome
+> sender revisions and are retained as engineering history. The current
+> `dos_sender_legacy` defaults to RGB3, `/WINDOW:66`, and `/RE:3`; new target
+> hardware measurements have not yet been added. See
+> [../RGB3_IMPLEMENTATION.md](../RGB3_IMPLEMENTATION.md).
+
 ## Generalized XOR parity release 1.2 (2026-08-04)
 
-The sender defaults to `/RE:7`, an independent seven-DATA XOR group. The
+That monochrome revision defaulted to `/RE:7`, an independent seven-DATA XOR group. The
 compact redundancy parameter now represents the actual equation geometry:
 
 | Parameter | Schedule | Long-run overhead | Recovery without replay |
@@ -342,15 +348,19 @@ header, approximately **7.5 KB**. The 8 KB degree-30 RS table is shared with
 normal V40 encoding. No per-frame allocation occurs, and the change remains
 compatible with the 640 KB conventional-memory target.
 
-## Measured in this build environment
+## Historical pre-RGB3 build-host measurements
+
+The figures in this subsection describe the earlier monochrome/C2 build that
+produced the profiling results above; they are retained only for comparison:
 
 - DOS binary: 115,056 bytes (Open Watcom v2, 16-bit large model).
-- Host protocol tests: 8 tests complete in about 2 ms of measured test time.
+- Host protocol tests: 8 tests completed in about 2 ms of measured test time.
 - Android: 37 Gradle build/test tasks completed successfully in 21 s after
-  dependency setup; all 8 protocol unit tests passed in the current rerun.
+  dependency setup, with 8 protocol unit tests in that historical rerun.
 
-These are build-host measurements, not optical throughput. A VM LCD and an
-Android phone are not substitutes for the target 386/VGA/CRT combination.
+Current RGB3 source validation is summarized in `../VERIFICATION.md`. These are
+build-host measurements, not optical throughput. A VM LCD and an Android phone
+are not substitutes for the target 386/VGA/CRT combination.
 
 ## Phone-free DOSBox profiling (2026-08-03)
 

@@ -1,63 +1,85 @@
-DOSfer legacy V40-L optimized validation
-=========================================
+DOSfer legacy RGB3 V40-L validation
+===================================
 
-Scope:
-- fixed QR Version 40-L (177x177)
-- VGA Mode 0Dh / 320x200 only
-- VIDEO:320_60 default, VIDEO:320_70 fallback
-- 16-bit Open Watcom architecture retained
+Scope
+-----
+- fixed standard QR Version 40-L (177x177 modules)
+- legacy 16-bit Open Watcom sender
+- planar EGA/VGA Mode 0Dh RGB3 output plus /BW compatibility
+- default /WINDOW:66 and /RE:3
+- Android receiver channel split is validated separately by the JVM tests
+  summarized below
 
-Checks performed in this environment:
+Host checks performed for this revision
+---------------------------------------
 
-1. Source syntax
-   - sender/config/producer/protocol/VGA/timing sources checked with GCC plus
-     lightweight DOS API compatibility stubs.
-   - The only expected warning is that `bios_ticks()` is supplied by Watcom
-     `#pragma aux` and therefore has no host-C definition.
+1. Source/API syntax
+   - sender/config/producer/protocol/VGA/timing/qrcodegen sources were checked
+     together with GCC and lightweight DOS compatibility stubs.
+   - release, DOSFER_DEVTOOLS and DOSFER_PROFILE code paths were included.
+   - Host-only warnings remain expected where Watcom's 32-bit `unsigned long`,
+     `#pragma aux`, segmented pointers and signed wraparound differ from the
+     64-bit host compiler model.
 
-2. Fixed V40-L encoder equivalence
-   - 500 deterministic randomized frame lengths from 0..2952 bytes.
-   - all masks 0..7 exercised through randomized selection.
-   - specialized codewords compared with the old canonical
-     qrcodegen_encodeBinaryAligned(V40, ECC L) path: PASS.
-   - specialized full matrices compared with the canonical path: PASS.
-   - full 2952-byte prepacked helper compared with the new fixed frame helper:
-     PASS.
+2. Fixed V40-L encoder and raster oracle
+   - the two portable host oracles also complete cleanly under
+     AddressSanitizer and UndefinedBehaviorSanitizer
+   - every mask 0..7
+   - 250 deterministic random transitions per mask
+   - frame lengths 0..2952 bytes
+   - optimized pack + block ECC + sequential emitter compared byte-for-byte
+     with canonical V40-L codewords
+   - packed raster delta compared with a canonical full matrix redraw
+   - result: PASS
 
-3. Packed VGA delta map
-   - 100 deterministic randomized V40-L transitions.
-   - packed-map delta update compared with a complete canonical raster redraw
-     after every transition: PASS.
+3. Encoded XOR3 parity derivation
+   - every mask 0..7
+   - random equal-length source frames
+   - source codewords XORed, then corrected by the desired 48-byte DOSfer
+     header and its degree-30 first-block Reed-Solomon correction
+   - all 3706 derived codewords compared with canonical parity encoding
+   - result: PASS
 
-4. Configuration
-   - default /PAYLOAD:2904 /VIDEO:320_60 validates.
-   - 320_70 remains accepted.
-   - removed 640_60 remains rejected.
-   - /ECC is no longer a sender option; V40-L is fixed.
+4. RGB3 protocol parity
+   - fixed C/Java-compatible XOR3 whitening vector
+   - lengths 0, 1, 3, 4, 47, 128, 1024 and 2904 bytes
+   - equal-length parity wire payload compared with the XOR of the three DATA
+     wire payloads
+   - derived V40-L parity compared with canonical encoding for every mask
+   - result: PASS
 
-5. Protocol
-   - protocol.c was not changed by this optimization pass.
-   - it therefore retains the previous cleanup validation where 500 randomized
-     plain/whitened/pair-whitened frames matched the pre-refactor protocol
-     byte-for-byte.
+5. Repository protocol regression
+   - deterministic JSON vectors: 2 files verified
+   - Python protocol suite: 16 tests
+   - result: PASS
 
-Not hardware-validated here:
-- direct CRTC page switching
-- custom 320x200 ~59.94 Hz timing on a real VGA adapter/CRT
-- actual Open Watcom generated executable performance
+6. Android-independent JVM regression
+   - 42 unit tests compiled directly with Java 21 (`--release 17`) and
+     lightweight temporary Android/JUnit stubs
+   - camera geometry and mode selection
+   - protocol parsing, whitening and stride-3 recovery
+   - RGB3 channel de-duplication and BW/RGB3 mode detection
+   - BT.601 YUV-to-R/G/B conversion, including strides and buffer positions
+   - result: PASS
 
-Open Watcom is not installed in this environment, so DOSFER.EXE was not rebuilt.
-Run build.bat, then use /BENCH and a real transfer on DOSBox/86Box/real hardware.
+7. Camera scanner API smoke compile
+   - the production CameraScanner, RGB3 channel wrappers and supporting camera
+     classes compiled with Java 17 language rules against lightweight Camera2,
+     CameraX and ZXing-C++ API stubs
+   - result: PASS
 
-Single-window / WINDOW64 change
--------------------------------
-- Default Config.window_frames is now 64.
-- Only one static Window remains in sender.c.
-- previous_window, have_previous, producer_reserve_window(), and the B previous-window replay command were removed.
-- R and M continue to operate on the current unacknowledged window.
-- Enter commits the current window and producer_fill_window() reuses the same PendingFrame payload allocations in place for the next window.
-- The END_WINDOW QR remains resident in VGA while the next window is filled.
-- Payload allocation for one 64-frame window is 64 * 2904 = 185856 bytes, exactly equal to the former two 32-frame replay windows (2 * 32 * 2904 = 185856 bytes).
-- Textual source audit found no remaining references to previous_window, have_previous, or producer_reserve_window.
+Not target-built or optically validated here
+--------------------------------------------
+- Open Watcom was not available, so DOSFER.EXE was not produced.
+- The Android Gradle wrapper could not download Gradle 8.11.1 because
+  services.gradle.org was unreachable, so no APK/full Gradle build was
+  produced. The Android-independent production classes and 42 tests were
+  compiled and run with a local javac harness instead.
+- No real EGA/VGA adapter, CRT, DOSBox/86Box timing run or phone camera was
+  available in this environment.
+- The planar register path therefore still needs a target build, hardware
+  readback and end-to-end optical throughput measurement.
 
-Open Watcom is not installed in this environment, so the DOS executable was not rebuilt here.
+Run the two portable C oracles with the commands in tests/README.md. Build the
+real executable with build.bat in an Open Watcom environment, then validate
+/BENCH, /RGB3 and /BW on the intended hardware.

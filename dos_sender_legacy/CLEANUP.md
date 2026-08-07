@@ -1,3 +1,5 @@
+> Historical pre-RGB3 cleanup record. The current sender defaults to `/RGB3 /WINDOW:66 /RE:3`; see `README.md`, `../RGB3_IMPLEMENTATION.md` and `docs/VALIDATION.txt`.
+
 # Production cleanup
 
 This pass removes obsolete runtime behavior and separates production from
@@ -12,7 +14,7 @@ diagnostic code.
 - END_WINDOW UI now shows only `Enter R M Esc`.
 - Removed the unused `filtered` argument from END_WINDOW rendering.
 - Removed the legacy `/SPEED:n` alias; use `/HOLD:n`.
-- The one-window, default `/WINDOW:64` model is unchanged.
+- At that cleanup revision, the one-window default remained `/WINDOW:64`.
 
 Detailed per-frame status strings (`TRANSFER ...`, XOR ranges, rescue details)
 are developer-only now. The release build keeps only user-facing prompts that

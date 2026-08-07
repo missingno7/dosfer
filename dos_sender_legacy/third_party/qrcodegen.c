@@ -152,6 +152,36 @@ static void dosferStrideCopy(const uint8_t __far *src,uint16_t len,
 	"stride_done:" \
 	parm [fs si] [cx] [es di] [dx] modify [ax cx si di];
 
+/* The large-model ABI keeps near static storage in DGROUP (the same segment
+ * as SS).  A preceding far-memory operation may have loaded DS with its data
+ * segment; restore the ABI invariant once before a complete V40 RS pass.
+ * This is deliberately outside the 25-block loop: it adds two instructions
+ * per full QR construction, not to the steady-state ECC path. */
+static void dosferRestoreDgroup(void);
+#pragma aux dosferRestoreDgroup = \
+	"push ss" \
+	"pop ds" \
+	modify [ds];
+
+/* The six V40-L long-block data bytes are consecutive at the destination but
+ * have 119-byte source spacing.  Copy them after all RS work through explicit
+ * far segments, so no C far store can invalidate DS between RS blocks. */
+static void dosferCopyV40LongData(const uint8_t __far *data,uint8_t __far *result);
+#pragma aux dosferCopyV40LongData = \
+	"mov al,fs:[si+2360]" \
+	"mov es:[di+2950],al" \
+	"mov al,fs:[si+2479]" \
+	"mov es:[di+2951],al" \
+	"mov al,fs:[si+2598]" \
+	"mov es:[di+2952],al" \
+	"mov al,fs:[si+2717]" \
+	"mov es:[di+2953],al" \
+	"mov al,fs:[si+2836]" \
+	"mov es:[di+2954],al" \
+	"mov al,fs:[si+2955]" \
+	"mov es:[di+2955],al" \
+	parm [fs si] [es di] modify [ax si di];
+
 static void dosferRs28Asm(const uint8_t __far *data,uint16_t len,
 		const uint8_t __near *table,uint8_t __near *ecc);
 #pragma aux dosferRs28Asm = \
@@ -191,7 +221,7 @@ static void dosferRs28Asm(const uint8_t __far *data,uint16_t len,
 	"jnz rs_loop" \
 	"rs_done:" \
 	"pop bp" \
-	parm [es si] [cx] [bx] [di] modify [ax dx si];
+	parm [es si] [cx] [bx] [di] modify [ax cx dx si];
 static void dosferRs26Asm(const uint8_t __far *data,uint16_t len,
 		const uint8_t __near *table,uint8_t __near *ecc);
 #pragma aux dosferRs26Asm = \
@@ -231,7 +261,7 @@ static void dosferRs26Asm(const uint8_t __far *data,uint16_t len,
 	"jnz rs26_loop" \
 	"rs26_done:" \
 	"pop bp" \
-	parm [es si] [cx] [bx] [di] modify [ax dx si];
+	parm [es si] [cx] [bx] [di] modify [ax cx dx si];
 static void dosferRs30Asm(const uint8_t __far *data,uint16_t len,
 		const uint8_t __near *table,uint8_t __near *ecc);
 #pragma aux dosferRs30Asm = \
@@ -274,7 +304,7 @@ static void dosferRs30Asm(const uint8_t __far *data,uint16_t len,
 	"jnz rs30_loop" \
 	"rs30_done:" \
 	"pop bp" \
-	parm [es si] [cx] [bx] [di] modify [ax dx si];
+	parm [es si] [cx] [bx] [di] modify [ax cx dx si];
 
 /* Advance the 30-byte RS register by two input bytes at once:
  * B[j] = E[j+2] ^ row(f1)[j+1] ^ row(f2)[j]. */
@@ -367,7 +397,7 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 	"mov word ptr [di+28],ax" \
 	"rs30p_done:" \
 	"pop bp" \
-	parm [es si] [cx] [bx] [di] modify [ax dx si];
+	parm [es si] [cx] [bx] [di] modify [ax cx dx si];
 
 #endif
 
@@ -817,6 +847,9 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 		ecc[31];
 	int block,j;
 
+	#ifdef __WATCOMC__
+	dosferRestoreDgroup();
+	#endif
 	dosferPrepareRs(30);
 	for(block=0;block<25;block++) {
 		int datLen=block<19?118:119;
@@ -824,7 +857,6 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 #ifdef __WATCOMC__
 		dosferRs30PairAsm(dat,(uint16_t)datLen,dosferRsStep,ecc);
 		dosferStrideCopy(dat,118,result+block,25);
-		if(block>=19)result[2950+block-19]=dat[118];
 		dosferStrideCopy(ecc,30,result+2956+block,25);
 #else
 		for(j=0;j<datLen;j++) {
@@ -839,6 +871,9 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 #endif
 		dat+=datLen;
 	}
+#ifdef __WATCOMC__
+	dosferCopyV40LongData(data,result);
+#endif
 }
 
 /* Pack one complete DOSfer frame into the fixed V40-L ECI-3/Byte data
@@ -882,6 +917,9 @@ void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
 		ecc[31];
 	int block,j;
 
+	#ifdef __WATCOMC__
+	dosferRestoreDgroup();
+	#endif
 	dosferPrepareRs(30);
 	for(block=0;block<25;block++) {
 		int datLen=block<19?118:119;
@@ -933,44 +971,71 @@ bool qrcodegen_dosferEncodeFrameV40L(const uint8_t frame[], uint16_t frameLen,
 	return true;
 }
 
-bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t encodedRight[],
-		const uint8_t protocolHeaderXor[48],uint8_t result[]) {
-	static uint8_t
+bool qrcodegen_dosferCorrectXorV40L(const uint8_t encodedXor[],uint16_t xorCount,
+        const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+    static uint8_t
 #ifdef __WATCOMC__
-		__near
+        __near
 #endif
-		data[118];
-	static uint8_t
+        data[118];
+    static uint8_t
 #ifdef __WATCOMC__
-		__near
+        __near
 #endif
-		 ecc[31];
-	uint16_t i;
+        ecc[31];
+    uint16_t i;
 #ifdef DOSFER_PROFILE
-	u32 profileStart=timer_ticks(),profileNow;
+    u32 profileStart=timer_ticks(),profileNow;
 #endif
-	memset(data,0,sizeof(data));memset(ecc,0,sizeof(ecc));
-	/* ECI 3 + Byte mode + 16-bit length 2952, followed by the affine
-	 * protocol-header correction. The remaining 2904 input bytes are zero. */
-	data[0]=0x70;data[1]=0x34;data[2]=0x0B;data[3]=0x88;
-	memcpy(data+4,protocolHeaderXor,48);dosferPrepareRs(30);
+    if(!encodedXor||!xorCount||!protocolHeaderXor||!result)return false;
+    memset(data,0,sizeof(data));memset(ecc,0,sizeof(ecc));
+    /* Even source counts cancel the common ECI 3 + Byte mode + length prefix;
+     * odd source counts retain it.  The caller supplies only the correction
+     * from XOR(source DOSfer headers) to the desired DOSfer header. */
+    if(!(xorCount&1)) {
+        data[0]=0x70;data[1]=0x34;data[2]=0x0B;data[3]=0x88;
+    }
+    memcpy(data+4,protocolHeaderXor,48);dosferPrepareRs(30);
 #ifdef __WATCOMC__
-	dosferRs30PairAsm(data,118,dosferRsStep,ecc);
+    dosferRs30PairAsm(data,118,dosferRsStep,ecc);
 #else
-	for(i=0;i<118;i++){uint8_t factor=data[i]^ecc[0];const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
-		ecc[30]=0;for(int j=0;j<30;j++)ecc[j]=ecc[j+1]^row[j];}
+    for(i=0;i<118;i++){uint8_t factor=data[i]^ecc[0];const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
+        ecc[30]=0;for(int j=0;j<30;j++)ecc[j]=ecc[j+1]^row[j];}
 #endif
 #ifdef DOSFER_PROFILE
-	profileNow=timer_ticks();dosferQrProfileTicks[1]+=profileNow-profileStart;profileStart=profileNow;
+    profileNow=timer_ticks();dosferQrProfileTicks[1]+=profileNow-profileStart;profileStart=profileNow;
 #endif
-	for(i=0;i+4<=3706;i+=4)*(uint32_t *)(result+i)=*(const uint32_t *)(encodedLeft+i)^*(const uint32_t *)(encodedRight+i);
-	for(;i<3706;i++)result[i]=encodedLeft[i]^encodedRight[i];
-	for(i=0;i<52;i++)result[i*25]^=data[i];
-	for(i=0;i<30;i++)result[2956+i*25]^=ecc[i];
+    if(result!=encodedXor)memcpy(result,encodedXor,3706);
+    for(i=0;i<52;i++)result[i*25]^=data[i];
+    for(i=0;i<30;i++)result[2956+i*25]^=ecc[i];
 #ifdef DOSFER_PROFILE
-	dosferQrProfileTicks[0]+=timer_ticks()-profileStart;
+    dosferQrProfileTicks[0]+=timer_ticks()-profileStart;
 #endif
-	return true;
+    return true;
+}
+
+bool qrcodegen_dosferDeriveXorV40L(const uint8_t encodedLeft[],const uint8_t encodedRight[],
+        const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+    uint16_t i;
+    if(!encodedLeft||!encodedRight||!protocolHeaderXor||!result)return false;
+    for(i=0;i+4<=3706;i+=4)
+        *(uint32_t *)(result+i)=*(const uint32_t *)(encodedLeft+i)^
+            *(const uint32_t *)(encodedRight+i);
+    for(;i<3706;i++)result[i]=encodedLeft[i]^encodedRight[i];
+    return qrcodegen_dosferCorrectXorV40L(result,2,protocolHeaderXor,result);
+}
+
+bool qrcodegen_dosferDeriveXor3V40L(const uint8_t encodedA[],const uint8_t encodedB[],
+        const uint8_t encodedC[],const uint8_t protocolHeaderXor[48],uint8_t result[]) {
+    uint16_t i;
+    if(!encodedA||!encodedB||!encodedC||!protocolHeaderXor||!result)return false;
+    /* Two 32-bit XORs derive the same codeword position for all three source
+     * streams.  The odd source count preserves the common QR prefix. */
+    for(i=0;i+4<=3706;i+=4)
+        *(uint32_t *)(result+i)=*(const uint32_t *)(encodedA+i)^
+            *(const uint32_t *)(encodedB+i)^*(const uint32_t *)(encodedC+i);
+    for(;i<3706;i++)result[i]=encodedA[i]^encodedB[i]^encodedC[i];
+    return qrcodegen_dosferCorrectXorV40L(result,3,protocolHeaderXor,result);
 }
 
 bool qrcodegen_dosferEncodePrepackedV40L(uint8_t dataCodewords[],uint8_t result[]) {
