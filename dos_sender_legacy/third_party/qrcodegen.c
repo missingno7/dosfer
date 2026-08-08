@@ -288,30 +288,24 @@ static void dosferInterleaveEccV40(const uint8_t __near *ecc,
 #pragma aux dosferInterleaveEccV40 = \
 	"mov cx,30" \
 	"v40ecc_row:" \
-	"mov al,[si]"     "mov es:[di],al" \
-	"mov al,[si+32]"  "mov es:[di+1],al" \
-	"mov al,[si+64]"  "mov es:[di+2],al" \
-	"mov al,[si+96]"  "mov es:[di+3],al" \
-	"mov al,[si+128]" "mov es:[di+4],al" \
-	"mov al,[si+160]" "mov es:[di+5],al" \
-	"mov al,[si+192]" "mov es:[di+6],al" \
-	"mov al,[si+224]" "mov es:[di+7],al" \
-	"mov al,[si+256]" "mov es:[di+8],al" \
-	"mov al,[si+288]" "mov es:[di+9],al" \
-	"mov al,[si+320]" "mov es:[di+10],al" \
-	"mov al,[si+352]" "mov es:[di+11],al" \
-	"mov al,[si+384]" "mov es:[di+12],al" \
-	"mov al,[si+416]" "mov es:[di+13],al" \
-	"mov al,[si+448]" "mov es:[di+14],al" \
-	"mov al,[si+480]" "mov es:[di+15],al" \
-	"mov al,[si+512]" "mov es:[di+16],al" \
-	"mov al,[si+544]" "mov es:[di+17],al" \
-	"mov al,[si+576]" "mov es:[di+18],al" \
-	"mov al,[si+608]" "mov es:[di+19],al" \
-	"mov al,[si+640]" "mov es:[di+20],al" \
-	"mov al,[si+672]" "mov es:[di+21],al" \
-	"mov al,[si+704]" "mov es:[di+22],al" \
-	"mov al,[si+736]" "mov es:[di+23],al" \
+	"mov al,[si]"     "mov ah,[si+32]" \
+	"ror eax,16" "mov al,[si+64]" "mov ah,[si+96]" \
+	"rol eax,16" "mov es:[di],eax" \
+	"mov al,[si+128]" "mov ah,[si+160]" \
+	"ror eax,16" "mov al,[si+192]" "mov ah,[si+224]" \
+	"rol eax,16" "mov es:[di+4],eax" \
+	"mov al,[si+256]" "mov ah,[si+288]" \
+	"ror eax,16" "mov al,[si+320]" "mov ah,[si+352]" \
+	"rol eax,16" "mov es:[di+8],eax" \
+	"mov al,[si+384]" "mov ah,[si+416]" \
+	"ror eax,16" "mov al,[si+448]" "mov ah,[si+480]" \
+	"rol eax,16" "mov es:[di+12],eax" \
+	"mov al,[si+512]" "mov ah,[si+544]" \
+	"ror eax,16" "mov al,[si+576]" "mov ah,[si+608]" \
+	"rol eax,16" "mov es:[di+16],eax" \
+	"mov al,[si+640]" "mov ah,[si+672]" \
+	"ror eax,16" "mov al,[si+704]" "mov ah,[si+736]" \
+	"rol eax,16" "mov es:[di+20],eax" \
 	"mov al,[si+768]" "mov es:[di+24],al" \
 	"inc si" \
 	"add di,25" \
