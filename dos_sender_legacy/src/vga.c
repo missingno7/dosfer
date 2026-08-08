@@ -49,8 +49,23 @@ static u8
  * This replaces the old 16-bit offset + separate 8-bit mask tables, saving
  * 29,648 bytes and one far-memory load for every changed module. */
 static u16 far *delta_entry;
+static u8 far *rgb3_template;
+static const u8 far *direct_asm_red,*direct_asm_green,*direct_asm_blue;
+static const u16 far *direct_asm_map;
 #ifdef DOSFER_DEVTOOLS
 static u16 delta_bits;
+#endif
+#ifdef DOSFER_MAP_STATS
+static u32 rgb_map_loads,rgb_red_xors,rgb_green_xors,rgb_blue_xors;
+#define RGB_STAT_MAP() (++rgb_map_loads)
+#define RGB_STAT_RED() (++rgb_red_xors)
+#define RGB_STAT_GREEN() (++rgb_green_xors)
+#define RGB_STAT_BLUE() (++rgb_blue_xors)
+#else
+#define RGB_STAT_MAP() ((void)0)
+#define RGB_STAT_RED() ((void)0)
+#define RGB_STAT_GREEN() ((void)0)
+#define RGB_STAT_BLUE() ((void)0)
 #endif
 static const u8 pixel_mask[8]={0x80,0x40,0x20,0x10,0x08,0x04,0x02,0x01};
 
@@ -141,7 +156,9 @@ static void dosferClearFull320(u8 far *dest) {
 
 static void free_delta(void) {
     if(delta_entry)free(delta_entry);
+    if(rgb3_template)_ffree(rgb3_template);
     delta_entry=0;
+    rgb3_template=0;
 #ifdef DOSFER_DEVTOOLS
     delta_bits=0;
 #endif
@@ -605,13 +622,14 @@ int vga_apply_v40l_delta(const u8 *data_codewords,const u8 *ecc_blocks,
 
 
 #define APPLY_RGB_MODULE(bit_index,bit_mask) do { \
-    if((changed_r|changed_g|changed_b)&(bit_mask)) { \
+    if(changed_any&(bit_mask)) { \
         u16 entry__=(map)[bit_index]; \
         u16 offset__=(u16)(entry__&0x1FFF); \
         u8 pixel__=pixel_mask[entry__>>13]; \
-        if(changed_r&(bit_mask))screen_320[offset__]^=pixel__; \
-        if(changed_g&(bit_mask))screen_green[offset__]^=pixel__; \
-        if(changed_b&(bit_mask))screen_blue[offset__]^=pixel__; \
+        RGB_STAT_MAP(); \
+        if(changed_r&(bit_mask)){screen_320[offset__]^=pixel__;RGB_STAT_RED();} \
+        if(changed_g&(bit_mask)){screen_green[offset__]^=pixel__;RGB_STAT_GREEN();} \
+        if(changed_b&(bit_mask)){screen_blue[offset__]^=pixel__;RGB_STAT_BLUE();} \
     } \
 } while(0)
 
@@ -629,7 +647,7 @@ int vga_apply_codeword_delta3(
     const u8 far *next_r,*next_g,*next_b;
     u8 far *current_r,*current_g,*current_b;
     u16 i;
-    u8 changed_r,changed_g,changed_b;
+    u8 changed_r,changed_g,changed_b,changed_any;
 #ifdef DOSFER_PROFILE
     u32 profile_start=timer_ticks();
 #endif
@@ -651,7 +669,8 @@ int vga_apply_codeword_delta3(
         *current_r++=*next_r++;
         *current_g++=*next_g++;
         *current_b++=*next_b++;
-        if(changed_r|changed_g|changed_b)APPLY_CHANGED_BYTE3(map);
+        changed_any=(u8)(changed_r|changed_g|changed_b);
+        if(changed_any)APPLY_CHANGED_BYTE3(map);
     }
 #ifdef DOSFER_PROFILE
     dosferVgaProfileTicks[0]+=timer_ticks()-profile_start;
@@ -672,7 +691,7 @@ int vga_apply_v40l_delta3(
     u8 far *current_r,*current_g,*current_b;
     u16 cw=0;
     int row,block;
-    u8 value_r,value_g,value_b,changed_r,changed_g,changed_b;
+    u8 value_r,value_g,value_b,changed_r,changed_g,changed_b,changed_any;
 #ifdef DOSFER_PROFILE
     u32 profile_start=timer_ticks();
 #endif
@@ -692,7 +711,8 @@ int vga_apply_v40l_delta3(
         changed_g=(u8)(value_g^*current_g); \
         changed_b=(u8)(value_b^*current_b); \
         *current_r++=value_r; *current_g++=value_g; *current_b++=value_b; \
-        if(changed_r|changed_g|changed_b)APPLY_CHANGED_BYTE3(map); \
+        changed_any=(u8)(changed_r|changed_g|changed_b); \
+        if(changed_any)APPLY_CHANGED_BYTE3(map); \
         ++cw; map+=8; \
     } while(0)
 
@@ -724,6 +744,10 @@ int vga_apply_v40l_delta3(
 #undef APPLY_CHANGED_BYTE3
 #undef APPLY_RGB_MODULE
 #undef APPLY_CHANGED_BYTE
+#undef RGB_STAT_BLUE
+#undef RGB_STAT_GREEN
+#undef RGB_STAT_RED
+#undef RGB_STAT_MAP
 
 int vga_delta_ready(void) {
     return delta_entry!=0;
@@ -732,6 +756,306 @@ int vga_delta_ready(void) {
 int vga_rgb3_active(void) {
     return rgb3_active;
 }
+
+/* Dense production renderer. It starts from a function-module raster template
+ * and directly scatters all three interleaved V40-L streams through the
+ * existing placement map. It deliberately has no previous-codeword state or
+ * delta comparison. */
+static int direct_scatter_rgb3(const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    const u16 far *map=delta_entry;
+    const u8 far *red,*green,*blue;
+    u16 i;
+    u8 value_r,value_g,value_b,value_any;
+
+    if(!rgb3_active||!delta_entry||!codewords||!codewords[VGA_RGB_RED]||
+            !codewords[VGA_RGB_GREEN]||!codewords[VGA_RGB_BLUE])return 0;
+    red=codewords[VGA_RGB_RED];green=codewords[VGA_RGB_GREEN];
+    blue=codewords[VGA_RGB_BLUE];
+#define DIRECT_MODULE(k,b) do { \
+    if(value_any&(b)) { \
+        u16 entry__=(map)[k]; \
+        u16 offset__=(u16)(entry__&0x1FFF); \
+        u8 pixel__=pixel_mask[entry__>>13]; \
+        if(value_r&(b))screen_320[offset__]^=pixel__; \
+        if(value_g&(b))screen_green[offset__]^=pixel__; \
+        if(value_b&(b))screen_blue[offset__]^=pixel__; \
+    } \
+} while(0)
+    for(i=0;i<DOSFER_QR_CODEWORDS;++i,map+=8) {
+        value_r=*red++;value_g=*green++;value_b=*blue++;
+        value_any=(u8)(value_r|value_g|value_b);
+        if(value_any) {
+            DIRECT_MODULE(0,0x80); DIRECT_MODULE(1,0x40);
+            DIRECT_MODULE(2,0x20); DIRECT_MODULE(3,0x10);
+            DIRECT_MODULE(4,0x08); DIRECT_MODULE(5,0x04);
+            DIRECT_MODULE(6,0x02); DIRECT_MODULE(7,0x01);
+        }
+    }
+#undef DIRECT_MODULE
+    return 1;
+}
+
+static int direct_scatter_rgb3_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+
+static int capture_rgb3_template(const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    int ok;
+    if(!rgb3_template)rgb3_template=(u8 far *)_fmalloc(VGA_VISIBLE_BYTES);
+    if(!rgb3_template)return 0;
+    /* The current shadows contain a complete QR. Toggling its data modules
+     * out leaves the mask-specific fixed V40-L function raster. */
+    if(!direct_scatter_rgb3_optimized(codewords))return 0;
+    _fmemcpy(rgb3_template,screen_320,VGA_VISIBLE_BYTES);
+#ifdef DOSFER_DEVTOOLS
+    ok=!memcmp(screen_320,screen_green,VGA_VISIBLE_BYTES)&&
+       !memcmp(screen_320,screen_blue,VGA_VISIBLE_BYTES);
+#else
+    ok=1;
+#endif
+    /* Restore the complete QR even when the diagnostic equality check fails. */
+    if(!direct_scatter_rgb3_optimized(codewords))return 0;
+    return ok;
+}
+
+int vga_rgb3_direct_ready(void) {
+    return rgb3_active&&delta_entry&&rgb3_template;
+}
+
+int vga_apply_codewords3_direct(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef DOSFER_PROFILE
+    u32 profile_start=timer_ticks();
+#endif
+    if(!vga_rgb3_direct_ready())return 0;
+    _fmemcpy(screen_320,rgb3_template,VGA_VISIBLE_BYTES);
+    _fmemcpy(screen_green,rgb3_template,VGA_VISIBLE_BYTES);
+    _fmemcpy(screen_blue,rgb3_template,VGA_VISIBLE_BYTES);
+    if(!direct_scatter_rgb3_optimized(codewords))return 0;
+#ifdef DOSFER_PROFILE
+    dosferVgaProfileTicks[0]+=timer_ticks()-profile_start;
+#endif
+    return 1;
+}
+
+#ifdef DOSFER_DIRECT_BENCH
+int vga_rgb3_direct_reset_template(void) {
+    if(!vga_rgb3_direct_ready())return 0;
+    _fmemcpy(screen_320,rgb3_template,VGA_VISIBLE_BYTES);
+    _fmemcpy(screen_green,rgb3_template,VGA_VISIBLE_BYTES);
+    _fmemcpy(screen_blue,rgb3_template,VGA_VISIBLE_BYTES);
+    return 1;
+}
+
+int vga_rgb3_direct_scatter(const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    return direct_scatter_rgb3(codewords);
+}
+
+#endif
+
+#ifdef __WATCOMC__
+/* Exact codeword-centric scatter, with all eight source bits and two
+ * codewords per outer iteration unrolled. DS streams the packed placement
+ * map; FS/GS/ES stream R/G/B once per codeword; SS explicitly addresses the
+ * three near shadow rasters and pixel-mask LUT. */
+static void directScatter386(void);
+#pragma aux directScatter386 = \
+    "push ax" "push bx" "push cx" "push dx" \
+    "push si" "push di" "push bp" \
+    "push ds" "push es" "push fs" "push gs" \
+    "mov di,word ptr ss:direct_asm_red" \
+    "mov ax,word ptr ss:direct_asm_red+2" "mov fs,ax" \
+    "mov bp,word ptr ss:direct_asm_green" \
+    "mov ax,word ptr ss:direct_asm_green+2" "mov gs,ax" \
+    "mov bx,word ptr ss:direct_asm_blue" \
+    "mov ax,word ptr ss:direct_asm_blue+2" "mov es,ax" \
+    "mov si,word ptr ss:direct_asm_map" \
+    "mov ax,word ptr ss:direct_asm_map+2" "mov ds,ax" \
+    "mov cx,1853" \
+    "direct_asm1_loop:" \
+    "xor eax,eax" \
+    "mov al,fs:[di]" "inc di" \
+    "mov ah,gs:[bp]" "inc bp" \
+    "mov dl,es:[bx]" "inc bx" \
+    "shl edx,16" "or eax,edx" \
+    "push bp" "push bx" \
+    "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,80h" "jz direct_asm1_m0_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m0_g:" "test ah,80h" "jz direct_asm1_m0_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m0_b:" "test eax,00800000h" "jz direct_asm1_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m0_done:" \
+    "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,40h" "jz direct_asm1_m1_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m1_g:" "test ah,40h" "jz direct_asm1_m1_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m1_b:" "test eax,00400000h" "jz direct_asm1_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m1_done:" \
+    "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,20h" "jz direct_asm1_m2_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m2_g:" "test ah,20h" "jz direct_asm1_m2_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m2_b:" "test eax,00200000h" "jz direct_asm1_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m2_done:" \
+    "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,10h" "jz direct_asm1_m3_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m3_g:" "test ah,10h" "jz direct_asm1_m3_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m3_b:" "test eax,00100000h" "jz direct_asm1_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m3_done:" \
+    "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,08h" "jz direct_asm1_m4_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m4_g:" "test ah,08h" "jz direct_asm1_m4_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m4_b:" "test eax,00080000h" "jz direct_asm1_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m4_done:" \
+    "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,04h" "jz direct_asm1_m5_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m5_g:" "test ah,04h" "jz direct_asm1_m5_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m5_b:" "test eax,00040000h" "jz direct_asm1_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m5_done:" \
+    "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,02h" "jz direct_asm1_m6_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m6_g:" "test ah,02h" "jz direct_asm1_m6_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m6_b:" "test eax,00020000h" "jz direct_asm1_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m6_done:" \
+    "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,01h" "jz direct_asm1_m7_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm1_m7_g:" "test ah,01h" "jz direct_asm1_m7_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm1_m7_b:" "test eax,00010000h" "jz direct_asm1_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m7_done:" \
+    "pop bx" "pop bp" "add si,16" \
+    "xor eax,eax" \
+    "mov al,fs:[di]" "inc di" \
+    "mov ah,gs:[bp]" "inc bp" \
+    "mov dl,es:[bx]" "inc bx" \
+    "shl edx,16" "or eax,edx" \
+    "push bp" "push bx" \
+    "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,80h" "jz direct_asm2_m0_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m0_g:" "test ah,80h" "jz direct_asm2_m0_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m0_b:" "test eax,00800000h" "jz direct_asm2_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m0_done:" \
+    "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,40h" "jz direct_asm2_m1_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m1_g:" "test ah,40h" "jz direct_asm2_m1_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m1_b:" "test eax,00400000h" "jz direct_asm2_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m1_done:" \
+    "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,20h" "jz direct_asm2_m2_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m2_g:" "test ah,20h" "jz direct_asm2_m2_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m2_b:" "test eax,00200000h" "jz direct_asm2_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m2_done:" \
+    "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,10h" "jz direct_asm2_m3_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m3_g:" "test ah,10h" "jz direct_asm2_m3_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m3_b:" "test eax,00100000h" "jz direct_asm2_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m3_done:" \
+    "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,08h" "jz direct_asm2_m4_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m4_g:" "test ah,08h" "jz direct_asm2_m4_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m4_b:" "test eax,00080000h" "jz direct_asm2_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m4_done:" \
+    "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,04h" "jz direct_asm2_m5_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m5_g:" "test ah,04h" "jz direct_asm2_m5_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m5_b:" "test eax,00040000h" "jz direct_asm2_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m5_done:" \
+    "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,02h" "jz direct_asm2_m6_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m6_g:" "test ah,02h" "jz direct_asm2_m6_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m6_b:" "test eax,00020000h" "jz direct_asm2_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m6_done:" \
+    "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,01h" "jz direct_asm2_m7_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_asm2_m7_g:" "test ah,01h" "jz direct_asm2_m7_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_asm2_m7_b:" "test eax,00010000h" "jz direct_asm2_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m7_done:" \
+    "pop bx" "pop bp" "add si,16" \
+    "dec cx" "jnz direct_asm1_loop" \
+    "pop gs" "pop fs" "pop es" "pop ds" \
+    "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp es fs gs];
+#else
+static void directScatter386(void) {}
+#endif
+
+static int direct_scatter_rgb3_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    if(!rgb3_active||!delta_entry||!codewords||!codewords[VGA_RGB_RED]||
+            !codewords[VGA_RGB_GREEN]||!codewords[VGA_RGB_BLUE])return 0;
+#ifdef __WATCOMC__
+    direct_asm_red=codewords[VGA_RGB_RED];
+    direct_asm_green=codewords[VGA_RGB_GREEN];
+    direct_asm_blue=codewords[VGA_RGB_BLUE];
+    direct_asm_map=delta_entry;
+    directScatter386();
+    return 1;
+#else
+    return direct_scatter_rgb3(codewords);
+#endif
+}
+
+#ifdef DOSFER_DIRECT_BENCH
+int vga_rgb3_direct_scatter_asm(const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    return direct_scatter_rgb3_optimized(codewords);
+}
+
+#endif
+
+#ifdef DOSFER_MAP_STATS
+void vga_rgb3_map_stats_reset(void) {
+    rgb_map_loads=rgb_red_xors=rgb_green_xors=rgb_blue_xors=0;
+}
+
+void vga_rgb3_map_stats(u32 *map_loads,u32 *red_xors,u32 *green_xors,
+                        u32 *blue_xors) {
+    if(map_loads)*map_loads=rgb_map_loads;
+    if(red_xors)*red_xors=rgb_red_xors;
+    if(green_xors)*green_xors=rgb_green_xors;
+    if(blue_xors)*blue_xors=rgb_blue_xors;
+}
+
+/* Count distinct shadow-raster bytes within each eight-module codeword. A
+ * duplicate is a byte-level RMW that a dense renderer could potentially
+ * combine after accumulating per-plane XOR masks. */
+void vga_rgb3_map_layout_stats(u32 *entries,u32 *within_codeword_bytes,
+                               u32 *global_unique_bytes) {
+    u16 codeword,bit,prior,offset;
+    static u8 seen[VGA_VISIBLE_BYTES];
+    u32 total_entries=0,total_within_codeword=0,total_global=0;
+    if(!delta_entry) {
+        if(entries)*entries=0;
+        if(within_codeword_bytes)*within_codeword_bytes=0;
+        if(global_unique_bytes)*global_unique_bytes=0;
+        return;
+    }
+    memset(seen,0,sizeof(seen));
+    for(codeword=0;codeword<DOSFER_QR_CODEWORDS;++codeword) {
+        for(bit=0;bit<8;++bit) {
+            offset=(u16)(delta_entry[(u32)codeword*8+bit]&0x1FFF);
+            ++total_entries;
+            if(!seen[offset]) {seen[offset]=1;++total_global;}
+            for(prior=0;prior<bit;++prior)
+                if((delta_entry[(u32)codeword*8+prior]&0x1FFF)==offset)break;
+            if(prior==bit)++total_within_codeword;
+        }
+    }
+    if(entries)*entries=total_entries;
+    if(within_codeword_bytes)*within_codeword_bytes=total_within_codeword;
+    if(global_unique_bytes)*global_unique_bytes=total_global;
+}
+#endif
 
 #ifdef DOSFER_DEVTOOLS
 void vga_delta_stats(u16 *bits) {
@@ -828,6 +1152,9 @@ int vga_show_full_qr3_at(const u8 *const qr[VGA_RGB_CHANNELS],
 #endif
     if(!build_qr_image_rgb3(qr,invert))return 0;
     prepare_delta();
+    /* Direct rendering is optional on low-memory systems. A failed template
+     * allocation leaves the canonical full-render path operational. */
+    if(delta_entry)capture_rgb3_template((const u8 *const *)codewords);
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;
     profile_start=profile_now;

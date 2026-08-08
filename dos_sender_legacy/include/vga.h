@@ -30,8 +30,14 @@ int vga_apply_codeword_delta(const u8 *next_codewords,
                              u8 *current_codewords);
 int vga_show_prepared_at(int invert, const char *status, u32 earliest_tick);
 
-/* Fused RGB3 steady-state paths.  The shared placement map is traversed once
- * while all three independent QR bitplanes are updated. */
+/* Production RGB3 steady-state path.  Each shadow plane is reset from the
+ * fixed V40-L function-pattern template, then all three interleaved codeword
+ * streams are scattered in one traversal of the shared placement map. */
+int vga_apply_codewords3_direct(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_ready(void);
+
+/* Retained delta paths are the verification oracle for the direct renderer. */
 int vga_apply_v40l_delta3(
         const u8 *const data_codewords[VGA_RGB_CHANNELS],
         const u8 *const ecc_blocks[VGA_RGB_CHANNELS],
@@ -55,6 +61,20 @@ void vga_benchmark_qr(const u8 *qr, int loops,
                       u32 *build_ms, u32 *copy_ms, u32 *text_ms);
 void vga_benchmark_delta(const u8 *codewords, int loops,
                          u32 *update_ms, u32 *copy_ms, u32 *text_ms);
+#endif
+
+#ifdef DOSFER_MAP_STATS
+void vga_rgb3_map_stats_reset(void);
+void vga_rgb3_map_stats(u32 *map_loads,u32 *red_xors,u32 *green_xors,
+                        u32 *blue_xors);
+void vga_rgb3_map_layout_stats(u32 *entries,u32 *within_codeword_bytes,
+                               u32 *global_unique_bytes);
+#endif
+
+#ifdef DOSFER_DIRECT_BENCH
+int vga_rgb3_direct_reset_template(void);
+int vga_rgb3_direct_scatter(const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_scatter_asm(const u8 *const codewords[VGA_RGB_CHANNELS]);
 #endif
 
 #endif

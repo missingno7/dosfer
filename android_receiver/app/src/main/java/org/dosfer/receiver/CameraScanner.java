@@ -43,7 +43,6 @@ import zxingcpp.BarcodeReader;
 
 public final class CameraScanner {
     private static final String TAG = "DOSFER-Camera";
-    private static final int DECODE_WORKER_COUNT = 2;
     private static final int TRY_HARDER_EVERY_MISS = 3;
     private static final long CLASSIFICATION_WARMUP_NANOS = 3_000_000_000L;
 
@@ -143,7 +142,7 @@ public final class CameraScanner {
             preview.addOnLayoutChangeListener(previewLayoutListener);
             previewLayoutListenerAttached = true;
         }
-        decodeWorkers = new DecodeWorker[DECODE_WORKER_COUNT];
+        decodeWorkers = new DecodeWorker[selection.decodeWorkers];
         for (int i = 0; i < decodeWorkers.length; i++) decodeWorkers[i] = new DecodeWorker(i);
         if (preview.isAvailable()) open();
         else preview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
@@ -884,7 +883,7 @@ public final class CameraScanner {
                     captureCrop.side, captureWidth, captureHeight, highResolutionDownsample);
             s.targetFps = targetFps; s.requestedFps = selection.targetFps == 0 ? "Auto (" + targetFps + ")" : String.valueOf(targetFps);
             s.requestRange = configuredFpsRange == null ? "unavailable" : configuredFpsRange.toString();
-            s.workerCount = DECODE_WORKER_COUNT;
+            s.workerCount = selection.decodeWorkers;
             s.cameraFrames = cameraFrames; s.sensorFrames = sensorFrames; s.imageReaderFrames = imageReaderFrames;
             s.attempts = attempts; s.successes = successes; s.failures = failures; s.busyDrops = busyDrops;
             s.fallbackAttempts = fallbackAttempts; s.fallbackSuccesses = fallbackSuccesses;

@@ -41,8 +41,8 @@ static u8 far *rgb_codewords[VGA_RGB_CHANNELS];
 static u8 far *rgb_workspace[VGA_RGB_CHANNELS];
 static u8 far *rgb_parity_codewords[VGA_RGB_CHANNELS];
 static u8 rgb_headers[VGA_RGB_CHANNELS][FRAME_HEADER_SIZE];
-static int rgb_delta_ready;
-static int rgb_encoded_mask=-1;
+static int rgb_direct_ready;
+static int rgb_template_mask=-1;
 static u8 far *chain_left_codewords,*chain_right_codewords,*chain_cached_raw;
 static int chain_cache_valid;
 static u32 chain_cache_session,chain_cache_window,chain_cache_global;
@@ -67,8 +67,8 @@ static void free_rgb_state(void) {
         rgb_workspace[channel]=0;
         rgb_parity_codewords[channel]=0;
     }
-    rgb_delta_ready=0;
-    rgb_encoded_mask=-1;
+    rgb_direct_ready=0;
+    rgb_template_mask=-1;
 }
 
 static int ensure_rgb_state(void) {
@@ -428,9 +428,8 @@ static u16 make_rgb_item_frame(const Window *w,const RgbItem *item,u32 session) 
 }
 
 static int rgb_prepare_items(const Window *w,const RgbItem items[VGA_RGB_CHANNELS],
-        const Config *cfg,u32 session,u8 display_mask,int delta) {
-    const u8 *data[VGA_RGB_CHANNELS],*ecc[VGA_RGB_CHANNELS];
-    u8 *current[VGA_RGB_CHANNELS];
+        const Config *cfg,u32 session,u8 display_mask,int direct) {
+    const u8 *codewords[VGA_RGB_CHANNELS];
     int channel,source;
     u16 rawlen;
 
@@ -442,31 +441,22 @@ static int rgb_prepare_items(const Window *w,const RgbItem items[VGA_RGB_CHANNEL
         if(source>=0) {
             _fmemcpy(rgb_headers[channel],rgb_headers[source],FRAME_HEADER_SIZE);
             _fmemcpy(rgb_workspace[channel],rgb_workspace[source],QR_BUFFER+1);
-            if(!delta)
-                _fmemcpy(rgb_codewords[channel],rgb_codewords[source],DOSFER_QR_CODEWORDS);
+            _fmemcpy(rgb_codewords[channel],rgb_codewords[source],DOSFER_QR_CODEWORDS);
             continue;
         }
         rawlen=make_rgb_item_frame(w,&items[channel],session);
         if(!rawlen)return 0;
         _fmemcpy(rgb_headers[channel],raw_frame,FRAME_HEADER_SIZE);
-        if(delta) {
-            if(!qrcodegen_dosferPackFrameV40L(raw_frame,rawlen,
-                    rgb_workspace[channel]))return 0;
-            qrcodegen_dosferComputeEccBlocksV40L(rgb_workspace[channel],
-                rgb_workspace[channel]+QR_DATA_CODEWORDS);
-        } else if(!qrcodegen_dosferEncodeFrameV40L(raw_frame,rawlen,
+        if(!qrcodegen_dosferEncodeFrameV40L(raw_frame,rawlen,
                 rgb_codewords[channel],rgb_workspace[channel],
-                (enum qrcodegen_Mask)display_mask,false))return 0;
+                (enum qrcodegen_Mask)display_mask,direct!=0))return 0;
     }
-    if(delta) {
-        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
-            data[channel]=rgb_workspace[channel];
-            ecc[channel]=rgb_workspace[channel]+QR_DATA_CODEWORDS;
-            current[channel]=rgb_codewords[channel];
-        }
-        if(!vga_apply_v40l_delta3(data,ecc,current))return 0;
+    if(direct) {
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            codewords[channel]=rgb_codewords[channel];
+        if(!vga_apply_codewords3_direct(codewords))return 0;
     }
-    rgb_encoded_mask=display_mask;
+    rgb_template_mask=display_mask;
     return 1;
 }
 
@@ -474,41 +464,37 @@ static int display_rgb_items(const Window *w,const RgbItem items[VGA_RGB_CHANNEL
         const Config *cfg,u32 session,u16 hold_ms,u8 display_mask,
         const char *status) {
     const u8 *qr[VGA_RGB_CHANNELS];
-    u8 *current[VGA_RGB_CHANNELS];
     u32 earliest=0;
     int channel;
-    int delta=rgb_delta_ready&&display_mask==rgb_encoded_mask;
+    int direct=rgb_direct_ready&&display_mask==rgb_template_mask;
 
-    if(!rgb_prepare_items(w,items,cfg,session,display_mask,delta))return 0;
+    if(!rgb_prepare_items(w,items,cfg,session,display_mask,direct))return 0;
     if(last_visible_tick&&hold_ms)
         earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
-    if(delta) {
+    if(direct) {
         if(!vga_show_prepared3_at(cfg->invert,status,earliest))return 0;
     } else {
         for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
             qr[channel]=rgb_workspace[channel];
-            current[channel]=rgb_codewords[channel];
         }
-        if(!vga_show_full_qr3_at(qr,current,cfg->invert,status,earliest))return 0;
+        if(!vga_show_full_qr3_at(qr,rgb_codewords,cfg->invert,status,earliest))return 0;
     }
-    rgb_delta_ready=vga_delta_ready();
+    rgb_direct_ready=vga_rgb3_direct_ready();
     last_visible_tick=vga_last_flip_tick();
     return 1;
 }
 
 static int display_rgb_codewords(const Config *cfg,u8 *const next[VGA_RGB_CHANNELS],
         u16 hold_ms,const char *status) {
-    u8 *current[VGA_RGB_CHANNELS];
     const u8 *source[VGA_RGB_CHANNELS];
     u32 earliest=0;
     int channel;
 
-    if(!rgb_delta_ready)return 0;
+    if(!rgb_direct_ready)return 0;
     for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
         source[channel]=next[channel];
-        current[channel]=rgb_codewords[channel];
     }
-    if(!vga_apply_codeword_delta3(source,current))return 0;
+    if(!vga_apply_codewords3_direct(source))return 0;
     if(last_visible_tick&&hold_ms)
         earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
     if(!vga_show_prepared3_at(cfg->invert,status,earliest))return 0;
@@ -593,7 +579,7 @@ static int flush_rgb_channel_parity(const Window *w,const Config *cfg,u32 sessio
     sprintf(status,"RGB3 PARITY stride3 x%u",acc->batches);
 #endif
     if(!acc->batches)return 1;
-    if(rgb_delta_ready&&display_mask==rgb_encoded_mask) {
+    if(rgb_direct_ready&&display_mask==rgb_template_mask) {
         for(channel=0;channel<VGA_RGB_CHANNELS;++channel)if(acc->count[channel]) {
             if(!finalize_rgb_parity_channel(w,(u16)channel,cfg,session,acc))return 0;
             next[channel]=rgb_parity_codewords[channel];last=channel;
@@ -907,8 +893,8 @@ static int enter_transfer_vga(const Config *cfg) {
     }
     qr_delta_ready=0;
     encoded_qr_mask=-1;
-    rgb_delta_ready=0;
-    rgb_encoded_mask=-1;
+    rgb_direct_ready=0;
+    rgb_template_mask=-1;
     last_visible_tick=0;
     return 1;
 }

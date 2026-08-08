@@ -98,6 +98,43 @@ static u32 copy_payload_crc(u8 *dst,const u8 *src,u16 len,u16 flags,
     u32 group_stride=stream_offset?stream_offset:1UL;
 
     if(!crc_ready)crc_init();
+    /* Normal DATA frames dominate the sender and use exactly one whitening
+     * stream (FF_REPEATED does not change that). Select this case once per
+     * payload instead of re-testing all whitening modes for every word. */
+    if((flags&(FF_GROUP_XOR_WHITENED|FF_PAIR_WHITENED|FF_WHITENED))==
+            FF_WHITENED) {
+        while(len>=8) {
+            u32 value=*(const u32 *)src;
+            left=xorshift32(left);
+            value^=left;
+            *(u32 *)dst=value;
+            crc=crc_word(crc,value);
+            value=*(const u32 *)(src+4);
+            left=xorshift32(left);
+            value^=left;
+            *(u32 *)(dst+4)=value;
+            crc=crc_word(crc,value);
+            src+=8;dst+=8;len-=8;
+        }
+        if(len>=4) {
+            u32 value=*(const u32 *)src;
+            left=xorshift32(left);
+            value^=left;
+            *(u32 *)dst=value;
+            crc=crc_word(crc,value);
+            src+=4;dst+=4;len-=4;
+        }
+        if(len) {
+            u32 key=xorshift32(left);
+            while(len--) {
+                u8 value=(u8)(*src++^(u8)key);
+                key>>=8;
+                *dst++=value;
+                crc=crc_byte(crc,value);
+            }
+        }
+        return crc^0xFFFFFFFFUL;
+    }
     if(flags&FF_GROUP_XOR_WHITENED) {
         /* RGB3 parity uses the XOR of up to three DATA whitening streams.
          * stream_id is the member count and stream_offset is their logical

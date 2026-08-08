@@ -41,7 +41,7 @@ public final class MainActivity extends Activity {
     private ImageView decoderPreview;
     private TextView status, result, modesText;
     private Button reconstruct, decoderView, decoderSize;
-    private Spinner cameraSelector, fpsSelector, resolutionSelector;
+    private Spinner cameraSelector, fpsSelector, resolutionSelector, workerSelector;
     private CheckBox automaticSelector;
     private LinearLayout cameraPage, receiverPage;
     private FrameLayout pages;
@@ -145,6 +145,7 @@ public final class MainActivity extends Activity {
         cameraSelector = spinner();
         fpsSelector = spinner();
         resolutionSelector = spinner();
+        workerSelector = spinner();
         automaticSelector = new CheckBox(this);
         automaticSelector.setText("Automatic mode selection");
         automaticSelector.setTextColor(Color.WHITE);
@@ -152,6 +153,7 @@ public final class MainActivity extends Activity {
         content.addView(labelled("Rear camera ID", cameraSelector));
         content.addView(labelled("Target FPS (Auto / 60 / 30)", fpsSelector));
         content.addView(labelled("YUV capture resolution", resolutionSelector));
+        content.addView(labelled("ZXing decoder workers (1-4)", workerSelector));
         content.addView(automaticSelector);
 
         Button openReceiver = new Button(this);
@@ -300,6 +302,8 @@ public final class MainActivity extends Activity {
         for (String value : fps) fpsLabels.add(value);
         fpsSelector.setAdapter(adapter(fpsLabels));
         fpsSelector.setSelection(cameraSelection.targetFps == 60 ? 1 : cameraSelection.targetFps == 30 ? 2 : 0);
+        workerSelector.setAdapter(adapter(java.util.Arrays.asList("1", "2 (default)", "3", "4")));
+        workerSelector.setSelection(cameraSelection.decodeWorkers - 1);
         automaticSelector.setOnCheckedChangeListener((button, checked) -> resolutionSelector.setEnabled(!checked));
         resolutionSelector.setEnabled(!cameraSelection.automatic);
         discoverSelectedCameraModes();
@@ -323,7 +327,8 @@ public final class MainActivity extends Activity {
         boolean automatic = automaticSelector.isChecked();
         String modeKey = resolutionSelector.getSelectedItem() == null ? "auto"
                 : resolutionSelector.getSelectedItem().toString().split(" ", 2)[0];
-        cameraSelection = new CameraSettings.Selection(cameraId, fps, modeKey, automatic);
+        int workers = workerSelector.getSelectedItemPosition() + 1;
+        cameraSelection = new CameraSettings.Selection(cameraId, fps, modeKey, automatic, workers);
         CameraSettings.save(this, cameraSelection);
         stopCamera();
         receiverVisible = true;

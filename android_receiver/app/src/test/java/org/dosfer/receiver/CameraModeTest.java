@@ -37,9 +37,12 @@ public class CameraModeTest {
     }
 
     @Test public void persistedConfigurationRoundTripsAndInvalidFpsFallsBackToAuto() {
-        CameraSettings.Selection original = new CameraSettings.Selection("logical|0", 60, "1440x1080", false);
+        CameraSettings.Selection original = new CameraSettings.Selection("logical|0", 60, "1440x1080", false, 3);
         assertEquals(original.serialize(), CameraSettings.Selection.parse(original.serialize()).serialize());
         assertEquals(0, CameraSettings.Selection.parse("0|120|auto|true").targetFps);
         assertTrue(CameraSettings.Selection.parse("0|120|auto|true").automatic);
+        assertEquals(2, CameraSettings.Selection.parse("0|60|auto|true").decodeWorkers);
+        assertEquals(4, CameraSettings.Selection.parse("0|60|auto|true|99").decodeWorkers);
+        assertEquals(1, CameraSettings.Selection.parse("0|60|auto|true|0").decodeWorkers);
     }
 }

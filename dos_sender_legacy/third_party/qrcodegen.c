@@ -152,6 +152,53 @@ static void dosferStrideCopy(const uint8_t __far *src,uint16_t len,
 	"stride_done:" \
 	parm [fs si] [cx] [es di] [dx] modify [ax cx si di];
 
+/* The specialized V40-L encoder always copies 118 data bytes and 30 ECC
+ * bytes at stride 25. Pairing adjacent source bytes halves loop and pointer
+ * overhead while preserving the exact interleaved destination order. */
+static void dosferStrideCopy118(const uint8_t __far *src,uint8_t __far *dest);
+#pragma aux dosferStrideCopy118 = \
+	"mov cx,14" \
+	"stride118_loop:" \
+	"mov al,fs:[si]"     "mov es:[di],al" \
+	"mov al,fs:[si+1]"   "mov es:[di+25],al" \
+	"mov al,fs:[si+2]"   "mov es:[di+50],al" \
+	"mov al,fs:[si+3]"   "mov es:[di+75],al" \
+	"mov al,fs:[si+4]"   "mov es:[di+100],al" \
+	"mov al,fs:[si+5]"   "mov es:[di+125],al" \
+	"mov al,fs:[si+6]"   "mov es:[di+150],al" \
+	"mov al,fs:[si+7]"   "mov es:[di+175],al" \
+	"add si,8" "add di,200" \
+	"dec cx" "jnz stride118_loop" \
+	"mov al,fs:[si]"     "mov es:[di],al" \
+	"mov al,fs:[si+1]"   "mov es:[di+25],al" \
+	"mov al,fs:[si+2]"   "mov es:[di+50],al" \
+	"mov al,fs:[si+3]"   "mov es:[di+75],al" \
+	"mov al,fs:[si+4]"   "mov es:[di+100],al" \
+	"mov al,fs:[si+5]"   "mov es:[di+125],al" \
+	parm [fs si] [es di] modify [ax cx si di];
+
+static void dosferStrideCopy30(const uint8_t __far *src,uint8_t __far *dest);
+#pragma aux dosferStrideCopy30 = \
+	"mov cx,3" \
+	"stride30_loop:" \
+	"mov al,fs:[si]"     "mov es:[di],al" \
+	"mov al,fs:[si+1]"   "mov es:[di+25],al" \
+	"mov al,fs:[si+2]"   "mov es:[di+50],al" \
+	"mov al,fs:[si+3]"   "mov es:[di+75],al" \
+	"mov al,fs:[si+4]"   "mov es:[di+100],al" \
+	"mov al,fs:[si+5]"   "mov es:[di+125],al" \
+	"mov al,fs:[si+6]"   "mov es:[di+150],al" \
+	"mov al,fs:[si+7]"   "mov es:[di+175],al" \
+	"add si,8" "add di,200" \
+	"dec cx" "jnz stride30_loop" \
+	"mov al,fs:[si]"     "mov es:[di],al" \
+	"mov al,fs:[si+1]"   "mov es:[di+25],al" \
+	"mov al,fs:[si+2]"   "mov es:[di+50],al" \
+	"mov al,fs:[si+3]"   "mov es:[di+75],al" \
+	"mov al,fs:[si+4]"   "mov es:[di+100],al" \
+	"mov al,fs:[si+5]"   "mov es:[di+125],al" \
+	parm [fs si] [es di] modify [ax cx si di];
+
 /* The large-model ABI keeps near static storage in DGROUP (the same segment
  * as SS).  A preceding far-memory operation may have loaded DS with its data
  * segment; restore the ABI invariant once before a complete V40 RS pass.
@@ -856,8 +903,8 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 		memset(ecc,0,sizeof(ecc));
 #ifdef __WATCOMC__
 		dosferRs30PairAsm(dat,(uint16_t)datLen,dosferRsStep,ecc);
-		dosferStrideCopy(dat,118,result+block,25);
-		dosferStrideCopy(ecc,30,result+2956+block,25);
+		dosferStrideCopy118(dat,result+block);
+		dosferStrideCopy30(ecc,result+2956+block);
 #else
 		for(j=0;j<datLen;j++) {
 			uint8_t factor=(uint8_t)(dat[j]^ecc[0]);
