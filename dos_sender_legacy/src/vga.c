@@ -718,18 +718,40 @@ static u32 stripe_group_lane_contribution(u16 lane,u8 raw) {
     return stripe_group_normalized_contribution(lane,normalized);
 }
 
+/* Phase groups join half-codewords from adjacent source bytes.  The table key
+ * contains only the two nibbles that survive that join, so one lookup replaces
+ * both normalization operations, the merge and this lane's transpose. */
+static u32 stripe_phase_lane_contribution(u16 lane,u8 key) {
+    u8 current,next,normalized;
+    if(!(lane&1u)) {
+        current=(u8)(key&0xF0u);
+        next=(u8)(key&0x0Fu);
+        normalized=(u8)((stripe_bit_reverse[current]<<4)|
+                        (stripe_bit_reverse[next]>>4));
+    } else {
+        current=(u8)(key>>4);
+        next=(u8)(key<<4);
+        normalized=(u8)((stripe_pair_swap[current]<<4)|
+                        (stripe_pair_swap[next]>>4));
+    }
+    return stripe_group_normalized_contribution(lane,normalized);
+}
+
 static void prepare_stripe_group_lut(void) {
     u16 lane,value;
     u32 paragraphs;
-    stripe_group_lut_raw=(u8 far *)_fmalloc(4096u+15u);
+    stripe_group_lut_raw=(u8 far *)_fmalloc(8192u+15u);
     if(!stripe_group_lut_raw)return;
     paragraphs=((u32)FP_OFF(stripe_group_lut_raw)+15UL)>>4;
     stripe_group_lut=(u32 far *)MK_FP(
         (u16)(FP_SEG(stripe_group_lut_raw)+paragraphs),0);
     for(lane=0;lane<4;++lane)
-        for(value=0;value<256;++value)
+        for(value=0;value<256;++value) {
             stripe_group_lut[(u16)(lane*256u+value)]=
                 stripe_group_lane_contribution(lane,(u8)value);
+            stripe_group_lut[(u16)(1024u+lane*256u+value)]=
+                stripe_phase_lane_contribution(lane,(u8)value);
+        }
 }
 
 static u16 stripe_run_bottom(const VgaStripeRun far *run) {
@@ -1807,6 +1829,65 @@ static void directStripePhasePlane386(void);
     "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
     modify [ax bx cx dx si di bp fs];
 
+/* Phase-specific direct contribution kernel. Reverse lanes (03/30) use a
+ * high-current/low-next key; forward lanes (0C/C0) use a
+ * low-current/high-next key. Selection occurs once per complete group. */
+static void directStripePhasePairLutPlane386(void);
+#pragma aux directStripePhasePairLutPlane386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" \
+    "push ds" "push fs" \
+    "mov ax,word ptr ss:stripe_group_source+2" "mov fs,ax" \
+    "mov ax,word ptr ss:stripe_group_lut+2" "mov ds,ax" \
+    "mov bp,word ptr ss:stripe_group_src0" \
+    "mov si,word ptr ss:stripe_group_src1" \
+    "mov bx,word ptr ss:stripe_group_src2" \
+    "mov di,word ptr ss:stripe_group_dest" \
+    "mov cx,word ptr ss:stripe_group_count_asm" \
+    "test cx,cx" "jz stripe_phase_pair_done" \
+    "cmp byte ptr ss:stripe_phase_type,1" \
+    "jne stripe_phase_pair_forward" \
+    /* Phase 1: shifted reverse lanes 0 and 2; raw lanes 1 and 3. */ \
+    "stripe_phase_pair_reverse_loop:" \
+    "xor eax,eax" "mov al,fs:[bp]" "dec bp" "and al,0f0h" \
+    "mov ah,fs:[bp]" "and ah,0fh" "or al,ah" "xor ah,ah" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax+4096]" \
+    "xor eax,eax" "mov al,fs:[si]" "inc si" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+1024]" \
+    "xor eax,eax" "mov al,fs:[bx]" "dec bx" "and al,0f0h" \
+    "mov ah,fs:[bx]" "and ah,0fh" "or al,ah" "xor ah,ah" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+6144]" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "xor eax,eax" "mov al,fs:[di]" "inc di" \
+    "mov word ptr ss:stripe_group_src3,di" "pop di" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+3072]" \
+    "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "sub di,40" \
+    "shr edx,16" "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "add di,280" \
+    "dec cx" "jnz stripe_phase_pair_reverse_loop" \
+    "jmp stripe_phase_pair_done" \
+    /* Phase 2: raw lanes 0 and 2; shifted forward lanes 1 and 3. */ \
+    "stripe_phase_pair_forward:" \
+    "xor eax,eax" "mov al,fs:[bp]" "dec bp" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax]" \
+    "xor eax,eax" "mov al,fs:[si]" "inc si" "and al,0fh" "shl al,4" \
+    "mov ah,fs:[si]" "and ah,0f0h" "shr ah,4" "or al,ah" \
+    "xor ah,ah" "shl eax,2" "xor edx,dword ptr ds:[eax+5120]" \
+    "xor eax,eax" "mov al,fs:[bx]" "dec bx" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+2048]" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "xor eax,eax" "mov al,fs:[di]" "inc di" "and al,0fh" "shl al,4" \
+    "mov ah,fs:[di]" "and ah,0f0h" "shr ah,4" "or al,ah" \
+    "xor ah,ah" "mov word ptr ss:stripe_group_src3,di" "pop di" \
+    "shl eax,2" "xor edx,dword ptr ds:[eax+7168]" \
+    "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "sub di,40" \
+    "shr edx,16" "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "add di,280" \
+    "dec cx" "jnz stripe_phase_pair_forward" \
+    "stripe_phase_pair_done:" \
+    "pop fs" "pop ds" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp ds fs];
 /* Three-lane complete-byte kernel. Lane 03 is deliberately zero; the
  * uninterrupted 0C/30/C0 streams are normalized and transposed exactly like
  * the four-lane production group kernel. */
@@ -1992,6 +2073,12 @@ static void stripe_phase_group_plane(const VgaStripePhaseGroup *group,
         group->dest+3u*VGA_BYTES_PER_LINE);
     stripe_group_count_asm=group->count;
     stripe_phase_type=group->phase;
+#ifdef __WATCOMC__
+    if(stripe_group_lut) {
+        directStripePhasePairLutPlane386();
+        return;
+    }
+#endif
     directStripePhasePlane386();
 }
 

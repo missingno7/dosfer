@@ -52,7 +52,7 @@ with `cpu cycles=3000` to compare the production direct paths against their
 bit-identical delta and portable-C oracles. The RGB benchmark also reports the
 run-level fallback, aligned four-stripe groups, phase-shifted groups, and their
 predecoded boundary-edge loop separately. It also isolates the three-lane
-groups, their production contribution-LUT kernels, and the exact C/386
+groups, the production raw/adjacent-nibble contribution-LUT kernels, and the exact C/386
 function-crossing range scatter:
 
 ```bat
