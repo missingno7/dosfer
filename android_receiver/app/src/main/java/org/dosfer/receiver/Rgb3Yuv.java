@@ -10,13 +10,11 @@ import java.nio.ByteOrder;
  * buffers. No Bitmap or intermediate ARGB frame is allocated. */
 final class Rgb3Yuv {
     static final int RED=0, GREEN=1, BLUE=2, CHANNELS=3;
-    /* The phone's high-resolution YUV mode is 3648x2736: its centered square
-     * crop is only 2736px, so deciding from the crop side accidentally sent it
-     * through the Java CPU path.  Classify the capture stream by its largest
-     * dimension instead; the GPU then keeps the camera's RGB/chroma detail
-     * while reducing the square crop to a decoder-sized plane. */
-    private static final int HIGH_RES_SOURCE_DIMENSION=3000;
-    private static final int HIGH_RES_DOWNSAMPLE=3;
+    /** Keep every ZXing channel above the largest RGB3 symbol grid in use. */
+    static final int MIN_DECODER_SIDE=708;
+    static final int MIN_420_CHROMA_SIDE=MIN_DECODER_SIDE*2;
+    private static final int DEFAULT_MAX_DOWNSAMPLE=4;
+    private static final int MAX_GPU_DOWNSAMPLE=4;
 
     /* BT.601 limited-range terms. Chroma contribution is shared by a 2x2 YUV
      * block, so the hot loop reads U/V and evaluates those products only once
@@ -42,41 +40,38 @@ final class Rgb3Yuv {
 
     private Rgb3Yuv() {}
 
-    static boolean isHighResolutionCapture(int sourceWidth, int sourceHeight) {
-        return Math.max(sourceWidth, sourceHeight) >= HIGH_RES_SOURCE_DIMENSION;
-    }
-
-    private static int normalizedFactor(int highResolutionFactor) {
-        return highResolutionFactor == 4 ? 4 : HIGH_RES_DOWNSAMPLE;
+    private static int normalizedMaximumFactor(int maximumFactor) {
+        return Math.max(1,Math.min(maximumFactor,MAX_GPU_DOWNSAMPLE));
     }
 
     static int decoderSide(int cropSide) {
-        return decoderSide(cropSide,HIGH_RES_DOWNSAMPLE);
+        return decoderSide(cropSide,DEFAULT_MAX_DOWNSAMPLE);
     }
 
-    static int decoderSide(int cropSide, int highResolutionFactor) {
-        int factor=normalizedFactor(highResolutionFactor);
-        return cropSide >= HIGH_RES_SOURCE_DIMENSION ? cropSide / factor : cropSide;
+    static int decoderSide(int cropSide, int maximumFactor) {
+        return cropSide/decoderDownsampleFactor(cropSide,maximumFactor);
     }
 
     static int decoderSideForCapture(int cropSide, int sourceWidth, int sourceHeight,
-            int highResolutionFactor) {
-        return isHighResolutionCapture(sourceWidth, sourceHeight)
-                ? cropSide / normalizedFactor(highResolutionFactor) : cropSide;
+            int maximumFactor) {
+        return decoderSide(cropSide,maximumFactor);
     }
 
     static int decoderDownsampleFactor(int cropSide) {
-        return decoderDownsampleFactor(cropSide,HIGH_RES_DOWNSAMPLE);
+        return decoderDownsampleFactor(cropSide,DEFAULT_MAX_DOWNSAMPLE);
     }
 
-    static int decoderDownsampleFactor(int cropSide, int highResolutionFactor) {
-        return cropSide >= HIGH_RES_SOURCE_DIMENSION ? normalizedFactor(highResolutionFactor) : 1;
+    /** Selects the largest cheap integer reduction that cannot take the
+     * decoder below its required input side. Small captures remain at 1x. */
+    static int decoderDownsampleFactor(int cropSide, int maximumFactor) {
+        if (cropSide <= 0) throw new IllegalArgumentException("invalid crop side");
+        int permitted=Math.max(1,cropSide/MIN_DECODER_SIDE);
+        return Math.min(normalizedMaximumFactor(maximumFactor),permitted);
     }
 
     static int decoderDownsampleFactorForCapture(int cropSide, int sourceWidth, int sourceHeight,
-            int highResolutionFactor) {
-        return isHighResolutionCapture(sourceWidth, sourceHeight)
-                ? normalizedFactor(highResolutionFactor) : 1;
+            int maximumFactor) {
+        return decoderDownsampleFactor(cropSide,maximumFactor);
     }
 
     /**
@@ -87,7 +82,7 @@ final class Rgb3Yuv {
      * bilinear sampling because it anti-aliases the CRT's one-pixel modules.
      */
     static int convertForDecode(Image image, Rect crop, ByteBuffer[] output, int[] histogram) {
-        return convertForDecode(image,crop,output,histogram,HIGH_RES_DOWNSAMPLE);
+        return convertForDecode(image,crop,output,histogram,DEFAULT_MAX_DOWNSAMPLE);
     }
 
     static int convertForDecode(Image image, Rect crop, ByteBuffer[] output, int[] histogram,

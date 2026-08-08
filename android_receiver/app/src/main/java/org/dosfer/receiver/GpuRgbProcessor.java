@@ -30,10 +30,14 @@ import java.util.concurrent.TimeUnit;
 final class GpuRgbProcessor {
     private static final String TAG = "DOSFER-GpuRgb";
     private static final int RING_SIZE = 2;
+    private static final long PREVIEW_INTERVAL_NANOS = 66_666_667L; // 15 FPS
+    static final int DROP_COALESCED = 1;
+    static final int DROP_PBO_BUSY = 2;
+    static final int DROP_DECODER_BUSY = 3;
 
     interface Listener {
         default void frameArrived(long cameraTimestampNanos) {}
-        default void dropped(int pendingReadbacks) {}
+        default void dropped(int reason, int pendingReadbacks) {}
         /** Cheap backpressure test. False means: keep preview current, but do
          * not spend GPU/readback bandwidth on a frame that cannot be decoded. */
         default boolean canAcceptPlanes() { return true; }
@@ -81,11 +85,15 @@ final class GpuRgbProcessor {
     private SurfaceTexture cameraTexture;
     private int cameraTextureId;
     private int planeProgram, previewProgram, framebuffer;
+    private int planeCameraUniform, planeMatrixUniform, planeCropUniform;
+    private int planeFactorUniform, planeOutputSideUniform;
+    private int previewCameraUniform, previewMatrixUniform, previewCropUniform;
     private final int[] planeTextures = new int[3];
     private int allocatedSide;
     private int requestedFactor;
     private volatile int nextFactor;
     private int nextSlot;
+    private long nextPreviewNanos;
     /* The SurfaceTexture listener can enqueue callbacks faster than a full
      * GLES/readback pass completes. Keep at most one expensive frame task
      * queued; updateTexImage() then latches the newest buffer and intentionally
@@ -102,7 +110,7 @@ final class GpuRgbProcessor {
         this.cropTop = crop.top;
         this.cropSide = crop.side;
         this.listener = listener;
-        requestedFactor = downsampleFactor == 4 ? 4 : 3;
+        requestedFactor = normalizeFactor(downsampleFactor);
         nextFactor = requestedFactor;
         for (int i = 0; i < slots.length; i++) slots[i] = new Slot();
     }
@@ -123,7 +131,11 @@ final class GpuRgbProcessor {
         return cameraSurface;
     }
 
-    void setDownsampleFactor(int factor) { nextFactor = factor == 4 ? 4 : 3; }
+    void setDownsampleFactor(int factor) { nextFactor = normalizeFactor(factor); }
+
+    private static int normalizeFactor(int factor) {
+        return Math.max(1,Math.min(factor,4));
+    }
 
     void stop() {
         stopping = true;
@@ -177,6 +189,7 @@ final class GpuRgbProcessor {
         cameraSurface = new Surface(cameraTexture);
         planeProgram = buildProgram(VERTEX_SHADER, PLANES_FRAGMENT_SHADER);
         previewProgram = buildProgram(VERTEX_SHADER, PREVIEW_FRAGMENT_SHADER);
+        cacheUniformLocations();
         int[] handles = new int[1];
         GLES30.glGenFramebuffers(1, handles, 0);
         framebuffer = handles[0];
@@ -196,7 +209,7 @@ final class GpuRgbProcessor {
             /* Deliberately discard the older signal. SurfaceTexture keeps the
              * latest producer buffer, so the queued task will latch the newest
              * image available when it runs. */
-            listener.dropped(pendingCount());
+            listener.dropped(DROP_COALESCED, pendingCount());
             return;
         }
         frameTaskQueued = true;
@@ -224,16 +237,23 @@ final class GpuRgbProcessor {
             /* Dispatch scanner work BEFORE preview presentation. eglSwapBuffers
              * belongs to the UI path and must not sit in front of QR decode. */
             Slot slot = slots[nextSlot];
-            if (!slot.pending && listener.canAcceptPlanes()) {
+            if (slot.pending) {
+                listener.dropped(DROP_PBO_BUSY, pendingCount());
+            } else if (!listener.canAcceptPlanes()) {
+                listener.dropped(DROP_DECODER_BUSY, pendingCount());
+            } else {
                 long dispatchStart = System.nanoTime();
                 drawPlanes(slot, timestamp, arrivalNanos, dispatchStart);
                 nextSlot = (nextSlot + 1) % slots.length;
-            } else {
-                listener.dropped(pendingCount());
             }
 
-            /* Preview is best-effort and is intentionally last. */
-            drawPreview();
+            /* Preview is best-effort, intentionally last, and capped at 15 FPS
+             * so display composition cannot consume every camera interval. */
+            long previewNow = System.nanoTime();
+            if (previewNow >= nextPreviewNanos) {
+                drawPreview();
+                nextPreviewNanos = previewNow + PREVIEW_INTERVAL_NANOS;
+            }
         } catch (RuntimeException e) {
             Log.w(TAG, "GPU frame failed", e);
             listener.gpuError("GPU preprocessing failed: " + e.getMessage());
@@ -252,7 +272,7 @@ final class GpuRgbProcessor {
     }
 
     private void ensureTargets(int factor) {
-        requestedFactor = factor == 4 ? 4 : 3;
+        requestedFactor = normalizeFactor(factor);
         int side = cropSide / requestedFactor;
         if (side == allocatedSide) return;
         allocatedSide = side;
@@ -286,9 +306,13 @@ final class GpuRgbProcessor {
         GLES30.glViewport(0, 0, allocatedSide, allocatedSide);
         GLES30.glDrawBuffers(3, drawBuffers, 0);
         GLES30.glUseProgram(planeProgram);
-        bindCommonUniforms(planeProgram, requestedFactor, true);
+        bindPlaneUniforms();
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
         GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, slot.pbo);
+        /* At 4x the 750px R8 rows are not four-byte aligned. The default
+         * GL_PACK_ALIGNMENT would pad every row to 752 bytes and make a
+         * 750x750 readback exceed its tightly sized PBO plane. */
+        GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1);
         for (int channel = 0; channel < 3; channel++) {
             GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0 + channel);
             GLES30.glReadPixels(0, 0, allocatedSide, allocatedSide, GLES30.GL_RED,
@@ -345,24 +369,47 @@ final class GpuRgbProcessor {
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0);
         GLES30.glViewport(0, 0, width, height);
         GLES30.glUseProgram(previewProgram);
-        bindCommonUniforms(previewProgram, 1, false);
+        bindPreviewUniforms();
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
         EGL14.eglSwapBuffers(display, window);
     }
 
-    private void bindCommonUniforms(int program, int factor, boolean planes) {
+    private void bindPlaneUniforms() {
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
-        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uCamera"), 0);
-        GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uTextureMatrix"), 1,
+        GLES30.glUniform1i(planeCameraUniform, 0);
+        GLES30.glUniformMatrix4fv(planeMatrixUniform, 1,
                 false, textureMatrix, 0);
-        GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "uCrop"),
+        GLES30.glUniform4f(planeCropUniform,
                 logicalCrop[0], logicalCrop[1], logicalCrop[2], logicalCrop[3]);
-        if (planes) {
-            GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uSourceSize"), sourceWidth, sourceHeight);
-            GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uFactor"), factor);
-            GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uOutputSide"), allocatedSide);
-        }
+        GLES30.glUniform1i(planeFactorUniform, requestedFactor);
+        GLES30.glUniform1i(planeOutputSideUniform, allocatedSide);
+    }
+
+    private void bindPreviewUniforms() {
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+        GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
+        GLES30.glUniform1i(previewCameraUniform, 0);
+        GLES30.glUniformMatrix4fv(previewMatrixUniform, 1, false, textureMatrix, 0);
+        GLES30.glUniform4f(previewCropUniform,
+                logicalCrop[0], logicalCrop[1], logicalCrop[2], logicalCrop[3]);
+    }
+
+    private void cacheUniformLocations() {
+        planeCameraUniform = uniform(planeProgram, "uCamera");
+        planeMatrixUniform = uniform(planeProgram, "uTextureMatrix");
+        planeCropUniform = uniform(planeProgram, "uCrop");
+        planeFactorUniform = uniform(planeProgram, "uFactor");
+        planeOutputSideUniform = uniform(planeProgram, "uOutputSide");
+        previewCameraUniform = uniform(previewProgram, "uCamera");
+        previewMatrixUniform = uniform(previewProgram, "uTextureMatrix");
+        previewCropUniform = uniform(previewProgram, "uCrop");
+    }
+
+    private static int uniform(int program, String name) {
+        int location = GLES30.glGetUniformLocation(program, name);
+        if (location < 0) throw new IllegalStateException("missing shader uniform " + name);
+        return location;
     }
 
     /**
@@ -504,17 +551,27 @@ final class GpuRgbProcessor {
             + "#extension GL_OES_EGL_image_external_essl3 : require\n"
             + "precision highp float;\n"
             + "uniform samplerExternalOES uCamera; uniform mat4 uTextureMatrix;\n"
-            + "uniform vec4 uCrop; uniform vec2 uSourceSize; uniform int uFactor; uniform int uOutputSide;\n"
+            + "uniform vec4 uCrop; uniform int uFactor; uniform int uOutputSide;\n"
             + "layout(location=0) out vec4 outR; layout(location=1) out vec4 outG; layout(location=2) out vec4 outB;\n"
             + "vec3 sampleRgb(vec2 p) { return texture(uCamera, (uTextureMatrix * vec4(p,0.0,1.0)).xy).rgb; }\n"
+            + "vec3 sampleSource(vec2 p) { vec2 uv=uCrop.xy+(p/float(uOutputSide*uFactor))*uCrop.zw; return sampleRgb(uv); }\n"
             + "void main() {\n"
             + "  float outputY = float(int(gl_FragCoord.y - 0.5));\n"
             + "  outputY = float(uOutputSide - 1) - outputY;\n"
-            + "  vec2 outputPixel=vec2(gl_FragCoord.x-0.5,outputY); vec3 total=vec3(0.0);\n"
-            + "  for (int y=0;y<4;y++) for (int x=0;x<4;x++) { if (x<uFactor && y<uFactor) {\n"
-            + "    vec2 sourcePixel=outputPixel*float(uFactor)+vec2(float(x)+0.5,float(y)+0.5);\n"
-            + "    vec2 uv=uCrop.xy+(sourcePixel/float(uOutputSide*uFactor))*uCrop.zw; total+=sampleRgb(uv); }}\n"
-            + "  total/=float(uFactor*uFactor); outR=vec4(total.r); outG=vec4(total.g); outB=vec4(total.b);\n"
+            + "  vec2 base=vec2(gl_FragCoord.x-0.5,outputY)*float(uFactor);\n"
+            + "  vec3 total;\n"
+            + "  if (uFactor==1) total=sampleSource(base+vec2(0.5));\n"
+            + "  else if (uFactor==2) total=sampleSource(base+vec2(1.0));\n"
+            + "  else {\n"
+            + "    float farOffset=uFactor==4?3.0:2.5; float nearWeight=uFactor==4?0.5:0.666666667;\n"
+            + "    float farWeight=1.0-nearWeight;\n"
+            + "    vec3 nearRow=sampleSource(base+vec2(1.0,1.0))*nearWeight\n"
+            + "        +sampleSource(base+vec2(farOffset,1.0))*farWeight;\n"
+            + "    vec3 farRow=sampleSource(base+vec2(1.0,farOffset))*nearWeight\n"
+            + "        +sampleSource(base+vec2(farOffset,farOffset))*farWeight;\n"
+            + "    total=nearRow*nearWeight+farRow*farWeight;\n"
+            + "  }\n"
+            + "  outR=vec4(total.r); outG=vec4(total.g); outB=vec4(total.b);\n"
             + "}\n";
 
     private static final String PREVIEW_FRAGMENT_SHADER = "#version 300 es\n"

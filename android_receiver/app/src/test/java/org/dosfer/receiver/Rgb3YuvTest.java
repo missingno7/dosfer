@@ -7,18 +7,24 @@ import java.util.Random;
 import static org.junit.Assert.*;
 
 public class Rgb3YuvTest {
-    @Test public void highResolutionLandscapeCaptureUsesGpuSizedDecoderPlane() {
-        assertTrue(Rgb3Yuv.isHighResolutionCapture(3648,2736));
+    @Test public void decoderNeverDownsamplesBelowRequiredSide() {
         assertEquals(3,Rgb3Yuv.decoderDownsampleFactorForCapture(2736,3648,2736,3));
         assertEquals(912,Rgb3Yuv.decoderSideForCapture(2736,3648,2736,3));
-        assertEquals(4,Rgb3Yuv.decoderDownsampleFactorForCapture(2736,3648,2736,4));
-        assertEquals(684,Rgb3Yuv.decoderSideForCapture(2736,3648,2736,4));
+        assertEquals(3,Rgb3Yuv.decoderDownsampleFactorForCapture(2736,3648,2736,4));
+        assertEquals(912,Rgb3Yuv.decoderSideForCapture(2736,3648,2736,4));
     }
 
-    @Test public void ordinaryCaptureRemainsFullCrop() {
-        assertFalse(Rgb3Yuv.isHighResolutionCapture(1920,1080));
+    @Test public void factorAdaptsToCropRatherThanSourceClassification() {
         assertEquals(1,Rgb3Yuv.decoderDownsampleFactorForCapture(1080,1920,1080,3));
         assertEquals(1080,Rgb3Yuv.decoderSideForCapture(1080,1920,1080,3));
+        assertEquals(2,Rgb3Yuv.decoderDownsampleFactorForCapture(1440,1920,1440,4));
+        assertEquals(720,Rgb3Yuv.decoderSideForCapture(1440,1920,1440,4));
+        assertEquals(3,Rgb3Yuv.decoderDownsampleFactorForCapture(2160,3840,2160,4));
+        assertEquals(720,Rgb3Yuv.decoderSideForCapture(2160,3840,2160,4));
+        assertEquals(4,Rgb3Yuv.decoderDownsampleFactorForCapture(2992,2992,2992,4));
+        assertEquals(748,Rgb3Yuv.decoderSideForCapture(2992,2992,2992,4));
+        assertEquals(4,Rgb3Yuv.decoderDownsampleFactorForCapture(3000,4000,3000,4));
+        assertEquals(750,Rgb3Yuv.decoderSideForCapture(3000,4000,3000,4));
     }
 
     @Test public void convertsBt601RedToIndependentChannels() {

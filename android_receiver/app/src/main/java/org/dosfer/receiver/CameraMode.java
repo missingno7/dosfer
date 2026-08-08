@@ -1,6 +1,7 @@
 package org.dosfer.receiver;
 
 import android.graphics.Rect;
+import android.graphics.SurfaceTexture;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.graphics.ImageFormat;
 import android.util.Range;
@@ -11,7 +12,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 
-/** A discovered YUV stream and the capability facts Camera2 exposes for it. */
+/** A discovered PRIVATE/OES stream and the capability facts Camera2 exposes for it. */
 public final class CameraMode {
     public final int width;
     public final int height;
@@ -38,11 +39,14 @@ public final class CameraMode {
 
     public static List<CameraMode> discover(StreamConfigurationMap map) {
         if (map == null) return Collections.emptyList();
-        Size[] sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
+        Size[] sizes = map.getOutputSizes(SurfaceTexture.class);
+        boolean privateOutput=sizes!=null&&sizes.length>0;
+        if (!privateOutput) sizes=map.getOutputSizes(ImageFormat.YUV_420_888);
         if (sizes == null) return Collections.emptyList();
         List<CameraMode> result = new ArrayList<>();
         for (Size size : sizes) {
-            long duration = map.getOutputMinFrameDuration(ImageFormat.YUV_420_888, size);
+            long duration=privateOutput?map.getOutputMinFrameDuration(SurfaceTexture.class,size)
+                    :map.getOutputMinFrameDuration(ImageFormat.YUV_420_888,size);
             result.add(new CameraMode(size.getWidth(), size.getHeight(), duration));
         }
         return result;
@@ -51,23 +55,35 @@ public final class CameraMode {
     public static List<CameraMode> ranked(List<CameraMode> modes, int requestedFps) {
         List<CameraMode> result = new ArrayList<>(modes);
         result.sort(Comparator.comparingLong((CameraMode mode) -> rank(mode, requestedFps))
-                .thenComparingLong((CameraMode mode) -> -(long) mode.width * mode.height));
+                /* Once colour detail and frame rate are satisfied, prefer the
+                 * least camera/ISP bandwidth. On the tested phone this makes
+                 * 1920x1440 the ideal 60 FPS RGB3 stream. If no mode has enough
+                 * 4:2:0 chroma detail, retain as much crop resolution as the
+                 * camera offers instead of accidentally choosing VGA. */
+                .thenComparingLong(CameraMode::bandwidthRank)
+                .thenComparingLong((CameraMode mode) -> (long)mode.width*mode.height));
         return result;
     }
 
-    /** Lower is better. The first five tiers implement the requested automatic policy. */
+    private static long bandwidthRank(CameraMode mode) {
+        int cropSide=Math.min(mode.width,mode.height);
+        return cropSide>=Rgb3Yuv.MIN_420_CHROMA_SIDE
+                ? (long)mode.width*mode.height : -cropSide;
+    }
+
+    /** Lower is better. A 4:2:0 stream needs at least twice the decoder side
+     * in its square crop to preserve the required independent colour grid.
+     * Colour adequacy deliberately precedes advertised frame duration because
+     * several Samsung modes sustain 60 FPS despite publishing a 30 FPS
+     * minimum-frame-duration entry. Measured FPS remains visible in the UI. */
     public static long rank(CameraMode mode, int requestedFps) {
+        int cropSide=Math.min(mode.width,mode.height);
+        int colourTier=cropSide>=Rgb3Yuv.MIN_420_CHROMA_SIDE?0:1;
         int fpsTier = requestedFps == 60 && mode.theoretically60Fps ? 0
                 : requestedFps == 30 && theoreticallyCapable(mode.theoreticalMaxFps, 30) ? 1
                 : mode.theoretically60Fps ? 2
                 : theoreticallyCapable(mode.theoreticalMaxFps, 30) ? 3 : 4;
-        int shapeTier;
-        if (mode.width == 1440 && mode.height == 1080 || mode.width == 1080 && mode.height == 1440) shapeTier = 0;
-        else if (mode.width == 1920 && mode.height == 1080 || mode.width == 1080 && mode.height == 1920) shapeTier = 1;
-        else if (mode.width == 1088 && mode.height == 1088) shapeTier = 2;
-        else if (mode.shorterSideAtLeast1000) shapeTier = 3;
-        else shapeTier = 4;
-        return (long) fpsTier * 100 + shapeTier * 10 + (mode.shorterSideAtLeast1000 ? 0 : 1);
+        return (long)colourTier*100+fpsTier;
     }
 
     public static CameraMode chooseAutomatic(List<CameraMode> modes, int requestedFps) {

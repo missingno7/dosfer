@@ -34,3 +34,43 @@ GPU latency fix:
 - GPU timing no longer subtracts SurfaceTexture.getTimestamp() from
   System.nanoTime(). SurfaceTexture timestamps have a source-defined zero point,
   so local latch time is used for valid latency measurements.
+
+Streaming performance follow-up:
+- Removed ZXing TryHarder recovery from every live Camera2 path. A failed image
+  is now released immediately so a native worker cannot spend hundreds of
+  milliseconds rescuing pixels that have already been replaced by newer camera
+  frames.
+- Replaced the 3x3/4x4 per-pixel GPU sampling loops with four weighted bilinear
+  samples. The weights reproduce the same box average while reducing external
+  camera-texture fetches from 9 or 16 to 4 per decoder pixel.
+- Once a window is classified as BW, the GPU path decodes only its green lane,
+  matching the existing direct-Y Camera2 fast path.
+- Best-effort preview presentation is capped at 15 FPS, and shader uniform
+  locations are cached outside the frame loop.
+- GPU drops are reported separately for coalesced camera signals, occupied PBO
+  slots, unavailable decoder workers, and readback submission races.
+- The large diagnostic text block refreshes once per second instead of four
+  times per second.
+- Set GL_PACK_ALIGNMENT to one before R8 PBO readback. This is required for
+  the 750px-wide 4x planes: the GLES default four-byte row padding otherwise
+  overruns the tightly allocated PBO and stops GPU dispatch.
+
+Adaptive GPU capture follow-up:
+- All camera modes now attempt the PRIVATE SurfaceTexture/GLES3 path first;
+  direct YUV conversion is retained only as a GLES setup fallback.
+- Resolution discovery and minimum-duration estimates use the PRIVATE
+  SurfaceTexture table that the active GPU session actually consumes, with
+  YUV_420_888 discovery only as a compatibility fallback.
+- Downsampling is selected from the square crop rather than a source-size
+  threshold. The largest 1x-4x factor that keeps each ZXing plane at least
+  708px is used (for example 1440->720 at 2x, 2160->720 at 3x, and
+  3000->750 at 4x).
+- Automatic RGB3 mode ranking requires a 4:2:0 chroma grid of at least
+  708x708 where possible, then minimizes camera/ISP pixel bandwidth. On the
+  tested SM-S928B this selects 1920x1440 at 60 FPS.
+- Auto FPS tries a camera-advertised global 60 FPS range even when a stream's
+  conservative minimum-duration metadata says 30 FPS; measured statistics
+  still report whether the session actually runs at 60 or falls back to 30.
+- Successful QR payloads are handed to a bounded, ordered session-store queue.
+  Filesystem writes and parity recovery no longer run while a native decoder
+  worker is marked busy; queue depth and overflow drops are visible in stats.

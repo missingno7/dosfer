@@ -43,7 +43,6 @@ import zxingcpp.BarcodeReader;
 
 public final class CameraScanner {
     private static final String TAG = "DOSFER-Camera";
-    private static final int TRY_HARDER_EVERY_MISS = 3;
     private static final long CLASSIFICATION_WARMUP_NANOS = 3_000_000_000L;
 
     public interface Listener {
@@ -63,16 +62,17 @@ public final class CameraScanner {
         public int previewWidth, previewHeight, displayRotation, sensorOrientation, relativeRotation;
         public float previewScale;
         public long cameraFrames, sensorFrames, imageReaderFrames, attempts, successes, failures;
-        public long busyDrops, fallbackAttempts, fallbackSuccesses, exposureTimeNanos, sensorFrameDurationNanos;
-        public long fullDetectorAttempts, recoveryAttempts, recoverySuccesses;
+        public long busyDrops, exposureTimeNanos, sensorFrameDurationNanos;
+        public long fullDetectorAttempts;
         public long channelAttempts, channelSuccesses, logicalFrames;
         public long rgbConversions, rgbConversionNanos;
         public boolean gpuRgb;
         public long gpuFrames, gpuDispatches, gpuReadbacks, gpuDecodedFrames, gpuBusyDrops;
+        public long gpuCoalescedDrops, gpuPboDrops, gpuDecoderDrops, gpuSubmitDrops;
         public long gpuArrivalToDispatchNanos, gpuCommandNanos, gpuReadbackNanos, gpuCopyNanos, gpuEndToEndNanos, gpuQueueDepth;
         public final long[] channelDecodeNanos = new long[Rgb3Yuv.CHANNELS];
         public final long[] channelDecodeAttempts = new long[Rgb3Yuv.CHANNELS];
-        public long fullDetectorTotalNanos, fullDetectorMaxNanos, recoveryTotalNanos, recoveryMaxNanos;
+        public long fullDetectorTotalNanos, fullDetectorMaxNanos;
         public double cameraFps, sensorFps, imageReaderFps, attemptFps, avgAttemptMs, maxAttemptMs;
     }
 
@@ -82,7 +82,6 @@ public final class CameraScanner {
     private final CameraSettings.Selection selection;
     private final Object statsLock = new Object();
     private final Object payloadLock = new Object();
-    private final AtomicLong missOrdinal = new AtomicLong();
     private final AtomicLong nextDiagnosticNanos = new AtomicLong();
     private final Rgb3DecoderPolicy.Detector rgbDetector = new Rgb3DecoderPolicy.Detector();
 
@@ -104,21 +103,22 @@ public final class CameraScanner {
     private long firstImageTimestamp, lastImageTimestamp, firstSensorTimestamp, lastSensorTimestamp;
     private long firstRuntimeNanos;
     private long cameraFrames, sensorFrames, imageReaderFrames, attempts, successes, failures, busyDrops;
-    private long fallbackAttempts, fallbackSuccesses, totalAttemptNanos, maxAttemptNanos;
-    private long fullDetectorAttempts, recoveryAttempts, recoverySuccesses;
+    private long totalAttemptNanos, maxAttemptNanos;
+    private long fullDetectorAttempts;
     private long channelAttempts, channelSuccesses, logicalFrames;
     private long rgbConversions, rgbConversionNanos;
     private long gpuFrames, gpuDispatches, gpuReadbacks, gpuDecodedFrames, gpuBusyDrops;
+    private long gpuCoalescedDrops, gpuPboDrops, gpuDecoderDrops, gpuSubmitDrops;
     private long gpuArrivalToDispatchNanos, gpuCommandNanos, gpuReadbackNanos, gpuCopyNanos, gpuEndToEndNanos, gpuQueueDepth;
     private final long[] channelDecodeNanos = new long[Rgb3Yuv.CHANNELS];
     private final long[] channelDecodeAttempts = new long[Rgb3Yuv.CHANNELS];
-    private long fullDetectorTotalNanos, fullDetectorMaxNanos, recoveryTotalNanos, recoveryMaxNanos;
+    private long fullDetectorTotalNanos, fullDetectorMaxNanos;
     private long exposureTimeNanos, sensorFrameDurationNanos;
     private String cameraId = "-", sessionStatus = "opening";
     private int sensorOrientation, lensFacing = CameraCharacteristics.LENS_FACING_BACK;
     private boolean awbLockAvailable;
     private volatile int diagnosticChannel = -1;
-    private volatile int highResolutionDownsample = 3;
+    private volatile int highResolutionDownsample = 4;
     private int previewWidth, previewHeight, previewDisplayRotation, previewRelativeRotation;
     private float previewScale;
     private final View.OnLayoutChangeListener previewLayoutListener = (v, left, top, right, bottom,
@@ -176,13 +176,20 @@ public final class CameraScanner {
             decodeWidth = Rgb3Yuv.decoderSideForCapture(captureCrop.side,
                     captureWidth, captureHeight, highResolutionDownsample);
             decodeHeight = decodeWidth;
-            /* The high-resolution RGB3 experiment uses an OES camera surface
-             * so the ISP conversion and our RGB box filter stay on the GPU.
-             * Smaller/BW-friendly modes retain the existing direct Y plane. */
-            gpuRgbPath = Rgb3Yuv.isHighResolutionCapture(captureWidth, captureHeight);
-            targetFps = selection.targetFps == 30 || selection.targetFps == 60
-                    ? selection.targetFps : (selectedMode.theoretically60Fps ? 60 : 30);
+            /* Every RGB3 mode starts on the OES/GLES path. PRIVATE camera
+             * buffers let the HAL perform its native YUV-to-RGB conversion,
+             * after which the GPU reduces the crop before any CPU readback.
+             * createSession retains the direct YUV path only as a GLES setup
+             * fallback for incompatible devices. */
+            gpuRgbPath = true;
             Range<Integer>[] ranges = cc.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+            /* Stream minimum-duration tables are conservative on this Samsung:
+             * several nominal 30 FPS modes run at a measured 60 FPS. In Auto,
+             * try the camera's global fixed/compatible 60 range and let the
+             * live statistics identify a real 30 FPS fallback. */
+            targetFps = selection.targetFps == 30 || selection.targetFps == 60
+                    ? selection.targetFps
+                    : CameraMode.fixedOrCompatibleRange(ranges,60) != null?60:30;
             configuredFpsRange = CameraMode.fixedOrCompatibleRange(ranges, targetFps);
             sessionStatus = "opening";
             Log.i(TAG, "camera=" + cameraId + " mode=" + selectedMode.key()
@@ -237,11 +244,15 @@ public final class CameraScanner {
             Surface previewSurface;
             if (gpuRgbPath) {
                 try {
+                    int downsample=Rgb3Yuv.decoderDownsampleFactorForCapture(captureCrop.side,
+                            width,height,highResolutionDownsample);
                     gpuProcessor = new GpuRgbProcessor(preview.getSurfaceTexture(), width, height,
-                            captureCrop, highResolutionDownsample,
+                            captureCrop, downsample,
                             new GpuRgbProcessor.Listener() {
                         @Override public void frameArrived(long timestamp) { gpuFrameArrived(timestamp); }
-                        @Override public void dropped(int queueDepth) { gpuFrameDropped(queueDepth); }
+                        @Override public void dropped(int reason, int queueDepth) {
+                            gpuFrameDropped(reason, queueDepth);
+                        }
                         @Override public boolean canAcceptPlanes() { return gpuCanAcceptPlanes(); }
                         @Override public boolean planes(ByteBuffer[] source, int side, long timestamp,
                                 long arrivalNanos, long dispatchNanos, long commandNanos,
@@ -455,7 +466,7 @@ public final class CameraScanner {
                 return true;
             }
         }
-        synchronized (statsLock) { gpuBusyDrops++; busyDrops++; }
+        synchronized (statsLock) { gpuSubmitDrops++; gpuBusyDrops++; busyDrops++; }
         return false;
     }
 
@@ -483,8 +494,11 @@ public final class CameraScanner {
         }
     }
 
-    private void gpuFrameDropped(int queueDepth) {
+    private void gpuFrameDropped(int reason, int queueDepth) {
         synchronized (statsLock) {
+            if (reason == GpuRgbProcessor.DROP_COALESCED) gpuCoalescedDrops++;
+            else if (reason == GpuRgbProcessor.DROP_PBO_BUSY) gpuPboDrops++;
+            else if (reason == GpuRgbProcessor.DROP_DECODER_BUSY) gpuDecoderDrops++;
             gpuBusyDrops++;
             busyDrops++;
             gpuQueueDepth += queueDepth;
@@ -578,9 +592,6 @@ public final class CameraScanner {
             return side;
         }
 
-        void resetReaders() {
-            for (BarcodeReader reader : qrReaders) reader.getOptions().setTryHarder(false);
-        }
         void release() { busy.set(false); }
         void shutdown() { accepting = false; thread.quitSafely(); }
         void await() { try { thread.join(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
@@ -589,7 +600,6 @@ public final class CameraScanner {
     private void decodeFrame(DecodeWorker worker, Image image, Rect crop) {
         long start = System.nanoTime();
         byte[][] candidates = new byte[Rgb3Yuv.CHANNELS][];
-        boolean fallbackTried = false, fallbackRecovered = false;
         boolean rgbDecode = rgbDetector.mode() != Rgb3DecoderPolicy.Mode.BW;
         MediaImageProxy monoProxy = null;
         try {
@@ -604,34 +614,14 @@ public final class CameraScanner {
                 }
                 publishDiagnosticPlane(worker,side);
 
-                boolean missing = false;
                 for (int channel = 0; channel < Rgb3Yuv.CHANNELS; channel++) {
                     long pathStart = System.nanoTime();
                     synchronized (statsLock) { fullDetectorAttempts++; channelAttempts++; }
-                    candidates[channel] = decode(worker.qrReaders[channel], worker.channelImages[channel], false);
+                    candidates[channel] = decode(worker.qrReaders[channel], worker.channelImages[channel]);
                     long pathElapsed = System.nanoTime() - pathStart;
-                    recordPath(1, pathElapsed);
+                    recordDetector(pathElapsed);
                     recordChannel(channel, pathElapsed);
-                    if (candidates[channel] == null) missing = true;
-                    else synchronized (statsLock) { channelSuccesses++; }
-                }
-
-                if (missing && missOrdinal.incrementAndGet() % TRY_HARDER_EVERY_MISS == 0) {
-                    fallbackTried = true;
-                    synchronized (statsLock) { recoveryAttempts++; }
-                    for (int channel = 0; channel < Rgb3Yuv.CHANNELS; channel++) {
-                        if (candidates[channel] != null) continue;
-                        long recoveryStart = System.nanoTime();
-                        synchronized (statsLock) { fullDetectorAttempts++; channelAttempts++; }
-                        candidates[channel] = decode(worker.qrReaders[channel], worker.channelImages[channel], true);
-                        long recoveryElapsed = System.nanoTime() - recoveryStart;
-                        recordPath(2, recoveryElapsed);
-                        recordChannel(channel, recoveryElapsed);
-                        if (candidates[channel] != null) {
-                            fallbackRecovered = true;
-                            synchronized (statsLock) { recoverySuccesses++; channelSuccesses++; }
-                        }
-                    }
+                    if (candidates[channel] != null) synchronized (statsLock) { channelSuccesses++; }
                 }
             } else {
                 /* In a detected legacy BW window the Camera2 Y plane already
@@ -641,30 +631,16 @@ public final class CameraScanner {
                 int channel = Rgb3Yuv.GREEN;
                 long pathStart = System.nanoTime();
                 synchronized (statsLock) { fullDetectorAttempts++; channelAttempts++; }
-                candidates[channel] = decode(worker.qrReaders[channel], monoProxy, false);
+                candidates[channel] = decode(worker.qrReaders[channel], monoProxy);
                 long pathElapsed = System.nanoTime() - pathStart;
-                recordPath(1, pathElapsed);
+                recordDetector(pathElapsed);
                 recordChannel(channel, pathElapsed);
                 if (candidates[channel] != null) synchronized (statsLock) { channelSuccesses++; }
-                else if (missOrdinal.incrementAndGet() % TRY_HARDER_EVERY_MISS == 0) {
-                    fallbackTried = true;
-                    long recoveryStart = System.nanoTime();
-                    synchronized (statsLock) { recoveryAttempts++; fullDetectorAttempts++; channelAttempts++; }
-                    candidates[channel] = decode(worker.qrReaders[channel], monoProxy, true);
-                    long recoveryElapsed = System.nanoTime() - recoveryStart;
-                    recordPath(2, recoveryElapsed);
-                    recordChannel(channel, recoveryElapsed);
-                    if (candidates[channel] != null) {
-                        fallbackRecovered = true;
-                        synchronized (statsLock) { recoverySuccesses++; channelSuccesses++; }
-                    }
-                }
             }
         } catch (RuntimeException e) {
             Log.w(TAG, "RGB3 camera decode failed", e);
         } finally {
             if (monoProxy != null) monoProxy.close(); else image.close();
-            worker.resetReaders();
             long elapsed = System.nanoTime() - start;
             try {
                 List<byte[]> unique = rgbDetector.accept(candidates);
@@ -674,10 +650,6 @@ public final class CameraScanner {
                     if (elapsed > maxAttemptNanos) maxAttemptNanos = elapsed;
                     if (unique.isEmpty()) failures++; else successes++;
                     logicalFrames += unique.size();
-                    if (fallbackTried) {
-                        fallbackAttempts++;
-                        if (fallbackRecovered) fallbackSuccesses++;
-                    }
                 }
                 if (running) for (byte[] payload : unique)
                     if (markDelivered(payload)) listener.payload(payload, elapsed);
@@ -691,28 +663,26 @@ public final class CameraScanner {
     private void decodeGpuFrame(DecodeWorker worker, int side, long timestamp, long arrivalNanos) {
         long start = System.nanoTime();
         byte[][] candidates = new byte[Rgb3Yuv.CHANNELS][];
-        boolean fallbackTried = false, fallbackRecovered = false;
         try {
             publishDiagnosticPlane(worker, side);
-            boolean missing = false;
-            for (int channel = 0; channel < Rgb3Yuv.CHANNELS; channel++) {
+            boolean bw = rgbDetector.mode() == Rgb3DecoderPolicy.Mode.BW;
+            int firstChannel = bw ? Rgb3Yuv.GREEN : Rgb3Yuv.RED;
+            int lastChannel = bw ? Rgb3Yuv.GREEN : Rgb3Yuv.BLUE;
+            for (int channel = firstChannel; channel <= lastChannel; channel++) {
                 long pathStart = System.nanoTime();
                 synchronized (statsLock) { fullDetectorAttempts++; channelAttempts++; }
-                candidates[channel] = decode(worker.qrReaders[channel], worker.channelImages[channel], false);
+                candidates[channel] = decode(worker.qrReaders[channel], worker.channelImages[channel]);
                 long pathElapsed = System.nanoTime() - pathStart;
-                recordPath(1, pathElapsed);
+                recordDetector(pathElapsed);
                 recordChannel(channel, pathElapsed);
-                if (candidates[channel] == null) missing = true;
-                else synchronized (statsLock) { channelSuccesses++; }
+                if (candidates[channel] != null) synchronized (statsLock) { channelSuccesses++; }
             }
-            /* Fast streaming path: never spend hundreds of milliseconds (or
-             * seconds) trying to rescue an old physical frame. Missing lanes
-             * are allowed by the RGB/parity protocol; the next camera frame is
-             * more valuable than TryHarder recovery on stale pixels. */
+            /* Fast streaming path: missing lanes are allowed by the RGB/parity
+             * protocol, so the next camera frame is more valuable than
+             * synchronous recovery on stale pixels. */
         } catch (RuntimeException e) {
             Log.w(TAG, "GPU RGB3 decode failed", e);
         } finally {
-            worker.resetReaders();
             long elapsed = System.nanoTime() - start;
             try {
                 List<byte[]> unique = rgbDetector.accept(candidates);
@@ -722,10 +692,6 @@ public final class CameraScanner {
                     if (elapsed > maxAttemptNanos) maxAttemptNanos = elapsed;
                     if (unique.isEmpty()) failures++; else successes++;
                     logicalFrames += unique.size();
-                    if (fallbackTried) {
-                        fallbackAttempts++;
-                        if (fallbackRecovered) fallbackSuccesses++;
-                    }
                     gpuDecodedFrames++;
                     gpuEndToEndNanos += Math.max(0, System.nanoTime() - arrivalNanos);
                 }
@@ -761,16 +727,10 @@ public final class CameraScanner {
         listener.decoderPlane(channel,side,side,copy);
     }
 
-    /** path 1 = normal full detector, path 2 = try-harder recovery */
-    private void recordPath(int path, long elapsed) {
+    private void recordDetector(long elapsed) {
         synchronized (statsLock) {
-            if (path == 1) {
-                fullDetectorTotalNanos += elapsed;
-                if (elapsed > fullDetectorMaxNanos) fullDetectorMaxNanos = elapsed;
-            } else {
-                recoveryTotalNanos += elapsed;
-                if (elapsed > recoveryMaxNanos) recoveryMaxNanos = elapsed;
-            }
+            fullDetectorTotalNanos += elapsed;
+            if (elapsed > fullDetectorMaxNanos) fullDetectorMaxNanos = elapsed;
         }
     }
 
@@ -781,12 +741,7 @@ public final class CameraScanner {
         }
     }
 
-    private static byte[] decode(BarcodeReader reader, ImageProxy image, boolean tryHarder) {
-        reader.getOptions().setTryHarder(tryHarder);
-        reader.getOptions().setTryRotate(false);
-        reader.getOptions().setTryInvert(false);
-        reader.getOptions().setTryDownscale(false);
-        reader.getOptions().setTryDenoise(false);
+    private static byte[] decode(BarcodeReader reader, ImageProxy image) {
         for (BarcodeReader.Result result : reader.read(image)) {
             if (result.getFormat() != BarcodeReader.Format.QR_CODE) continue;
             byte[] b = result.getBytes();
@@ -904,9 +859,7 @@ public final class CameraScanner {
             s.workerCount = selection.decodeWorkers;
             s.cameraFrames = cameraFrames; s.sensorFrames = sensorFrames; s.imageReaderFrames = imageReaderFrames;
             s.attempts = attempts; s.successes = successes; s.failures = failures; s.busyDrops = busyDrops;
-            s.fallbackAttempts = fallbackAttempts; s.fallbackSuccesses = fallbackSuccesses;
             s.fullDetectorAttempts = fullDetectorAttempts;
-            s.recoveryAttempts = recoveryAttempts; s.recoverySuccesses = recoverySuccesses;
             s.channelAttempts = channelAttempts; s.channelSuccesses = channelSuccesses;
             s.logicalFrames = logicalFrames;
             s.rgbConversions = rgbConversions; s.rgbConversionNanos = rgbConversionNanos;
@@ -914,6 +867,8 @@ public final class CameraScanner {
             s.gpuFrames = gpuFrames; s.gpuDispatches = gpuDispatches; s.gpuReadbacks = gpuReadbacks;
             s.gpuDecodedFrames = gpuDecodedFrames;
             s.gpuBusyDrops = gpuBusyDrops; s.gpuArrivalToDispatchNanos = gpuArrivalToDispatchNanos;
+            s.gpuCoalescedDrops = gpuCoalescedDrops; s.gpuPboDrops = gpuPboDrops;
+            s.gpuDecoderDrops = gpuDecoderDrops; s.gpuSubmitDrops = gpuSubmitDrops;
             s.gpuCommandNanos = gpuCommandNanos;
             s.gpuReadbackNanos = gpuReadbackNanos; s.gpuCopyNanos = gpuCopyNanos;
             s.gpuEndToEndNanos = gpuEndToEndNanos; s.gpuQueueDepth = gpuQueueDepth;
@@ -921,7 +876,6 @@ public final class CameraScanner {
             System.arraycopy(channelDecodeAttempts, 0, s.channelDecodeAttempts, 0, Rgb3Yuv.CHANNELS);
             s.rgbMode = rgbDetector.mode().name();
             s.fullDetectorTotalNanos = fullDetectorTotalNanos; s.fullDetectorMaxNanos = fullDetectorMaxNanos;
-            s.recoveryTotalNanos = recoveryTotalNanos; s.recoveryMaxNanos = recoveryMaxNanos;
             s.exposureTimeNanos = exposureTimeNanos; s.sensorFrameDurationNanos = sensorFrameDurationNanos;
             s.decoderCrop = captureCrop == null ? "-" : captureCrop.left + "," + captureCrop.top + "–" + captureCrop.right + "," + captureCrop.bottom;
             s.previewWidth = previewWidth; s.previewHeight = previewHeight;
@@ -988,13 +942,15 @@ public final class CameraScanner {
         nextDiagnosticNanos.set(0);
     }
 
-    /** Switches the 3060px crop between 1020px (3x) and 765px (4x) decoder
-     * images without reopening the camera. */
+    /** Changes the maximum reduction without reopening the camera. The actual
+     * factor is capped so the decoder side never falls below 708 pixels. */
     public void setHighResolutionDownsample(int factor) {
         highResolutionDownsample = factor == 4 ? 4 : 3;
-        GpuRgbProcessor gpu = gpuProcessor;
-        if (gpu != null) gpu.setDownsampleFactor(highResolutionDownsample);
         CameraCrop crop=captureCrop;
+        int effectiveFactor=crop == null?1:Rgb3Yuv.decoderDownsampleFactorForCapture(
+                crop.side,captureWidth,captureHeight,highResolutionDownsample);
+        GpuRgbProcessor gpu = gpuProcessor;
+        if (gpu != null) gpu.setDownsampleFactor(effectiveFactor);
         if (crop != null) {
             decodeWidth=Rgb3Yuv.decoderSideForCapture(crop.side, captureWidth, captureHeight,
                     highResolutionDownsample);

@@ -34,9 +34,15 @@ import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class MainActivity extends Activity {
     private static final int CAMERA_PERMISSION = 10, DESTINATION = 20;
+    private static final int STORE_QUEUE_CAPACITY = 512;
     private TextureView preview;
     private ImageView decoderPreview;
     private TextView status, result, modesText;
@@ -46,6 +52,8 @@ public final class MainActivity extends Activity {
     private LinearLayout cameraPage, receiverPage;
     private FrameLayout pages;
     private SessionStore store;
+    private ThreadPoolExecutor storeExecutor;
+    private final AtomicLong storeQueueDrops = new AtomicLong();
     private CameraScanner scanner;
     private Uri destination;
     private CameraSettings.Selection cameraSelection;
@@ -55,11 +63,11 @@ public final class MainActivity extends Activity {
     private String lastMessage = "";
     private boolean receiverVisible;
     private int decoderViewChannel = -1;
-    private int highResolutionDownsample = 3;
+    private int highResolutionDownsample = 4;
     private Bitmap decoderBitmap;
     private int[] decoderPixels;
     private final Runnable refresh = new Runnable() {
-        public void run() { showStats(); ui.postDelayed(this, 250); }
+        public void run() { showStats(); ui.postDelayed(this, 1000); }
     };
 
     /**
@@ -109,6 +117,9 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle b) {
         super.onCreate(b);
         store = new SessionStore(this);
+        storeExecutor = new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(STORE_QUEUE_CAPACITY),
+                runnable -> new Thread(runnable,"dosfer-session-store"));
         cameraSelection = CameraSettings.load(this);
         buildUi();
         refreshCameraOptions();
@@ -152,7 +163,7 @@ public final class MainActivity extends Activity {
         automaticSelector.setChecked(cameraSelection.automatic);
         content.addView(labelled("Rear camera ID", cameraSelector));
         content.addView(labelled("Target FPS (Auto / 60 / 30)", fpsSelector));
-        content.addView(labelled("YUV capture resolution", resolutionSelector));
+        content.addView(labelled("PRIVATE/GPU capture resolution", resolutionSelector));
         content.addView(labelled("ZXing decoder workers (1-4)", workerSelector));
         content.addView(automaticSelector);
 
@@ -239,16 +250,18 @@ public final class MainActivity extends Activity {
         row.addView(decoderView, new LinearLayout.LayoutParams(0, -2, 1));
 
         decoderSize = new Button(this);
-        decoderSize.setText("Decode: 1020");
+        decoderSize.setText("Downsample: max 4x");
         decoderSize.setOnClickListener(x -> cycleDecoderSize());
         row.addView(decoderSize, new LinearLayout.LayoutParams(0, -2, 1));
 
         Button reset = new Button(this);
         reset.setText("Reset session");
         reset.setOnClickListener(x -> {
-            store.reset();
             if (scanner != null) scanner.clearLastPayload();
-            lastMessage = "";
+            enqueueStore(() -> {
+                store.reset();
+                runOnUiThread(() -> lastMessage = "");
+            });
         });
         row.addView(reset, new LinearLayout.LayoutParams(0, -2, 1));
         return row;
@@ -358,8 +371,11 @@ public final class MainActivity extends Activity {
         if (!receiverVisible || scanner != null) return;
         scanner = new CameraScanner(this, preview, new CameraScanner.Listener() {
             public void payload(byte[] b, long latency) {
-                SessionStore.Result r = store.accept(b, latency);
-                runOnUiThread(() -> { if (r == SessionStore.Result.INVALID) lastMessage = "INVALID FRAME"; });
+                enqueueStore(() -> {
+                    SessionStore.Result r = store.accept(b, latency);
+                    if (r == SessionStore.Result.INVALID)
+                        runOnUiThread(() -> lastMessage = "INVALID FRAME");
+                });
             }
             public void error(String m) { runOnUiThread(() -> lastMessage = "Camera: " + m); }
             public void modes(List<CameraMode> modes) { runOnUiThread(() -> updateModes(modes)); }
@@ -370,6 +386,18 @@ public final class MainActivity extends Activity {
         scanner.start();
         scanner.setDiagnosticChannel(decoderViewChannel);
         scanner.setHighResolutionDownsample(highResolutionDownsample);
+    }
+
+    private boolean enqueueStore(Runnable operation) {
+        ThreadPoolExecutor executor=storeExecutor;
+        if (executor == null || executor.isShutdown()) return false;
+        try {
+            executor.execute(operation);
+            return true;
+        } catch (RejectedExecutionException full) {
+            storeQueueDrops.incrementAndGet();
+            return false;
+        }
     }
 
     private void stopCamera() {
@@ -401,7 +429,7 @@ public final class MainActivity extends Activity {
 
     private void cycleDecoderSize() {
         highResolutionDownsample = highResolutionDownsample == 3 ? 4 : 3;
-        decoderSize.setText("Decode: " + (highResolutionDownsample == 3 ? "1020" : "765"));
+        decoderSize.setText("Downsample: max " + highResolutionDownsample + "x");
         if (scanner != null) scanner.setHighResolutionDownsample(highResolutionDownsample);
     }
 
@@ -426,7 +454,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showModeList(List<CameraMode> modes, CameraScanner.Stats current) {
-        StringBuilder out = new StringBuilder("Available YUV_420_888 modes\n");
+        StringBuilder out = new StringBuilder("Available PRIVATE/OES modes\n");
         for (CameraMode mode : modes) {
             boolean selected = current != null && current.width == mode.width && current.height == mode.height;
             out.append(mode.key()).append("  crop ").append(mode.cropLabel())
@@ -469,17 +497,20 @@ public final class MainActivity extends Activity {
         CameraScanner.Stats c = scanner == null ? new CameraScanner.Stats() : scanner.stats();
         if (status == null) return;
         status.setText(String.format(Locale.US,
-                "Session: %08X    DOS window: %d\nUnique: %d / %d in window    Missing: %s\nDuplicate: %d    Invalid: %d    Other session: %d\nDecoded: %.2f fps    Useful: %.0f B/s    Latency: %.1f ms\nCalibration: %d unique    %d missed\nCapture buffer: %dx%d    Decoder crop: %s\nDecode size: %dx%d    RGB downsample: %dx\nPreview view: %dx%d square\nDisplay rotation: %d    Sensor orientation: %d    Relative rotation: %d    Scale: %.3f\nRequested FPS: %s    request range: %s\nSensor FPS: %.1f    ImageReader FPS: %.1f    Attempts: %.1f/s\nNative workers: %d    Busy drops: %d\nPhysical QR frames: %d    No QR: %d    Hard fallback: %d/%d\nTransport mode: %s    RGB channels: %d/%d decoded    Logical frames: %d\nRGB conversion: %d frames    %.1f ms avg\nGPU RGB path: %s    Frames: %d    Busy drops: %d\nGPU arrival->dispatch: %.2f ms    command: %.2f ms    ready: %.2f ms    plane copy: %.2f ms    total: %.2f ms    queue: %.1f\nZXing R/G/B: %.2f / %.2f / %.2f ms\nFull detector: %d    Recovery: %d/%d    %.1f/%.1f ms avg/max\nAttempt time: %.1f ms avg / %.1f ms max\nExposure: %.3f ms    Sensor frame duration: %.3f ms\nCamera state: %s    Classification: %s\nPayload received: %d bytes    Total frames: %d\nDestination: %s\nIntegrity: %s",
+                "Session: %08X    DOS window: %d\nUnique: %d / %d in window    Missing: %s\nDuplicate: %d    Invalid: %d    Other session: %d\nDecoded: %.2f fps    Useful: %.0f B/s    Latency: %.1f ms\nCalibration: %d unique    %d missed\nCapture buffer: %dx%d    Decoder crop: %s\nDecode size: %dx%d    RGB downsample: %dx\nPreview view: %dx%d square\nDisplay rotation: %d    Sensor orientation: %d    Relative rotation: %d    Scale: %.3f\nRequested FPS: %s    request range: %s\nSensor FPS: %.1f    ImageReader FPS: %.1f    Attempts: %.1f/s\nNative workers: %d    Busy drops: %d\nStore queue: %d + %d active    Queue drops: %d\nPhysical QR frames: %d    No QR: %d    Recovery: disabled\nTransport mode: %s    RGB channels: %d/%d decoded    Logical frames: %d\nRGB conversion: %d frames    %.1f ms avg\nGPU RGB path: %s    Frames: %d    Busy drops: %d (signal %d / PBO %d / worker %d / submit %d)\nGPU arrival->dispatch: %.2f ms    command: %.2f ms    ready: %.2f ms    plane copy: %.2f ms    total: %.2f ms    queue: %.1f\nZXing R/G/B: %.2f / %.2f / %.2f ms\nDetector: %d calls    %.1f/%.1f ms avg/max\nAttempt time: %.1f ms avg / %.1f ms max\nExposure: %.3f ms    Sensor frame duration: %.3f ms\nCamera state: %s    Classification: %s\nPayload received: %d bytes    Total frames: %d\nDestination: %s\nIntegrity: %s",
                 s.session, s.window + 1, s.uniqueWindow, s.expected, s.missing, s.duplicates, s.invalid, s.other,
                 s.decodedFps, s.usefulBps, s.avgLatencyMs, s.calibrationUnique, s.calibrationMissed,
                 c.width, c.height, c.decoderCrop, c.decodeWidth, c.decodeHeight, c.downsampleFactor, c.previewWidth, c.previewHeight,
                 c.displayRotation, c.sensorOrientation, c.relativeRotation, c.previewScale,
                 c.requestedFps, c.requestRange,
-                c.sensorFps, c.imageReaderFps, c.attemptFps, c.workerCount, c.busyDrops, c.successes, c.failures,
-                c.fallbackSuccesses, c.fallbackAttempts,
+                c.sensorFps, c.imageReaderFps, c.attemptFps, c.workerCount, c.busyDrops,
+                storeExecutor == null ? 0 : storeExecutor.getQueue().size(),
+                storeExecutor == null ? 0 : storeExecutor.getActiveCount(),storeQueueDrops.get(),
+                c.successes, c.failures,
                 c.rgbMode, c.channelSuccesses, c.channelAttempts, c.logicalFrames,
                 c.rgbConversions, c.rgbConversions == 0 ? 0 : c.rgbConversionNanos / 1e6 / c.rgbConversions,
                 c.gpuRgb ? "GLES3/PBO" : "CPU fallback", c.gpuFrames, c.gpuBusyDrops,
+                c.gpuCoalescedDrops, c.gpuPboDrops, c.gpuDecoderDrops, c.gpuSubmitDrops,
                 c.gpuDispatches == 0 ? 0 : c.gpuArrivalToDispatchNanos / 1e6 / c.gpuDispatches,
                 c.gpuDispatches == 0 ? 0 : c.gpuCommandNanos / 1e6 / c.gpuDispatches,
                 c.gpuReadbacks == 0 ? 0 : c.gpuReadbackNanos / 1e6 / c.gpuReadbacks,
@@ -489,7 +520,7 @@ public final class MainActivity extends Activity {
                 c.channelDecodeAttempts[Rgb3Yuv.RED] == 0 ? 0 : c.channelDecodeNanos[Rgb3Yuv.RED] / 1e6 / c.channelDecodeAttempts[Rgb3Yuv.RED],
                 c.channelDecodeAttempts[Rgb3Yuv.GREEN] == 0 ? 0 : c.channelDecodeNanos[Rgb3Yuv.GREEN] / 1e6 / c.channelDecodeAttempts[Rgb3Yuv.GREEN],
                 c.channelDecodeAttempts[Rgb3Yuv.BLUE] == 0 ? 0 : c.channelDecodeNanos[Rgb3Yuv.BLUE] / 1e6 / c.channelDecodeAttempts[Rgb3Yuv.BLUE],
-                c.fullDetectorAttempts, c.recoveryAttempts, c.recoverySuccesses, c.recoveryAttempts == 0 ? 0 : c.recoveryTotalNanos / 1e6 / c.recoveryAttempts, c.recoveryMaxNanos / 1e6,
+                c.fullDetectorAttempts, c.fullDetectorAttempts == 0 ? 0 : c.fullDetectorTotalNanos / 1e6 / c.fullDetectorAttempts, c.fullDetectorMaxNanos / 1e6,
                 c.avgAttemptMs, c.maxAttemptMs, c.exposureTimeNanos / 1e6, c.sensorFrameDurationNanos / 1e6,
                 c.sessionStatus, c.classification, s.totalPayload, s.uniqueTotal,
                 destination == null ? "not selected" : "selected", s.complete ? "all frames present; ready to reconstruct" : "INCOMPLETE"));
@@ -499,7 +530,9 @@ public final class MainActivity extends Activity {
             else if (s.session == 0) result.setText(s.calibration);
             else result.setText(s.complete ? "ALL FRAMES PRESENT" : "SCANNING");
         }
-        if (reconstruct != null) reconstruct.setEnabled(s.complete && destination != null);
+        if (reconstruct != null) reconstruct.setEnabled(s.complete && destination != null &&
+                storeExecutor != null && storeExecutor.getQueue().isEmpty() &&
+                storeExecutor.getActiveCount() == 0);
     }
 
     private void reconstruct() {
@@ -514,5 +547,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() { if (receiverVisible) stopCamera(); super.onPause(); }
     @Override protected void onResume() { super.onResume(); if (receiverVisible && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera(); }
-    @Override protected void onDestroy() { ui.removeCallbacks(refresh); stopCamera(); super.onDestroy(); }
+    @Override protected void onDestroy() {
+        ui.removeCallbacks(refresh);
+        stopCamera();
+        if (storeExecutor != null) storeExecutor.shutdown();
+        super.onDestroy();
+    }
 }

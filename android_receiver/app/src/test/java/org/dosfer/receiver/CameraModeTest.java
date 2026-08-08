@@ -12,9 +12,21 @@ public class CameraModeTest {
         return new CameraMode(w, h, fps <= 0 ? 0 : (long) (1_000_000_000.0 / fps));
     }
 
-    @Test public void automaticRankingPrefersRequestedHighResolution60() {
-        List<CameraMode> modes = Arrays.asList(mode(1088, 1088, 60), mode(1920, 1080, 60), mode(1440, 1080, 60), mode(1440, 1080, 30));
-        assertEquals("1440x1080", CameraMode.chooseAutomatic(modes, 60).key());
+    @Test public void automaticRankingPrefersSmallestColourAdequate60Mode() {
+        List<CameraMode> modes = Arrays.asList(mode(1088, 1088, 60), mode(1920, 1080, 60),
+                mode(1440, 1080, 60), mode(1920, 1440, 60), mode(2992,2992,30));
+        assertEquals("1920x1440", CameraMode.chooseAutomatic(modes, 60).key());
+    }
+
+    @Test public void colourAdequatePublished30ModeBeatsInsufficient60Mode() {
+        List<CameraMode> modes=Arrays.asList(mode(1440,1080,60),mode(2992,2992,30));
+        assertEquals("2992x2992",CameraMode.chooseAutomatic(modes,60).key());
+    }
+
+    @Test public void largestCropWinsWhenNoModeHasEnoughChroma() {
+        List<CameraMode> modes=Arrays.asList(mode(640,480,60),mode(1440,1080,60),
+                mode(1280,720,60));
+        assertEquals("1440x1080",CameraMode.chooseAutomatic(modes,60).key());
     }
 
     @Test public void centeredCropDoesNotScale() {

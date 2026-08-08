@@ -46,6 +46,20 @@ public class Rgb3DecoderPolicyTest {
         detector.accept(new byte[][]{eow,null,null});
         assertEquals(Rgb3DecoderPolicy.Mode.UNKNOWN,detector.mode());
     }
+
+    @Test public void lockedBwAcceptsOneDecodedChannel() {
+        Rgb3DecoderPolicy.Detector detector = new Rgb3DecoderPolicy.Detector();
+        byte[] a=frame(0),b=frame(1),c=frame(2);
+        detector.accept(new byte[][]{a,a.clone(),a.clone()});
+        detector.accept(new byte[][]{b,b.clone(),b.clone()});
+        assertEquals(Rgb3DecoderPolicy.Mode.BW,detector.mode());
+
+        List<byte[]> out=detector.accept(new byte[][]{null,c,null});
+        assertEquals(1,out.size());
+        assertArrayEquals(c,out.get(0));
+        assertEquals(Rgb3DecoderPolicy.Mode.BW,detector.mode());
+    }
+
     @Test public void partialRgbDecodeKeepsValidChannelsAndLocksRgb3() {
         Rgb3DecoderPolicy.Detector detector = new Rgb3DecoderPolicy.Detector();
         byte[] a=frame(4),c=frame(6);
