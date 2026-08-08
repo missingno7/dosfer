@@ -54,14 +54,15 @@ module operations unrolled. RGB3 preclassifies uninterrupted two-column QR
 stripes once when constructing the placement map. Its run-level 386 kernel
 processes each R/G/B codeword as four two-bit row pairs with a fixed byte mask
 and signed 40-byte row stride, avoiding per-module placement loads for 3,283 of
-3,706 codewords. Six fully aligned sets of four neighboring stripes are
-transposed into complete framebuffer bytes, reducing those regions from four
-plane-byte updates to one. Six more four-stripe regions overlap after a
+3,706 codewords. Six fully aligned sets of four neighboring stripes use a
+derived 4 KB lane-contribution table to construct each complete framebuffer
+byte with four dword lookups instead of normalizing and transposing the bits
+at runtime. Six more four-stripe regions overlap after a
 two-row phase shift; their adjacent normalized codewords are joined before the
-same transpose, while 48 predecoded edge contributions are handled by a small
+arithmetic transpose, while 48 predecoded edge contributions are handled by a small
 RGB-aware 386 loop. Three uninterrupted 0C/30/C0 lane sets are also transposed
-over their complete 168-row intervals while their interrupted fourth lanes
-remain on the run path. Function-pattern crossings use a parameterized exact
+through the same contribution table over their complete 168-row intervals;
+their interrupted fourth lanes remain on the run path. Function-pattern crossings use a parameterized exact
 386 codeword scatter over the original placement map. The older delta
 renderers remain verification oracles.
 

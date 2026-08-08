@@ -81,6 +81,8 @@ static u8 stripe_pair_swap[256],stripe_bit_reverse[256];
 static const u8 far *stripe_group_source;
 static u16 stripe_group_src0,stripe_group_src1,stripe_group_src2,
            stripe_group_src3,stripe_group_dest,stripe_group_count_asm;
+static u8 far *stripe_group_lut_raw;
+static u32 far *stripe_group_lut;
 #define VGA_STRIPE_MAX_PHASE_GROUPS 8
 #define VGA_STRIPE_MAX_EDGES 64
 typedef struct {
@@ -215,6 +217,9 @@ static void free_stream_renderer(void) {
     if(placement_entry)free(placement_entry);
     if(direct_template)_ffree(direct_template);
     if(stripe_runs)_ffree(stripe_runs);
+    if(stripe_group_lut_raw)_ffree(stripe_group_lut_raw);
+    stripe_group_lut_raw=0;
+    stripe_group_lut=0;
     placement_entry=0;
     direct_template=0;
     stripe_runs=0;
@@ -696,6 +701,37 @@ static void prepare_stripe_groups(void) {
     }
 }
 
+/* Each exact group combines four two-bit lanes into four framebuffer bytes.
+ * Precompute one independent 32-bit contribution per raw lane byte; XORing
+ * the four entries is exactly the existing normalize-and-transpose kernel. */
+static u32 stripe_group_normalized_contribution(u16 lane,u8 normalized) {
+    u32 value,swap;
+    value=(u32)normalized<<(lane*8u);
+    swap=((value>>6)^value)&0x00CC00CCUL;
+    value^=swap^(swap<<6);
+    swap=((value>>12)^value)&0x0000F0F0UL;
+    return value^swap^(swap<<12);
+}
+
+static u32 stripe_group_lane_contribution(u16 lane,u8 raw) {
+    u8 normalized=(lane&1u)?stripe_pair_swap[raw]:stripe_bit_reverse[raw];
+    return stripe_group_normalized_contribution(lane,normalized);
+}
+
+static void prepare_stripe_group_lut(void) {
+    u16 lane,value;
+    u32 paragraphs;
+    stripe_group_lut_raw=(u8 far *)_fmalloc(4096u+15u);
+    if(!stripe_group_lut_raw)return;
+    paragraphs=((u32)FP_OFF(stripe_group_lut_raw)+15UL)>>4;
+    stripe_group_lut=(u32 far *)MK_FP(
+        (u16)(FP_SEG(stripe_group_lut_raw)+paragraphs),0);
+    for(lane=0;lane<4;++lane)
+        for(value=0;value<256;++value)
+            stripe_group_lut[(u16)(lane*256u+value)]=
+                stripe_group_lane_contribution(lane,(u8)value);
+}
+
 static u16 stripe_run_bottom(const VgaStripeRun far *run) {
     return (u16)(stripe_run_top(run)+
         (u16)(run->count*4u-1u)*VGA_BYTES_PER_LINE);
@@ -886,6 +922,7 @@ static int prepare_placement_map(void) {
     }
     prepare_stripe_runs();
     prepare_stripe_groups();
+    prepare_stripe_group_lut();
     prepare_stripe_phase_groups();
     prepare_stripe_triples();
 #ifdef DOSFER_DEVTOOLS
@@ -1674,6 +1711,41 @@ static void directStripeGroupPlane386(void);
     "stripe_group_done:" \
     "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
     modify [ax bx cx dx si di bp fs];
+
+/* Four far LUT reads replace byte normalization and the 4x4 two-bit
+ * transpose for the exact same four-lane group operation.  The table is
+ * derived from the placement geometry during renderer setup. */
+static void directStripeGroupLutPlane386(void);
+#pragma aux directStripeGroupLutPlane386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" \
+    "push ds" "push fs" \
+    "mov ax,word ptr ss:stripe_group_source+2" "mov fs,ax" \
+    "mov ax,word ptr ss:stripe_group_lut+2" "mov ds,ax" \
+    "mov bp,word ptr ss:stripe_group_src0" \
+    "mov si,word ptr ss:stripe_group_src1" \
+    "mov bx,word ptr ss:stripe_group_src2" \
+    "mov di,word ptr ss:stripe_group_dest" \
+    "mov cx,word ptr ss:stripe_group_count_asm" \
+    "test cx,cx" "jz stripe_group_lut_done" \
+    "stripe_group_lut_loop:" \
+    "xor eax,eax" "mov al,fs:[bp]" "dec bp" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax]" \
+    "xor eax,eax" "mov al,fs:[si]" "inc si" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+1024]" \
+    "xor eax,eax" "mov al,fs:[bx]" "dec bx" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+2048]" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "xor eax,eax" "mov al,fs:[di]" "inc di" \
+    "mov word ptr ss:stripe_group_src3,di" "pop di" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+3072]" \
+    "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "sub di,40" \
+    "shr edx,16" "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "add di,280" \
+    "dec cx" "jnz stripe_group_lut_loop" \
+    "stripe_group_lut_done:" \
+    "pop fs" "pop ds" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp ds fs];
 /* Same byte transpose as the production group kernel, but two lanes begin
  * halfway through a normalized codeword.  Combine the current low half with
  * the following high half before transposing.  Phase 1 shifts the reverse
@@ -1772,7 +1844,34 @@ static void directStripeTriplePlane386(void);
     "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
     modify [ax bx cx dx si di bp fs];
 
-
+static void directStripeTripleLutPlane386(void);
+#pragma aux directStripeTripleLutPlane386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" \
+    "push ds" "push fs" \
+    "mov ax,word ptr ss:stripe_group_source+2" "mov fs,ax" \
+    "mov ax,word ptr ss:stripe_group_lut+2" "mov ds,ax" \
+    "mov si,word ptr ss:stripe_group_src1" \
+    "mov bx,word ptr ss:stripe_group_src2" \
+    "mov di,word ptr ss:stripe_group_dest" \
+    "mov cx,word ptr ss:stripe_group_count_asm" \
+    "test cx,cx" "jz stripe_triple_lut_done" \
+    "stripe_triple_lut_loop:" \
+    "xor eax,eax" "mov al,fs:[si]" "inc si" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax+1024]" \
+    "xor eax,eax" "mov al,fs:[bx]" "dec bx" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+2048]" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "xor eax,eax" "mov al,fs:[di]" "inc di" \
+    "mov word ptr ss:stripe_group_src3,di" "pop di" "shl eax,2" \
+    "xor edx,dword ptr ds:[eax+3072]" \
+    "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "sub di,40" \
+    "shr edx,16" "xor byte ptr ss:[di],dl" "sub di,40" \
+    "xor byte ptr ss:[di],dh" "add di,280" \
+    "dec cx" "jnz stripe_triple_lut_loop" \
+    "stripe_triple_lut_done:" \
+    "pop fs" "pop ds" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di ds fs];
 /* Predecoded 10-byte edge recipes avoid the generic C run lookup and update
  * all three planes while the source byte and destination are hot. */
 static void directStripeEdges386(void);
@@ -1869,6 +1968,12 @@ static void stripe_group_plane(const VgaStripeGroup *group,
     stripe_group_dest=(u16)(FP_OFF((u8 far *)rgb_screen(channel))+
         group->dest+3u*VGA_BYTES_PER_LINE);
     stripe_group_count_asm=group->count;
+#ifdef __WATCOMC__
+    if(stripe_group_lut) {
+        directStripeGroupLutPlane386();
+        return;
+    }
+#endif
     directStripeGroupPlane386();
 }
 
@@ -1900,6 +2005,12 @@ static void stripe_triple_plane(const VgaStripeTriple *group,
     stripe_group_dest=(u16)(FP_OFF((u8 far *)rgb_screen(channel))+
         group->dest+3u*VGA_BYTES_PER_LINE);
     stripe_group_count_asm=group->count;
+#ifdef __WATCOMC__
+    if(stripe_group_lut) {
+        directStripeTripleLutPlane386();
+        return;
+    }
+#endif
     directStripeTriplePlane386();
 }
 
