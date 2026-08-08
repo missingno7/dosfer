@@ -37,8 +37,9 @@ int vga_show_prepared_at(int invert, const char *status, u32 earliest_tick);
 
 /* Production RGB3 steady-state path. Each shadow plane is reset from the
  * fixed V40-L function-pattern template. Regular two-column placement runs
- * use a run-level kernel plus direct contribution-LUT exact, phase and triple
- * groups; crossings use the exact parameterized 386 map scatter. */
+ * use direct contribution-LUT run, exact, phase and triple kernels, with the
+ * fixed-mask run fallback for irregular geometry. Crossings use the exact
+ * parameterized 386 map scatter. */
 int vga_apply_codewords3_direct(
         const u8 *const codewords[VGA_RGB_CHANNELS]);
 

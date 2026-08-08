@@ -51,10 +51,11 @@ raster. There is no previous-codeword comparison in the production path.
 
 The specialized 386 BW loop handles two codewords per iteration with all eight
 module operations unrolled. RGB3 preclassifies uninterrupted two-column QR
-stripes once when constructing the placement map. Its run-level 386 kernel
-processes each R/G/B codeword as four two-bit row pairs with a fixed byte mask
-and signed 40-byte row stride, avoiding per-module placement loads for 3,283 of
-3,706 codewords. Six fully aligned sets of four neighboring stripes use a
+stripes once when constructing the placement map. Standard ungrouped lanes
+use one contribution-table dword per R/G/B codeword to update their four
+successive rows; irregular lanes retain the fixed-mask pair kernel. Together
+these paths avoid per-module placement loads for 3,283 of 3,706 codewords.
+Six fully aligned sets of four neighboring stripes use a
 derived 8 KB lane-contribution table to construct each complete framebuffer
 byte with four dword lookups instead of normalizing and transposing the bits
 at runtime. Six more four-stripe regions overlap after a

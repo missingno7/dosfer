@@ -67,6 +67,7 @@ static VgaStripeRun far *stripe_runs;
 static u16 stripe_run_count,stripe_codewords_covered;
 static u16 stripe_asm_step;
 static const u8 far *stripe_asm_pair_mask;
+static u16 stripe_run_lut_segment,stripe_run_source_step;
 #define VGA_STRIPE_MAX_GROUPS 8
 #define VGA_STRIPE_GROUP_EXACT 1
 #define VGA_STRIPE_GROUP_PHASE 2
@@ -1689,6 +1690,42 @@ static void directStripe386(u16 source_offset,u16 count,u16 dest,
     "pop gs" "pop fs" "pop es" "pop ds" "pop bp" \
     parm [ax] [cx] [di] [si] modify [ax bx cx dx di];
 
+/* One standard lane still spans four adjacent raster rows. Its existing
+ * contribution table therefore replaces four two-bit mask lookups per plane
+ * while preserving the same twelve final framebuffer XORs. */
+static void directStripeRunLut386(u16 source_offset,u16 count,u16 dest);
+#pragma aux directStripeRunLut386 = \
+    "push bp" "push ds" "push es" "push fs" "push gs" \
+    "mov bp,ax" \
+    "mov ax,word ptr ss:direct_asm_red+2" "mov fs,ax" \
+    "mov ax,word ptr ss:direct_asm_green+2" "mov gs,ax" \
+    "mov ax,word ptr ss:direct_asm_blue+2" "mov es,ax" \
+    "mov ax,word ptr ss:stripe_run_lut_segment" "mov ds,ax" \
+    "test cx,cx" "jz stripe_run_lut_done" \
+    "stripe_run_lut_loop:" \
+    "xor eax,eax" "mov al,fs:[bp]" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax]" \
+    "xor byte ptr ss:screen_320[di],dl" \
+    "xor byte ptr ss:screen_320[di-40],dh" "shr edx,16" \
+    "xor byte ptr ss:screen_320[di-80],dl" \
+    "xor byte ptr ss:screen_320[di-120],dh" \
+    "xor eax,eax" "mov al,gs:[bp]" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax]" \
+    "xor byte ptr ss:screen_green[di],dl" \
+    "xor byte ptr ss:screen_green[di-40],dh" "shr edx,16" \
+    "xor byte ptr ss:screen_green[di-80],dl" \
+    "xor byte ptr ss:screen_green[di-120],dh" \
+    "xor eax,eax" "mov al,es:[bp]" "shl eax,2" \
+    "mov edx,dword ptr ds:[eax]" \
+    "xor byte ptr ss:screen_blue[di],dl" \
+    "xor byte ptr ss:screen_blue[di-40],dh" "shr edx,16" \
+    "xor byte ptr ss:screen_blue[di-80],dl" \
+    "xor byte ptr ss:screen_blue[di-120],dh" \
+    "add bp,word ptr ss:stripe_run_source_step" "add di,160" \
+    "dec cx" "jnz stripe_run_lut_loop" \
+    "stripe_run_lut_done:" \
+    "pop gs" "pop fs" "pop es" "pop ds" "pop bp" \
+    parm [ax] [cx] [di] modify [ax cx dx di];
 /* Four regular two-column runs fill one framebuffer byte. Pack their source
  * bytes into EAX, normalize the alternating QR zigzag directions, transpose
  * the four-by-four matrix of two-bit pairs, then update four destination rows
@@ -2101,6 +2138,22 @@ static void stripe_triple_plane(const VgaStripeTriple *group,
     directStripeTriplePlane386();
 }
 
+#ifdef __WATCOMC__
+static int scatter_stripe_run_lut(const VgaStripeRun far *run,u16 offset) {
+    int slot=stripe_group_slot(run->pair_mask[3]);
+    u16 source,dest;
+    if(!stripe_group_lut||slot<0||
+       run->direction!=((slot&1)?1:-1))return 0;
+    source=(u16)(offset+run->first+
+        (run->direction<0?run->count-1u:0u));
+    dest=(u16)(stripe_run_top(run)+3u*VGA_BYTES_PER_LINE);
+    stripe_run_lut_segment=(u16)(FP_SEG(stripe_group_lut)+(u16)slot*64u);
+    stripe_run_source_step=(u16)(run->direction<0?-1:1);
+    directStripeRunLut386(source,run->count,dest);
+    return 1;
+}
+#endif
+
 
 static void scatter_phase_edges(
         const u8 *const codewords[VGA_RGB_CHANNELS]) {
@@ -2141,6 +2194,10 @@ static int direct_scatter_rgb3_phased_optimized(
             direct_scatter_rgb3_range_optimized(codewords,offset,current,
                 (u16)(run->first-current));
         if(!run->group_flags) {
+            if(scatter_stripe_run_lut(run,offset)) {
+                current=(u16)(run->first+run->count);
+                continue;
+            }
             stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
             stripe_asm_pair_mask=run->pair_mask;
             directStripe386((u16)(offset+run->first),run->count,run->dest,
