@@ -44,5 +44,7 @@ public class CameraModeTest {
         assertEquals(2, CameraSettings.Selection.parse("0|60|auto|true").decodeWorkers);
         assertEquals(4, CameraSettings.Selection.parse("0|60|auto|true|99").decodeWorkers);
         assertEquals(1, CameraSettings.Selection.parse("0|60|auto|true|0").decodeWorkers);
+        assertEquals(4, CameraScanner.imageReaderBufferCount(1));
+        assertEquals(6, CameraScanner.imageReaderBufferCount(4));
     }
 }

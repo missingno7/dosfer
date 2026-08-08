@@ -262,7 +262,8 @@ public final class CameraScanner {
                 }
             } else previewSurface = null;
             if (!gpuRgbPath) {
-                reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 4);
+                reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888,
+                        imageReaderBufferCount(selection.decodeWorkers));
                 reader.setOnImageAvailableListener(this::image, cameraHandler);
                 SurfaceTexture texture = preview.getSurfaceTexture();
                 texture.setDefaultBufferSize(width, height);
@@ -397,7 +398,17 @@ public final class CameraScanner {
     }
 
     private void image(ImageReader source) {
-        Image image = source.acquireLatestImage();
+        Image image;
+        try {
+            image = source.acquireLatestImage();
+        } catch (IllegalStateException exhausted) {
+            /* A worker retains its Image until native ZXing has finished. On
+             * devices that temporarily exhaust the reader pool, retain camera
+             * liveness and count this as a normal back-pressure drop. */
+            Log.w(TAG, "ImageReader buffer pool exhausted", exhausted);
+            synchronized (statsLock) { busyDrops++; }
+            return;
+        }
         if (image == null) return;
         synchronized (statsLock) {
             cameraFrames++;
@@ -453,6 +464,13 @@ public final class CameraScanner {
         if (workers == null) return false;
         for (DecodeWorker worker : workers) if (worker.canAccept()) return true;
         return false;
+    }
+
+    /** Each accepted CPU frame remains acquired until its worker finishes.
+     * Keep two reader buffers beyond the worker pool so acquireLatestImage()
+     * can discard an old pending image rather than failing at four workers. */
+    static int imageReaderBufferCount(int workers) {
+        return Math.max(4, workers + 2);
     }
 
     private void gpuFrameArrived(long timestamp) {
