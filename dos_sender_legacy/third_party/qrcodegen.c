@@ -255,30 +255,24 @@ static void dosferInterleaveDataV40(const uint8_t __far *data,
 #pragma aux dosferInterleaveDataV40 = \
 	"mov cx,118" \
 	"v40data_row:" \
-	"mov al,fs:[si]"      "mov es:[di],al" \
-	"mov al,fs:[si+118]"  "mov es:[di+1],al" \
-	"mov al,fs:[si+236]"  "mov es:[di+2],al" \
-	"mov al,fs:[si+354]"  "mov es:[di+3],al" \
-	"mov al,fs:[si+472]"  "mov es:[di+4],al" \
-	"mov al,fs:[si+590]"  "mov es:[di+5],al" \
-	"mov al,fs:[si+708]"  "mov es:[di+6],al" \
-	"mov al,fs:[si+826]"  "mov es:[di+7],al" \
-	"mov al,fs:[si+944]"  "mov es:[di+8],al" \
-	"mov al,fs:[si+1062]" "mov es:[di+9],al" \
-	"mov al,fs:[si+1180]" "mov es:[di+10],al" \
-	"mov al,fs:[si+1298]" "mov es:[di+11],al" \
-	"mov al,fs:[si+1416]" "mov es:[di+12],al" \
-	"mov al,fs:[si+1534]" "mov es:[di+13],al" \
-	"mov al,fs:[si+1652]" "mov es:[di+14],al" \
-	"mov al,fs:[si+1770]" "mov es:[di+15],al" \
-	"mov al,fs:[si+1888]" "mov es:[di+16],al" \
-	"mov al,fs:[si+2006]" "mov es:[di+17],al" \
-	"mov al,fs:[si+2124]" "mov es:[di+18],al" \
-	"mov al,fs:[si+2242]" "mov es:[di+19],al" \
-	"mov al,fs:[si+2361]" "mov es:[di+20],al" \
-	"mov al,fs:[si+2480]" "mov es:[di+21],al" \
-	"mov al,fs:[si+2599]" "mov es:[di+22],al" \
-	"mov al,fs:[si+2718]" "mov es:[di+23],al" \
+	"mov al,fs:[si]"      "mov ah,fs:[si+118]" \
+	"ror eax,16" "mov al,fs:[si+236]" "mov ah,fs:[si+354]" \
+	"rol eax,16" "mov es:[di],eax" \
+	"mov al,fs:[si+472]"  "mov ah,fs:[si+590]" \
+	"ror eax,16" "mov al,fs:[si+708]" "mov ah,fs:[si+826]" \
+	"rol eax,16" "mov es:[di+4],eax" \
+	"mov al,fs:[si+944]"  "mov ah,fs:[si+1062]" \
+	"ror eax,16" "mov al,fs:[si+1180]" "mov ah,fs:[si+1298]" \
+	"rol eax,16" "mov es:[di+8],eax" \
+	"mov al,fs:[si+1416]" "mov ah,fs:[si+1534]" \
+	"ror eax,16" "mov al,fs:[si+1652]" "mov ah,fs:[si+1770]" \
+	"rol eax,16" "mov es:[di+12],eax" \
+	"mov al,fs:[si+1888]" "mov ah,fs:[si+2006]" \
+	"ror eax,16" "mov al,fs:[si+2124]" "mov ah,fs:[si+2242]" \
+	"rol eax,16" "mov es:[di+16],eax" \
+	"mov al,fs:[si+2361]" "mov ah,fs:[si+2480]" \
+	"ror eax,16" "mov al,fs:[si+2599]" "mov ah,fs:[si+2718]" \
+	"rol eax,16" "mov es:[di+20],eax" \
 	"mov al,fs:[si+2837]" "mov es:[di+24],al" \
 	"inc si" \
 	"add di,25" \
@@ -334,30 +328,24 @@ static void dosferInterleaveEcc30V40(const uint8_t __far *ecc,
 #pragma aux dosferInterleaveEcc30V40 = \
 	"mov cx,30" \
 	"v40ecc30_row:" \
-	"mov al,fs:[si]"     "mov es:[di],al" \
-	"mov al,fs:[si+30]"  "mov es:[di+1],al" \
-	"mov al,fs:[si+60]"  "mov es:[di+2],al" \
-	"mov al,fs:[si+90]"  "mov es:[di+3],al" \
-	"mov al,fs:[si+120]" "mov es:[di+4],al" \
-	"mov al,fs:[si+150]" "mov es:[di+5],al" \
-	"mov al,fs:[si+180]" "mov es:[di+6],al" \
-	"mov al,fs:[si+210]" "mov es:[di+7],al" \
-	"mov al,fs:[si+240]" "mov es:[di+8],al" \
-	"mov al,fs:[si+270]" "mov es:[di+9],al" \
-	"mov al,fs:[si+300]" "mov es:[di+10],al" \
-	"mov al,fs:[si+330]" "mov es:[di+11],al" \
-	"mov al,fs:[si+360]" "mov es:[di+12],al" \
-	"mov al,fs:[si+390]" "mov es:[di+13],al" \
-	"mov al,fs:[si+420]" "mov es:[di+14],al" \
-	"mov al,fs:[si+450]" "mov es:[di+15],al" \
-	"mov al,fs:[si+480]" "mov es:[di+16],al" \
-	"mov al,fs:[si+510]" "mov es:[di+17],al" \
-	"mov al,fs:[si+540]" "mov es:[di+18],al" \
-	"mov al,fs:[si+570]" "mov es:[di+19],al" \
-	"mov al,fs:[si+600]" "mov es:[di+20],al" \
-	"mov al,fs:[si+630]" "mov es:[di+21],al" \
-	"mov al,fs:[si+660]" "mov es:[di+22],al" \
-	"mov al,fs:[si+690]" "mov es:[di+23],al" \
+	"mov al,fs:[si]"     "mov ah,fs:[si+30]" \
+	"ror eax,16" "mov al,fs:[si+60]" "mov ah,fs:[si+90]" \
+	"rol eax,16" "mov es:[di],eax" \
+	"mov al,fs:[si+120]" "mov ah,fs:[si+150]" \
+	"ror eax,16" "mov al,fs:[si+180]" "mov ah,fs:[si+210]" \
+	"rol eax,16" "mov es:[di+4],eax" \
+	"mov al,fs:[si+240]" "mov ah,fs:[si+270]" \
+	"ror eax,16" "mov al,fs:[si+300]" "mov ah,fs:[si+330]" \
+	"rol eax,16" "mov es:[di+8],eax" \
+	"mov al,fs:[si+360]" "mov ah,fs:[si+390]" \
+	"ror eax,16" "mov al,fs:[si+420]" "mov ah,fs:[si+450]" \
+	"rol eax,16" "mov es:[di+12],eax" \
+	"mov al,fs:[si+480]" "mov ah,fs:[si+510]" \
+	"ror eax,16" "mov al,fs:[si+540]" "mov ah,fs:[si+570]" \
+	"rol eax,16" "mov es:[di+16],eax" \
+	"mov al,fs:[si+600]" "mov ah,fs:[si+630]" \
+	"ror eax,16" "mov al,fs:[si+660]" "mov ah,fs:[si+690]" \
+	"rol eax,16" "mov es:[di+20],eax" \
 	"mov al,fs:[si+720]" "mov es:[di+24],al" \
 	"inc si" \
 	"add di,25" \
