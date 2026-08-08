@@ -51,7 +51,8 @@ The renderer benchmarks build standalone DOS executables. Run them in DOSBox-X
 with `cpu cycles=3000` to compare the production direct paths against their
 bit-identical delta and portable-C oracles. The RGB benchmark also reports the
 run-level fallback, aligned four-stripe groups, phase-shifted groups, and their
-predecoded boundary-edge loop separately:
+predecoded boundary-edge loop separately. It also isolates the three-lane
+groups and the exact C/386 function-crossing range scatter:
 
 ```bat
 tests\run_watcom_bw_bench.bat

@@ -59,8 +59,11 @@ transposed into complete framebuffer bytes, reducing those regions from four
 plane-byte updates to one. Six more four-stripe regions overlap after a
 two-row phase shift; their adjacent normalized codewords are joined before the
 same transpose, while 48 predecoded edge contributions are handled by a small
-RGB-aware 386 loop. Function-pattern crossings use the exact codeword-centric
-scatter fallback. The older delta renderers remain verification oracles.
+RGB-aware 386 loop. Three uninterrupted 0C/30/C0 lane sets are also transposed
+over their complete 168-row intervals while their interrupted fourth lanes
+remain on the run path. Function-pattern crossings use a parameterized exact
+386 codeword scatter over the original placement map. The older delta
+renderers remain verification oracles.
 
 For the optimized RGB3 `/RE:3` schedule, three successive physical DATA images
 `[D0,D1,D2]`, `[D3,D4,D5]`, and `[D6,D7,D8]` produce one parity image containing

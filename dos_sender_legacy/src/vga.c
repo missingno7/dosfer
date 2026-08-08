@@ -70,6 +70,7 @@ static const u8 far *stripe_asm_pair_mask;
 #define VGA_STRIPE_MAX_GROUPS 8
 #define VGA_STRIPE_GROUP_EXACT 1
 #define VGA_STRIPE_GROUP_PHASE 2
+#define VGA_STRIPE_GROUP_TRIPLE 4
 typedef struct {
     u16 first[4];
     u16 count,dest;
@@ -99,6 +100,15 @@ static u16 stripe_phase_group_count,stripe_phase_codewords,
            stripe_phase_destination_bytes,stripe_phase_edge_count;
 static u8 stripe_phase_type;
 static u16 stripe_edge_source_offset;
+#define VGA_STRIPE_MAX_TRIPLES 4
+typedef struct {
+    u16 first[3];
+    u16 count,dest;
+} VgaStripeTriple;
+static VgaStripeTriple stripe_triples[VGA_STRIPE_MAX_TRIPLES];
+static u16 stripe_triple_count,stripe_triple_codewords;
+static const u16 far *direct_range_map;
+static u16 direct_range_count,direct_range_source_offset;
 #ifdef DOSFER_DEVTOOLS
 static u16 delta_bits;
 #endif
@@ -212,6 +222,7 @@ static void free_stream_renderer(void) {
     stripe_group_count=stripe_group_codewords=0;
     stripe_phase_group_count=stripe_phase_codewords=0;
     stripe_phase_destination_bytes=stripe_phase_edge_count=0;
+    stripe_triple_count=stripe_triple_codewords=0;
 #ifdef DOSFER_DEVTOOLS
     delta_bits=0;
 #endif
@@ -809,6 +820,46 @@ static void prepare_stripe_phase_groups(void) {
     }
 }
 
+/* Three long lanes (0C/30/C0) remain after the complete and phase-shifted
+ * four-lane groups.  They share one exact 168-row destination interval; the
+ * interrupted 03 lane can continue through the normal run path. */
+static void prepare_stripe_triples(void) {
+    u16 i,j,top;
+    int slot;
+    stripe_triple_count=stripe_triple_codewords=0;
+    for(i=0;i<stripe_run_count;++i)
+        stripe_runs[i].group_flags&=(u8)~VGA_STRIPE_GROUP_TRIPLE;
+    for(i=0;i<stripe_run_count;++i) {
+        VgaStripeRun far *base=&stripe_runs[i];
+        int found[3]={-1,-1,-1};
+        if(base->group_flags||stripe_group_slot(base->pair_mask[3])!=1||
+           base->direction<=0)continue;
+        found[0]=i;top=stripe_run_top(base);
+        for(j=0;j<stripe_run_count;++j) {
+            VgaStripeRun far *candidate=&stripe_runs[j];
+            if(candidate->group_flags||candidate->count!=base->count||
+               stripe_run_top(candidate)!=top)continue;
+            slot=stripe_group_slot(candidate->pair_mask[3]);
+            if(slot==2&&candidate->direction<0)found[1]=j;
+            if(slot==3&&candidate->direction>0)found[2]=j;
+        }
+        if(found[1]>=0&&found[2]>=0) {
+            VgaStripeTriple *group;
+            if(stripe_triple_count>=VGA_STRIPE_MAX_TRIPLES)break;
+            group=&stripe_triples[stripe_triple_count++];
+            for(slot=0;slot<3;++slot) {
+                group->first[slot]=stripe_runs[found[slot]].first;
+                stripe_runs[found[slot]].group_flags|=
+                    VGA_STRIPE_GROUP_TRIPLE;
+            }
+            group->count=base->count;group->dest=top;
+            stripe_triple_codewords=(u16)(stripe_triple_codewords+
+                base->count*3u);
+        }
+    }
+}
+
+
 static int prepare_placement_map(void) {
     u16 *modules;
     int bits=qrcodegen_dosferPlacementBits();
@@ -836,6 +887,7 @@ static int prepare_placement_map(void) {
     prepare_stripe_runs();
     prepare_stripe_groups();
     prepare_stripe_phase_groups();
+    prepare_stripe_triples();
 #ifdef DOSFER_DEVTOOLS
     delta_bits=(u16)bits;
 #endif
@@ -1463,6 +1515,77 @@ static void directScatter386(void);
     "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
     modify [ax bx cx dx si di bp es fs gs];
 
+/* Exact one-codeword RGB scatter for the short function-pattern gaps.  The
+ * algorithm and packed placement entries are identical to directScatter386;
+ * only the source/map start and count are parameterized. */
+static void directScatterRange386(void);
+#pragma aux directScatterRange386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" \
+    "push ds" "push es" "push fs" "push gs" \
+    "mov di,word ptr ss:direct_range_source_offset" "mov bp,di" "mov bx,di" \
+    "mov ax,word ptr ss:direct_asm_red+2" "mov fs,ax" \
+    "mov ax,word ptr ss:direct_asm_green+2" "mov gs,ax" \
+    "mov ax,word ptr ss:direct_asm_blue+2" "mov es,ax" \
+    "mov si,word ptr ss:direct_range_map" \
+    "mov ax,word ptr ss:direct_range_map+2" "mov ds,ax" \
+    "mov cx,word ptr ss:direct_range_count" "test cx,cx" "jz direct_range_done" \
+    "direct_range_loop:" \
+    "mov al,fs:[di]" "inc di" "mov ah,gs:[bp]" "inc bp" \
+    "mov dh,es:[bx]" "inc bx" "push bp" "push bx" \
+    "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,80h" "jz direct_range_m0_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m0_g:" "test ah,80h" "jz direct_range_m0_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m0_b:" "test dh,80h" "jz direct_range_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m0_done:" \
+    "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,40h" "jz direct_range_m1_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m1_g:" "test ah,40h" "jz direct_range_m1_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m1_b:" "test dh,40h" "jz direct_range_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m1_done:" \
+    "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,20h" "jz direct_range_m2_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m2_g:" "test ah,20h" "jz direct_range_m2_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m2_b:" "test dh,20h" "jz direct_range_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m2_done:" \
+    "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,10h" "jz direct_range_m3_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m3_g:" "test ah,10h" "jz direct_range_m3_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m3_b:" "test dh,10h" "jz direct_range_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m3_done:" \
+    "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,08h" "jz direct_range_m4_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m4_g:" "test ah,08h" "jz direct_range_m4_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m4_b:" "test dh,08h" "jz direct_range_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m4_done:" \
+    "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,04h" "jz direct_range_m5_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m5_g:" "test ah,04h" "jz direct_range_m5_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m5_b:" "test dh,04h" "jz direct_range_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m5_done:" \
+    "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,02h" "jz direct_range_m6_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m6_g:" "test ah,02h" "jz direct_range_m6_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m6_b:" "test dh,02h" "jz direct_range_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m6_done:" \
+    "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" \
+    "test al,01h" "jz direct_range_m7_g" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_range_m7_g:" "test ah,01h" "jz direct_range_m7_b" "xor byte ptr ss:screen_green[bx],dl" \
+    "direct_range_m7_b:" "test dh,01h" "jz direct_range_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_range_m7_done:" \
+    "pop bx" "pop bp" "add si,16" "dec cx" "jnz direct_range_loop" \
+    "direct_range_done:" \
+    "pop gs" "pop fs" "pop es" "pop ds" "pop bp" "pop di" "pop si" \
+    "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp es fs gs];
+
 /* Run-level two-column stripe kernel. All three codeword streams have the
  * same checked far offset. Each source byte is consumed as four two-bit row
  * pairs; DS:SI supplies the run's four combined masks and DI advances by the
@@ -1612,6 +1735,44 @@ static void directStripePhasePlane386(void);
     "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
     modify [ax bx cx dx si di bp fs];
 
+/* Three-lane complete-byte kernel. Lane 03 is deliberately zero; the
+ * uninterrupted 0C/30/C0 streams are normalized and transposed exactly like
+ * the four-lane production group kernel. */
+static void directStripeTriplePlane386(void);
+#pragma aux directStripeTriplePlane386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" "push fs" \
+    "mov ax,word ptr ss:stripe_group_source+2" "mov fs,ax" \
+    "mov si,word ptr ss:stripe_group_src1" \
+    "mov bx,word ptr ss:stripe_group_src2" \
+    "mov di,word ptr ss:stripe_group_dest" \
+    "mov cx,word ptr ss:stripe_group_count_asm" \
+    "test cx,cx" "jz stripe_triple_done" \
+    "stripe_triple_loop:" \
+    "xor eax,eax" "mov ah,fs:[si]" "inc si" \
+    "mov dl,fs:[bx]" "dec bx" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "mov dh,fs:[di]" "inc di" "mov word ptr ss:stripe_group_src3,di" "pop di" \
+    "movzx edx,dx" "shl edx,16" "or eax,edx" \
+    "push bx" "mov edx,eax" "xor bh,bh" \
+    "mov bl,ah" "mov ah,byte ptr ss:stripe_pair_swap[bx]" \
+    "shr edx,16" \
+    "mov bl,dl" "mov dl,byte ptr ss:stripe_bit_reverse[bx]" \
+    "mov bl,dh" "mov dh,byte ptr ss:stripe_pair_swap[bx]" \
+    "and eax,0000ffffh" "shl edx,16" "or eax,edx" "pop bx" \
+    "mov edx,eax" "shr edx,6" "xor edx,eax" "and edx,00cc00cch" \
+    "xor eax,edx" "shl edx,6" "xor eax,edx" \
+    "mov edx,eax" "shr edx,12" "xor edx,eax" "and edx,0000f0f0h" \
+    "xor eax,edx" "shl edx,12" "xor eax,edx" \
+    "xor byte ptr ss:[di],al" "sub di,40" \
+    "xor byte ptr ss:[di],ah" "sub di,40" \
+    "ror eax,16" "xor byte ptr ss:[di],al" "sub di,40" \
+    "xor byte ptr ss:[di],ah" "add di,280" \
+    "dec cx" "jnz stripe_triple_loop" \
+    "stripe_triple_done:" \
+    "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp fs];
+
+
 /* Predecoded 10-byte edge recipes avoid the generic C run lookup and update
  * all three planes while the source byte and destination are hot. */
 static void directStripeEdges386(void);
@@ -1643,14 +1804,31 @@ static void directStripeEdges386(void);
 #else
 static void directScatterBw386(void) {}
 static void directScatter386(void) {}
+static void directScatterRange386(void) {}
 static void directStripe386(u16 source_offset,u16 count,u16 dest,
         u16 pair_mask_offset) {
     (void)source_offset;(void)count;(void)dest;(void)pair_mask_offset;
 }
 static void directStripeGroupPlane386(void) {}
 static void directStripePhasePlane386(void) {}
+static void directStripeTriplePlane386(void) {}
 static void directStripeEdges386(void) {}
 #endif
+
+static void direct_scatter_rgb3_range_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS],u16 source_base,
+        u16 first,u16 count) {
+#ifdef __WATCOMC__
+    (void)codewords;
+    direct_range_source_offset=(u16)(source_base+first);
+    direct_range_count=count;
+    direct_range_map=placement_entry+(u32)first*8UL;
+    directScatterRange386();
+#else
+    (void)source_base;
+    direct_scatter_rgb3_range(codewords,first,count);
+#endif
+}
 
 static int direct_scatter_bw_optimized(const u8 *codewords) {
     if(rgb3_active||!placement_entry||!codewords)return 0;
@@ -1712,6 +1890,20 @@ static void stripe_phase_group_plane(const VgaStripePhaseGroup *group,
     directStripePhasePlane386();
 }
 
+static void stripe_triple_plane(const VgaStripeTriple *group,
+        const u8 far *codewords,int channel) {
+    u16 offset=FP_OFF(codewords);
+    stripe_group_source=codewords;
+    stripe_group_src1=(u16)(offset+group->first[0]);
+    stripe_group_src2=(u16)(offset+group->first[1]+group->count-1);
+    stripe_group_src3=(u16)(offset+group->first[2]);
+    stripe_group_dest=(u16)(FP_OFF((u8 far *)rgb_screen(channel))+
+        group->dest+3u*VGA_BYTES_PER_LINE);
+    stripe_group_count_asm=group->count;
+    directStripeTriplePlane386();
+}
+
+
 static void scatter_phase_edges(
         const u8 *const codewords[VGA_RGB_CHANNELS]) {
 #ifdef __WATCOMC__
@@ -1748,7 +1940,7 @@ static int direct_scatter_rgb3_phased_optimized(
     for(run_index=0;run_index<stripe_run_count;++run_index) {
         VgaStripeRun far *run=&stripe_runs[run_index];
         if(run->first>current)
-            direct_scatter_rgb3_range(codewords,current,
+            direct_scatter_rgb3_range_optimized(codewords,offset,current,
                 (u16)(run->first-current));
         if(!run->group_flags) {
             stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
@@ -1759,7 +1951,7 @@ static int direct_scatter_rgb3_phased_optimized(
         current=(u16)(run->first+run->count);
     }
     if(current<DOSFER_QR_CODEWORDS)
-        direct_scatter_rgb3_range(codewords,current,
+        direct_scatter_rgb3_range_optimized(codewords,offset,current,
             (u16)(DOSFER_QR_CODEWORDS-current));
     for(group_index=0;group_index<stripe_group_count;++group_index)
         for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
@@ -1771,6 +1963,10 @@ static int direct_scatter_rgb3_phased_optimized(
                 codewords[channel],channel);
         }
     scatter_phase_edges(codewords);
+    for(group_index=0;group_index<stripe_triple_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_triple_plane(&stripe_triples[group_index],
+                codewords[channel],channel);
     return 1;
 #else
     return direct_scatter_rgb3(codewords);
@@ -1881,6 +2077,21 @@ void vga_rgb3_stripe_stats(u16 *runs,u16 *covered) {
     if(covered)*covered=stripe_codewords_covered;
 }
 
+int vga_rgb3_stripe_run_info(u16 index,u16 *first,u16 *count,u16 *top,
+        u16 *bottom,u8 *mask,signed char *direction,u8 *group_flags) {
+    VgaStripeRun far *run;
+    if(index>=stripe_run_count)return 0;
+    run=&stripe_runs[index];
+    if(first)*first=run->first;
+    if(count)*count=run->count;
+    if(top)*top=stripe_run_top(run);
+    if(bottom)*bottom=stripe_run_bottom(run);
+    if(mask)*mask=run->pair_mask[3];
+    if(direction)*direction=run->direction;
+    if(group_flags)*group_flags=run->group_flags;
+    return 1;
+}
+
 static int benchmark_stripe_sources(
         const u8 *const codewords[VGA_RGB_CHANNELS],u16 *offset) {
     if(!rgb3_active||!placement_entry||!stripe_runs||!stripe_run_count||
@@ -1894,6 +2105,137 @@ static int benchmark_stripe_sources(
     direct_asm_green=codewords[VGA_RGB_GREEN];
     direct_asm_blue=codewords[VGA_RGB_BLUE];
     return 1;
+}
+
+int vga_rgb3_direct_scatter_fallback_asm(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 run_index,current=0,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range_optimized(codewords,offset,current,
+                (u16)(run->first-current));
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range_optimized(codewords,offset,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_range_asm_full(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef __WATCOMC__
+    u16 run_index,group_index,channel,offset,current=0;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range_optimized(codewords,offset,current,
+                (u16)(run->first-current));
+        if(!run->group_flags) {
+            stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+            stripe_asm_pair_mask=run->pair_mask;
+            directStripe386((u16)(offset+run->first),run->count,run->dest,
+                FP_OFF(run->pair_mask));
+        }
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range_optimized(codewords,offset,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
+    for(group_index=0;group_index<stripe_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_group_plane(&stripe_groups[group_index],codewords[channel],
+                channel);
+    for(group_index=0;group_index<stripe_phase_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_phase_group_plane(&stripe_phase_groups[group_index],
+                codewords[channel],channel);
+    scatter_phase_edges(codewords);
+    for(group_index=0;group_index<stripe_triple_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_triple_plane(&stripe_triples[group_index],
+                codewords[channel],channel);
+    return 1;
+#else
+    return direct_scatter_rgb3(codewords);
+#endif
+}
+
+void vga_rgb3_stripe_triple_stats(u16 *groups,u16 *source_codewords,
+        u16 *destination_bytes) {
+    if(groups)*groups=stripe_triple_count;
+    if(source_codewords)*source_codewords=stripe_triple_codewords;
+    if(destination_bytes)*destination_bytes=(u16)(stripe_triple_codewords/3u*4u);
+}
+
+
+int vga_rgb3_direct_scatter_triple_baseline(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 run_index,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(!(run->group_flags&VGA_STRIPE_GROUP_TRIPLE))continue;
+        stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+        stripe_asm_pair_mask=run->pair_mask;
+        directStripe386((u16)(offset+run->first),run->count,run->dest,
+            FP_OFF(run->pair_mask));
+    }
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_triples(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 group_index,channel,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    (void)offset;
+    for(group_index=0;group_index<stripe_triple_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_triple_plane(&stripe_triples[group_index],
+                codewords[channel],channel);
+    return 1;
+}
+
+
+static int direct_scatter_rgb3_phase_control(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef __WATCOMC__
+    u16 run_index,group_index,channel,offset,current=0;
+    if(!benchmark_stripe_sources(codewords,&offset)||!stripe_triple_count)
+        return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range(codewords,current,
+                (u16)(run->first-current));
+        if(!(run->group_flags&(VGA_STRIPE_GROUP_EXACT|
+                               VGA_STRIPE_GROUP_PHASE))) {
+            stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+            stripe_asm_pair_mask=run->pair_mask;
+            directStripe386((u16)(offset+run->first),run->count,run->dest,
+                FP_OFF(run->pair_mask));
+        }
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range(codewords,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
+    for(group_index=0;group_index<stripe_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_group_plane(&stripe_groups[group_index],codewords[channel],
+                channel);
+    for(group_index=0;group_index<stripe_phase_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_phase_group_plane(&stripe_phase_groups[group_index],
+                codewords[channel],channel);
+    scatter_phase_edges(codewords);
+    return 1;
+#else
+    return direct_scatter_rgb3(codewords);
+#endif
 }
 
 int vga_rgb3_direct_scatter_stripe_runs(
@@ -2067,6 +2409,11 @@ int vga_rgb3_direct_scatter_phase_edges(
 }
 
 int vga_rgb3_direct_scatter_phased(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    return direct_scatter_rgb3_phase_control(codewords);
+}
+
+int vga_rgb3_direct_scatter_with_triples(
         const u8 *const codewords[VGA_RGB_CHANNELS]) {
     return direct_scatter_rgb3_phased_optimized(codewords);
 }

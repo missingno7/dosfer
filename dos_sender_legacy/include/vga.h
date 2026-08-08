@@ -37,8 +37,8 @@ int vga_show_prepared_at(int invert, const char *status, u32 earliest_tick);
 
 /* Production RGB3 steady-state path. Each shadow plane is reset from the
  * fixed V40-L function-pattern template. Regular two-column placement runs
- * use run-level and four-lane byte-transpose kernels; function crossings use
- * the exact map. */
+ * use run-level, four-lane and three-lane byte-transpose kernels; function
+ * crossings use the exact parameterized 386 map scatter. */
 int vga_apply_codewords3_direct(
         const u8 *const codewords[VGA_RGB_CHANNELS]);
 
@@ -85,6 +85,10 @@ int vga_rgb3_direct_scatter(const u8 *const codewords[VGA_RGB_CHANNELS]);
 int vga_rgb3_direct_scatter_asm(const u8 *const codewords[VGA_RGB_CHANNELS]);
 int vga_rgb3_direct_scatter_stripe(const u8 *const codewords[VGA_RGB_CHANNELS]);
 void vga_rgb3_stripe_stats(u16 *runs,u16 *covered);
+int vga_rgb3_stripe_run_info(u16 index,u16 *first,u16 *count,u16 *top,
+        u16 *bottom,u8 *mask,signed char *direction,u8 *group_flags);
+void vga_rgb3_stripe_triple_stats(u16 *groups,u16 *source_codewords,
+                                  u16 *destination_bytes);
 int vga_rgb3_direct_scatter_stripe_runs(
         const u8 *const codewords[VGA_RGB_CHANNELS]);
 int vga_rgb3_direct_scatter_stripe_fallback(
@@ -112,6 +116,16 @@ int vga_rgb3_direct_scatter_phase_kernel(
 int vga_rgb3_direct_scatter_phase_edges(
         const u8 *const codewords[VGA_RGB_CHANNELS]);
 int vga_rgb3_direct_scatter_phased(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_scatter_triple_baseline(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_scatter_triples(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_scatter_with_triples(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_scatter_fallback_asm(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+int vga_rgb3_direct_scatter_range_asm_full(
         const u8 *const codewords[VGA_RGB_CHANNELS]);
 #endif
 
