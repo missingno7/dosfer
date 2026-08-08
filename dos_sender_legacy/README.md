@@ -42,12 +42,25 @@ is incomplete, the final valid logical QR is repeated in unused channels.
 - inversion and end-of-window beep
 - calibration and benchmark modes in developer builds
 
-## RGB3 hot path
+## Direct rendering hot paths
 
-Three persistent codeword streams and three 1-bpp shadow rasters share one
-packed V40 placement map. The steady-state loop processes the same codeword
-position for R/G/B together, loads each placement entry once, and toggles only
-the affected channel rasters.
+BW and RGB3 share one packed V40 placement map and one fixed function-pattern
+raster template. Every steady image restores only the 185-by-24-byte QR strip,
+then scatters the complete interleaved codeword stream directly into the shadow
+raster. There is no previous-codeword comparison in the production path.
+
+The specialized 386 BW loop handles two codewords per iteration with all eight
+module operations unrolled. RGB3 preclassifies uninterrupted two-column QR
+stripes once when constructing the placement map. Its run-level 386 kernel
+processes each R/G/B codeword as four two-bit row pairs with a fixed byte mask
+and signed 40-byte row stride, avoiding per-module placement loads for 3,283 of
+3,706 codewords. Six fully aligned sets of four neighboring stripes are
+transposed into complete framebuffer bytes, reducing those regions from four
+plane-byte updates to one. Six more four-stripe regions overlap after a
+two-row phase shift; their adjacent normalized codewords are joined before the
+same transpose, while 48 predecoded edge contributions are handled by a small
+RGB-aware 386 loop. Function-pattern crossings use the exact codeword-centric
+scatter fallback. The older delta renderers remain verification oracles.
 
 For the optimized RGB3 `/RE:3` schedule, three successive physical DATA images
 `[D0,D1,D2]`, `[D3,D4,D5]`, and `[D6,D7,D8]` produce one parity image containing
@@ -73,8 +86,9 @@ Configure cadence with `/HOLD:n` before transfer.
 ## Existing V40 optimizations retained
 
 - dedicated fixed V40-L packing and block layout;
-- degree-30 two-input-byte Open Watcom Reed-Solomon kernel;
-- persistent codeword streams and fused codeword/raster delta application;
+- degree-30 four-input-byte Open Watcom Reed-Solomon kernel;
+- direct BW and RGB3 codeword-to-raster 386 scatter loops;
+- shared fixed V40-L raster template with QR-strip-only restoration;
 - one 59,296-byte placement map instead of duplicate maps;
 - status-row upload suppression in release builds;
 - direct CRTC page flips and retrace-aware absolute `/HOLD` deadlines;

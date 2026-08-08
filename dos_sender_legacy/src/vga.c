@@ -48,10 +48,57 @@ static u8
  * shadow-raster byte offset, high 3 bits select the pixel bit in that byte.
  * This replaces the old 16-bit offset + separate 8-bit mask tables, saving
  * 29,648 bytes and one far-memory load for every changed module. */
-static u16 far *delta_entry;
-static u8 far *rgb3_template;
+static u16 far *placement_entry;
+/* Fixed V40-L function-module raster shared by the BW and RGB3 direct
+ * renderers. All three RGB planes have the same function patterns. */
+static u8 far *direct_template;
 static const u8 far *direct_asm_red,*direct_asm_green,*direct_asm_blue;
+static const u8 far *direct_asm_bw;
 static const u16 far *direct_asm_map;
+#define VGA_STRIPE_MIN_RUN 4
+#define VGA_STRIPE_MAX_RUNS 256
+typedef struct {
+    u16 first,count,dest;
+    signed char direction;
+    u8 pair_mask[4];
+    u8 group_flags;
+} VgaStripeRun;
+static VgaStripeRun far *stripe_runs;
+static u16 stripe_run_count,stripe_codewords_covered;
+static u16 stripe_asm_step;
+static const u8 far *stripe_asm_pair_mask;
+#define VGA_STRIPE_MAX_GROUPS 8
+#define VGA_STRIPE_GROUP_EXACT 1
+#define VGA_STRIPE_GROUP_PHASE 2
+typedef struct {
+    u16 first[4];
+    u16 count,dest;
+} VgaStripeGroup;
+static VgaStripeGroup stripe_groups[VGA_STRIPE_MAX_GROUPS];
+static u16 stripe_group_count,stripe_group_codewords;
+static u8 stripe_pair_swap[256],stripe_bit_reverse[256];
+static const u8 far *stripe_group_source;
+static u16 stripe_group_src0,stripe_group_src1,stripe_group_src2,
+           stripe_group_src3,stripe_group_dest,stripe_group_count_asm;
+#define VGA_STRIPE_MAX_PHASE_GROUPS 8
+#define VGA_STRIPE_MAX_EDGES 64
+typedef struct {
+    u16 first[4];
+    u16 count,dest;
+    u8 phase;
+} VgaStripePhaseGroup;
+typedef struct {
+    u16 codeword,dest;
+    u8 shift;
+    u8 pair_mask[4];
+    u8 pad;
+} VgaStripeEdge;
+static VgaStripePhaseGroup stripe_phase_groups[VGA_STRIPE_MAX_PHASE_GROUPS];
+static VgaStripeEdge stripe_phase_edges[VGA_STRIPE_MAX_EDGES];
+static u16 stripe_phase_group_count,stripe_phase_codewords,
+           stripe_phase_destination_bytes,stripe_phase_edge_count;
+static u8 stripe_phase_type;
+static u16 stripe_edge_source_offset;
 #ifdef DOSFER_DEVTOOLS
 static u16 delta_bits;
 #endif
@@ -154,11 +201,17 @@ static void dosferClearFull320(u8 far *dest) {
 }
 #endif
 
-static void free_delta(void) {
-    if(delta_entry)free(delta_entry);
-    if(rgb3_template)_ffree(rgb3_template);
-    delta_entry=0;
-    rgb3_template=0;
+static void free_stream_renderer(void) {
+    if(placement_entry)free(placement_entry);
+    if(direct_template)_ffree(direct_template);
+    if(stripe_runs)_ffree(stripe_runs);
+    placement_entry=0;
+    direct_template=0;
+    stripe_runs=0;
+    stripe_run_count=stripe_codewords_covered=0;
+    stripe_group_count=stripe_group_codewords=0;
+    stripe_phase_group_count=stripe_phase_codewords=0;
+    stripe_phase_destination_bytes=stripe_phase_edge_count=0;
 #ifdef DOSFER_DEVTOOLS
     delta_bits=0;
 #endif
@@ -250,7 +303,7 @@ static void setup_planar_write(void) {
 }
 
 int vga_enter(VideoMode mode,int rgb3) {
-    free_delta();
+    free_stream_renderer();
     vga_dac_present=bios_vga_present();
     bios_mode(0x0D);
     crtc_port=(inp(0x3CC)&1)?0x3D4:0x3B4;
@@ -289,7 +342,7 @@ int vga_enter(VideoMode mode,int rgb3) {
 }
 
 void vga_leave(void) {
-    free_delta();
+    free_stream_renderer();
     screen_invert=-1;
     rgb3_active=0;
     if(vga_active){
@@ -503,7 +556,260 @@ static void copy_rgb3_flip(u32 earliest_tick) {
     finish_page_flip(earliest_tick);
 }
 
-static int prepare_delta(void) {
+/* Recognize uninterrupted same-byte two-column stripes directly from the
+ * production framebuffer map. A run descriptor replaces all 8*count module
+ * entries in the stripe kernel; crossings remain on the exact
+ * placement-map fallback. */
+static int stripe_codeword_shape(u16 codeword,signed char *direction,
+        u16 *dest,u8 *right_mask,u8 *left_mask) {
+    const u16 far *entry=placement_entry+(u32)codeword*8UL;
+    u16 first=(u16)(entry[0]&0x1FFF),row;
+    int step;
+
+    if((entry[1]&0x1FFF)!=first)return 0;
+    step=(int)(entry[2]&0x1FFF)-(int)first;
+    if(step!=VGA_BYTES_PER_LINE&&step!=-VGA_BYTES_PER_LINE)return 0;
+    *direction=(signed char)(step>0?1:-1);
+    *right_mask=pixel_mask[entry[0]>>13];
+    *left_mask=pixel_mask[entry[1]>>13];
+    for(row=0;row<4;++row) {
+        u16 expected=(u16)(first+(int)row*step);
+        if((entry[row*2]&0x1FFF)!=expected||
+           (entry[row*2+1]&0x1FFF)!=expected||
+           pixel_mask[entry[row*2]>>13]!=*right_mask||
+           pixel_mask[entry[row*2+1]>>13]!=*left_mask)return 0;
+    }
+    *dest=first;
+    return 1;
+}
+
+static void prepare_stripe_runs(void) {
+    u16 first=0,count,next_dest,dest;
+    u8 right_mask,left_mask,next_right,next_left;
+    signed char direction,next_direction;
+
+    stripe_runs=(VgaStripeRun far *)_fmalloc(
+        VGA_STRIPE_MAX_RUNS*sizeof(VgaStripeRun));
+    if(!stripe_runs)return;
+    while(first<DOSFER_QR_CODEWORDS) {
+        if(!stripe_codeword_shape(first,&direction,&dest,
+                &right_mask,&left_mask)) {++first;continue;}
+        count=1;
+        while(first+count<DOSFER_QR_CODEWORDS&&
+              stripe_codeword_shape((u16)(first+count),&next_direction,
+                  &next_dest,&next_right,&next_left)&&
+              next_direction==direction&&next_right==right_mask&&
+              next_left==left_mask&&
+              next_dest==(u16)(dest+(int)count*(int)direction*160))++count;
+        if(count>=VGA_STRIPE_MIN_RUN) {
+            VgaStripeRun far *run;
+            if(stripe_run_count>=VGA_STRIPE_MAX_RUNS) {
+                _ffree(stripe_runs);stripe_runs=0;
+                stripe_run_count=stripe_codewords_covered=0;return;
+            }
+            run=&stripe_runs[stripe_run_count++];
+            run->first=first;run->count=count;run->dest=dest;
+            run->direction=direction;
+            run->pair_mask[0]=0;
+            run->pair_mask[1]=left_mask;
+            run->pair_mask[2]=right_mask;
+            run->pair_mask[3]=(u8)(right_mask|left_mask);
+            run->group_flags=0;
+            stripe_codewords_covered=(u16)(stripe_codewords_covered+count);
+        }
+        first=(u16)(first+count);
+    }
+}
+
+static int stripe_group_slot(u8 mask) {
+    if(mask==0x03)return 0;
+    if(mask==0x0C)return 1;
+    if(mask==0x30)return 2;
+    if(mask==0xC0)return 3;
+    return -1;
+}
+
+static u16 stripe_run_top(const VgaStripeRun far *run) {
+    if(run->direction>0)return run->dest;
+    return (u16)(run->dest-(u16)(run->count*4u-1u)*VGA_BYTES_PER_LINE);
+}
+
+/* Find complete framebuffer-byte regions formed by the four regular
+ * two-column masks. The alternating directions are the fixed V40 zigzag:
+ * 03/30 run upward in placement order, 0C/C0 downward. */
+static void prepare_stripe_groups(void) {
+    u16 i,j,top;
+    int slot;
+    u8 value;
+
+    stripe_group_count=stripe_group_codewords=0;
+    for(i=0;i<stripe_run_count;++i)stripe_runs[i].group_flags=0;
+    for(i=0;i<256;++i) {
+        stripe_pair_swap[i]=(u8)(((i&0xAAu)>>1)|((i&0x55u)<<1));
+        value=(u8)i;
+        value=(u8)((value>>4)|(value<<4));
+        value=(u8)(((value&0xCCu)>>2)|((value&0x33u)<<2));
+        stripe_bit_reverse[i]=(u8)(((value&0xAAu)>>1)|((value&0x55u)<<1));
+    }
+    for(i=0;i<stripe_run_count;++i) {
+        VgaStripeRun far *base=&stripe_runs[i];
+        int found[4]={-1,-1,-1,-1};
+        if((base->group_flags&VGA_STRIPE_GROUP_EXACT)||
+           stripe_group_slot(base->pair_mask[3])!=0)
+            continue;
+        top=stripe_run_top(base);
+        for(j=i;j<stripe_run_count;++j) {
+            VgaStripeRun far *candidate=&stripe_runs[j];
+            if((candidate->group_flags&VGA_STRIPE_GROUP_EXACT)||
+               candidate->count!=base->count||
+               stripe_run_top(candidate)!=top)continue;
+            slot=stripe_group_slot(candidate->pair_mask[3]);
+            if(slot>=0&&found[slot]<0)found[slot]=j;
+        }
+        if(found[0]>=0&&found[1]>=0&&found[2]>=0&&found[3]>=0&&
+           stripe_runs[found[0]].direction<0&&
+           stripe_runs[found[1]].direction>0&&
+           stripe_runs[found[2]].direction<0&&
+           stripe_runs[found[3]].direction>0) {
+            VgaStripeGroup *group;
+            if(stripe_group_count>=VGA_STRIPE_MAX_GROUPS)break;
+            group=&stripe_groups[stripe_group_count++];
+            for(slot=0;slot<4;++slot) {
+                group->first[slot]=stripe_runs[found[slot]].first;
+                stripe_runs[found[slot]].group_flags|=VGA_STRIPE_GROUP_EXACT;
+            }
+            group->count=base->count;group->dest=top;
+            stripe_group_codewords=(u16)(stripe_group_codewords+
+                base->count*4u);
+        }
+    }
+}
+
+static u16 stripe_run_bottom(const VgaStripeRun far *run) {
+    return (u16)(stripe_run_top(run)+
+        (u16)(run->count*4u-1u)*VGA_BYTES_PER_LINE);
+}
+
+/* Find the adjacent complete-byte regions whose four mask lanes have the
+ * same 164-row overlap but are displaced by two rows.  Keeping this derived
+ * from the placement stream makes the experiment self-checking and avoids
+ * embedding V40 codeword indices in the renderer. */
+static void prepare_stripe_phase_groups(void) {
+    u16 i,j,k,top0,bottom0,top1,bottom1,overlap_top,overlap_bottom;
+    int slot;
+
+    stripe_phase_group_count=stripe_phase_codewords=0;
+    stripe_phase_destination_bytes=stripe_phase_edge_count=0;
+    for(i=0;i<stripe_run_count;++i)
+        stripe_runs[i].group_flags&=(u8)~VGA_STRIPE_GROUP_PHASE;
+    if(sizeof(VgaStripeEdge)!=10)return; /* ASM recipe stride contract. */
+    for(i=0;i<stripe_run_count;++i) {
+        VgaStripeRun far *run0=&stripe_runs[i];
+        int reverse[2]={-1,-1},forward[2]={-1,-1};
+        VgaStripePhaseGroup *group;
+        u8 phase;
+
+        if(run0->group_flags||
+           stripe_group_slot(run0->pair_mask[3])!=0||
+           run0->direction>=0)continue;
+        reverse[0]=i;
+        top0=stripe_run_top(run0);bottom0=stripe_run_bottom(run0);
+        for(j=0;j<stripe_run_count;++j) {
+            VgaStripeRun far *candidate=&stripe_runs[j];
+            if(candidate->group_flags)continue;
+            slot=stripe_group_slot(candidate->pair_mask[3]);
+            if(slot==2&&candidate->direction<0&&
+               candidate->count==run0->count&&
+               stripe_run_top(candidate)==top0&&
+               stripe_run_bottom(candidate)==bottom0) {
+                reverse[1]=j;break;
+            }
+        }
+        if(reverse[1]<0)continue;
+        for(j=0;j<stripe_run_count;++j) {
+            VgaStripeRun far *candidate=&stripe_runs[j];
+            if(candidate->group_flags||
+               candidate->direction<=0||
+               stripe_group_slot(candidate->pair_mask[3])!=1)continue;
+            top1=stripe_run_top(candidate);bottom1=stripe_run_bottom(candidate);
+            if(!((top0+2u*VGA_BYTES_PER_LINE==top1&&
+                  bottom0==bottom1+2u*VGA_BYTES_PER_LINE)||
+                 (top1+2u*VGA_BYTES_PER_LINE==top0&&
+                  bottom1==bottom0+2u*VGA_BYTES_PER_LINE)))continue;
+            forward[0]=j;
+            for(k=0;k<stripe_run_count;++k) {
+                VgaStripeRun far *mate=&stripe_runs[k];
+                if(mate->group_flags||
+                   mate->direction<=0||
+                   stripe_group_slot(mate->pair_mask[3])!=3)continue;
+                if(mate->count==candidate->count&&
+                   stripe_run_top(mate)==top1&&
+                   stripe_run_bottom(mate)==bottom1) {
+                    forward[1]=k;break;
+                }
+            }
+            if(forward[1]>=0)break;
+            forward[0]=-1;
+        }
+        if(forward[0]<0||forward[1]<0)continue;
+        overlap_top=top0>top1?top0:top1;
+        overlap_bottom=bottom0<bottom1?bottom0:bottom1;
+        if(overlap_bottom<overlap_top||
+           (u16)((overlap_bottom-overlap_top)/VGA_BYTES_PER_LINE+1u)!=164u)
+            continue;
+        phase=(u8)(top0<top1?1:2);
+        if(stripe_phase_group_count>=VGA_STRIPE_MAX_PHASE_GROUPS)break;
+        group=&stripe_phase_groups[stripe_phase_group_count++];
+        group->first[0]=stripe_runs[reverse[0]].first;
+        group->first[1]=stripe_runs[forward[0]].first;
+        group->first[2]=stripe_runs[reverse[1]].first;
+        group->first[3]=stripe_runs[forward[1]].first;
+        group->count=41;group->dest=overlap_top;group->phase=phase;
+        stripe_runs[reverse[0]].group_flags|=VGA_STRIPE_GROUP_PHASE;
+        stripe_runs[reverse[1]].group_flags|=VGA_STRIPE_GROUP_PHASE;
+        stripe_runs[forward[0]].group_flags|=VGA_STRIPE_GROUP_PHASE;
+        stripe_runs[forward[1]].group_flags|=VGA_STRIPE_GROUP_PHASE;
+        stripe_phase_codewords=(u16)(stripe_phase_codewords+
+            stripe_runs[reverse[0]].count+stripe_runs[reverse[1]].count+
+            stripe_runs[forward[0]].count+stripe_runs[forward[1]].count);
+        stripe_phase_destination_bytes=(u16)(
+            stripe_phase_destination_bytes+164u);
+
+        /* Record only the rows outside the common interval. They are exact
+         * original run contributions and are applied after the phase kernel. */
+        for(slot=0;slot<4;++slot) {
+            u16 run_index=(u16)(slot==0?reverse[0]:slot==1?forward[0]:
+                                slot==2?reverse[1]:forward[1]);
+            VgaStripeRun far *run=&stripe_runs[run_index];
+            u16 codeword,pair,dest;
+            for(codeword=0;codeword<run->count;++codeword)
+                for(pair=0;pair<4;++pair) {
+                    dest=(u16)(run->dest+(int)run->direction*
+                        (int)(codeword*4u+pair)*VGA_BYTES_PER_LINE);
+                    if(dest>=overlap_top&&dest<=overlap_bottom)continue;
+                    if(stripe_phase_edge_count>=VGA_STRIPE_MAX_EDGES) {
+                        stripe_phase_group_count=stripe_phase_codewords=0;
+                        stripe_phase_destination_bytes=stripe_phase_edge_count=0;
+                        for(k=0;k<stripe_run_count;++k)
+                            stripe_runs[k].group_flags&=
+                                (u8)~VGA_STRIPE_GROUP_PHASE;
+                        return;
+                    }
+                    stripe_phase_edges[stripe_phase_edge_count].codeword=
+                        (u16)(run->first+codeword);
+                    stripe_phase_edges[stripe_phase_edge_count].dest=dest;
+                    stripe_phase_edges[stripe_phase_edge_count].shift=
+                        (u8)(6u-pair*2u);
+                    memcpy(stripe_phase_edges[stripe_phase_edge_count].pair_mask,
+                        run->pair_mask,4);
+                    stripe_phase_edges[stripe_phase_edge_count].pad=0;
+                    ++stripe_phase_edge_count;
+                }
+        }
+    }
+}
+
+static int prepare_placement_map(void) {
     u16 *modules;
     int bits=qrcodegen_dosferPlacementBits();
     int i,x,y,px;
@@ -517,16 +823,19 @@ static int prepare_delta(void) {
     modules=qrcodegen_dosferTakePlacementModules();
     if(!modules)return 0;
 
-    free_delta();
-    delta_entry=modules;
+    free_stream_renderer();
+    placement_entry=modules;
     for(i=0;i<bits;++i){
-        linear=delta_entry[i];
+        linear=placement_entry[i];
         y=linear/DOSFER_QR_SIZE;
         x=linear-y*DOSFER_QR_SIZE;
         px=QR_X0+DOSFER_QR_QUIET+x;
-        delta_entry[i]=(u16)(((QR_Y0+y)*VGA_BYTES_PER_LINE+(px>>3))|
+        placement_entry[i]=(u16)(((QR_Y0+y)*VGA_BYTES_PER_LINE+(px>>3))|
             ((u16)(px&7)<<13));
     }
+    prepare_stripe_runs();
+    prepare_stripe_groups();
+    prepare_stripe_phase_groups();
 #ifdef DOSFER_DEVTOOLS
     delta_bits=(u16)bits;
 #endif
@@ -548,7 +857,7 @@ static int prepare_delta(void) {
 } while(0)
 
 int vga_apply_codeword_delta(const u8 *next_codewords,u8 *current_codewords) {
-    const u16 far *map=delta_entry;
+    const u16 far *map=placement_entry;
     const u8 far *next=next_codewords;
     u8 far *current=current_codewords;
     u16 i;
@@ -557,7 +866,7 @@ int vga_apply_codeword_delta(const u8 *next_codewords,u8 *current_codewords) {
     u32 profile_start=timer_ticks();
 #endif
 
-    if(!delta_entry||!next_codewords||!current_codewords)return 0;
+    if(!placement_entry||!next_codewords||!current_codewords)return 0;
     for(i=0;i<DOSFER_QR_CODEWORDS;++i,map+=8) {
         changed=(u8)(*next^*current);
         *current++=*next++;
@@ -580,7 +889,7 @@ int vga_apply_v40l_delta(const u8 *data_codewords,const u8 *ecc_blocks,
         1180,1298,1416,1534,1652,1770,1888,2006,2124,
         2242,2361,2480,2599,2718,2837
     };
-    const u16 far *map=delta_entry;
+    const u16 far *map=placement_entry;
     u8 far *current=current_codewords;
     u16 cw=0;
     int row,block;
@@ -589,7 +898,7 @@ int vga_apply_v40l_delta(const u8 *data_codewords,const u8 *ecc_blocks,
     u32 profile_start=timer_ticks();
 #endif
 
-    if(!delta_entry||!data_codewords||!ecc_blocks||!current_codewords)return 0;
+    if(!placement_entry||!data_codewords||!ecc_blocks||!current_codewords)return 0;
 
 #define EMIT_VALUE(v) do { \
         value=(u8)(v); \
@@ -643,7 +952,7 @@ int vga_apply_v40l_delta(const u8 *data_codewords,const u8 *ecc_blocks,
 int vga_apply_codeword_delta3(
         const u8 *const next_codewords[VGA_RGB_CHANNELS],
         u8 *const current_codewords[VGA_RGB_CHANNELS]) {
-    const u16 far *map=delta_entry;
+    const u16 far *map=placement_entry;
     const u8 far *next_r,*next_g,*next_b;
     u8 far *current_r,*current_g,*current_b;
     u16 i;
@@ -652,7 +961,7 @@ int vga_apply_codeword_delta3(
     u32 profile_start=timer_ticks();
 #endif
 
-    if(!rgb3_active||!delta_entry||!next_codewords||!current_codewords||
+    if(!rgb3_active||!placement_entry||!next_codewords||!current_codewords||
        !next_codewords[VGA_RGB_RED]||!next_codewords[VGA_RGB_GREEN]||
        !next_codewords[VGA_RGB_BLUE]||!current_codewords[VGA_RGB_RED]||
        !current_codewords[VGA_RGB_GREEN]||!current_codewords[VGA_RGB_BLUE])return 0;
@@ -687,7 +996,7 @@ int vga_apply_v40l_delta3(
         1180,1298,1416,1534,1652,1770,1888,2006,2124,
         2242,2361,2480,2599,2718,2837
     };
-    const u16 far *map=delta_entry;
+    const u16 far *map=placement_entry;
     u8 far *current_r,*current_g,*current_b;
     u16 cw=0;
     int row,block;
@@ -696,7 +1005,7 @@ int vga_apply_v40l_delta3(
     u32 profile_start=timer_ticks();
 #endif
 
-    if(!rgb3_active||!delta_entry||!data_codewords||!ecc_blocks||
+    if(!rgb3_active||!placement_entry||!data_codewords||!ecc_blocks||
        !current_codewords)return 0;
     for(block=0;block<VGA_RGB_CHANNELS;++block)
         if(!data_codewords[block]||!ecc_blocks[block]||
@@ -750,11 +1059,69 @@ int vga_apply_v40l_delta3(
 #undef RGB_STAT_MAP
 
 int vga_delta_ready(void) {
-    return delta_entry!=0;
+    return placement_entry!=0;
 }
 
 int vga_rgb3_active(void) {
     return rgb3_active;
+}
+
+/* Dense monochrome renderer matching the RGB3 direct algorithm: start from
+ * the fixed function raster and toggle every set codeword module through the
+ * sequential placement map. */
+static int direct_scatter_bw(const u8 *codewords) {
+    const u16 far *map=placement_entry;
+    const u8 far *source=codewords;
+    u16 i;
+    u8 value;
+
+    if(rgb3_active||!placement_entry||!codewords)return 0;
+#define DIRECT_BW_MODULE(k,b) do { \
+    if(value&(b)) { \
+        u16 entry__=(map)[k]; \
+        screen_320[entry__&0x1FFF]^=pixel_mask[entry__>>13]; \
+    } \
+} while(0)
+    for(i=0;i<DOSFER_QR_CODEWORDS;++i,map+=8) {
+        value=*source++;
+        DIRECT_BW_MODULE(0,0x80); DIRECT_BW_MODULE(1,0x40);
+        DIRECT_BW_MODULE(2,0x20); DIRECT_BW_MODULE(3,0x10);
+        DIRECT_BW_MODULE(4,0x08); DIRECT_BW_MODULE(5,0x04);
+        DIRECT_BW_MODULE(6,0x02); DIRECT_BW_MODULE(7,0x01);
+    }
+#undef DIRECT_BW_MODULE
+    return 1;
+}
+
+static int direct_scatter_bw_optimized(const u8 *codewords);
+
+static int ensure_direct_template(void) {
+    if(!direct_template)direct_template=(u8 far *)_fmalloc(VGA_VISIBLE_BYTES);
+    return direct_template!=0;
+}
+
+static int capture_bw_template(const u8 *codewords) {
+    if(!ensure_direct_template())return 0;
+    if(!direct_scatter_bw_optimized(codewords))return 0;
+    _fmemcpy(direct_template,screen_320,VGA_VISIBLE_BYTES);
+    return direct_scatter_bw_optimized(codewords);
+}
+
+int vga_direct_ready(void) {
+    return placement_entry&&direct_template;
+}
+
+int vga_apply_codewords_direct(const u8 *codewords) {
+#ifdef DOSFER_PROFILE
+    u32 profile_start=timer_ticks();
+#endif
+    if(rgb3_active||!vga_direct_ready())return 0;
+    dosferCopyQr320(direct_template,screen_320);
+    if(!direct_scatter_bw_optimized(codewords))return 0;
+#ifdef DOSFER_PROFILE
+    dosferVgaProfileTicks[0]+=timer_ticks()-profile_start;
+#endif
+    return 1;
 }
 
 /* Dense production renderer. It starts from a function-module raster template
@@ -762,12 +1129,12 @@ int vga_rgb3_active(void) {
  * existing placement map. It deliberately has no previous-codeword state or
  * delta comparison. */
 static int direct_scatter_rgb3(const u8 *const codewords[VGA_RGB_CHANNELS]) {
-    const u16 far *map=delta_entry;
+    const u16 far *map=placement_entry;
     const u8 far *red,*green,*blue;
     u16 i;
     u8 value_r,value_g,value_b,value_any;
 
-    if(!rgb3_active||!delta_entry||!codewords||!codewords[VGA_RGB_RED]||
+    if(!rgb3_active||!placement_entry||!codewords||!codewords[VGA_RGB_RED]||
             !codewords[VGA_RGB_GREEN]||!codewords[VGA_RGB_BLUE])return 0;
     red=codewords[VGA_RGB_RED];green=codewords[VGA_RGB_GREEN];
     blue=codewords[VGA_RGB_BLUE];
@@ -795,17 +1162,50 @@ static int direct_scatter_rgb3(const u8 *const codewords[VGA_RGB_CHANNELS]) {
     return 1;
 }
 
+static void direct_scatter_rgb3_range(
+        const u8 *const codewords[VGA_RGB_CHANNELS],u16 first,u16 count) {
+    const u16 far *map=placement_entry+(u32)first*8UL;
+    const u8 far *red=codewords[VGA_RGB_RED]+first;
+    const u8 far *green=codewords[VGA_RGB_GREEN]+first;
+    const u8 far *blue=codewords[VGA_RGB_BLUE]+first;
+    u16 i;
+    u8 value_r,value_g,value_b,value_any;
+
+#define DIRECT_RANGE_MODULE(k,b) do { \
+    if(value_any&(b)) { \
+        u16 entry__=(map)[k]; \
+        u16 offset__=(u16)(entry__&0x1FFF); \
+        u8 pixel__=pixel_mask[entry__>>13]; \
+        if(value_r&(b))screen_320[offset__]^=pixel__; \
+        if(value_g&(b))screen_green[offset__]^=pixel__; \
+        if(value_b&(b))screen_blue[offset__]^=pixel__; \
+    } \
+} while(0)
+    for(i=0;i<count;++i,map+=8) {
+        value_r=*red++;value_g=*green++;value_b=*blue++;
+        value_any=(u8)(value_r|value_g|value_b);
+        if(value_any) {
+            DIRECT_RANGE_MODULE(0,0x80);DIRECT_RANGE_MODULE(1,0x40);
+            DIRECT_RANGE_MODULE(2,0x20);DIRECT_RANGE_MODULE(3,0x10);
+            DIRECT_RANGE_MODULE(4,0x08);DIRECT_RANGE_MODULE(5,0x04);
+            DIRECT_RANGE_MODULE(6,0x02);DIRECT_RANGE_MODULE(7,0x01);
+        }
+    }
+#undef DIRECT_RANGE_MODULE
+}
+
 static int direct_scatter_rgb3_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS]);
+static int direct_scatter_rgb3_stripe_optimized(
         const u8 *const codewords[VGA_RGB_CHANNELS]);
 
 static int capture_rgb3_template(const u8 *const codewords[VGA_RGB_CHANNELS]) {
     int ok;
-    if(!rgb3_template)rgb3_template=(u8 far *)_fmalloc(VGA_VISIBLE_BYTES);
-    if(!rgb3_template)return 0;
+    if(!ensure_direct_template())return 0;
     /* The current shadows contain a complete QR. Toggling its data modules
      * out leaves the mask-specific fixed V40-L function raster. */
-    if(!direct_scatter_rgb3_optimized(codewords))return 0;
-    _fmemcpy(rgb3_template,screen_320,VGA_VISIBLE_BYTES);
+    if(!direct_scatter_rgb3_stripe_optimized(codewords))return 0;
+    _fmemcpy(direct_template,screen_320,VGA_VISIBLE_BYTES);
 #ifdef DOSFER_DEVTOOLS
     ok=!memcmp(screen_320,screen_green,VGA_VISIBLE_BYTES)&&
        !memcmp(screen_320,screen_blue,VGA_VISIBLE_BYTES);
@@ -813,12 +1213,8 @@ static int capture_rgb3_template(const u8 *const codewords[VGA_RGB_CHANNELS]) {
     ok=1;
 #endif
     /* Restore the complete QR even when the diagnostic equality check fails. */
-    if(!direct_scatter_rgb3_optimized(codewords))return 0;
+    if(!direct_scatter_rgb3_stripe_optimized(codewords))return 0;
     return ok;
-}
-
-int vga_rgb3_direct_ready(void) {
-    return rgb3_active&&delta_entry&&rgb3_template;
 }
 
 int vga_apply_codewords3_direct(
@@ -826,11 +1222,11 @@ int vga_apply_codewords3_direct(
 #ifdef DOSFER_PROFILE
     u32 profile_start=timer_ticks();
 #endif
-    if(!vga_rgb3_direct_ready())return 0;
-    _fmemcpy(screen_320,rgb3_template,VGA_VISIBLE_BYTES);
-    _fmemcpy(screen_green,rgb3_template,VGA_VISIBLE_BYTES);
-    _fmemcpy(screen_blue,rgb3_template,VGA_VISIBLE_BYTES);
-    if(!direct_scatter_rgb3_optimized(codewords))return 0;
+    if(!rgb3_active||!vga_direct_ready())return 0;
+    dosferCopyQr320(direct_template,screen_320);
+    dosferCopyQr320(direct_template,screen_green);
+    dosferCopyQr320(direct_template,screen_blue);
+    if(!direct_scatter_rgb3_stripe_optimized(codewords))return 0;
 #ifdef DOSFER_PROFILE
     dosferVgaProfileTicks[0]+=timer_ticks()-profile_start;
 #endif
@@ -839,10 +1235,10 @@ int vga_apply_codewords3_direct(
 
 #ifdef DOSFER_DIRECT_BENCH
 int vga_rgb3_direct_reset_template(void) {
-    if(!vga_rgb3_direct_ready())return 0;
-    _fmemcpy(screen_320,rgb3_template,VGA_VISIBLE_BYTES);
-    _fmemcpy(screen_green,rgb3_template,VGA_VISIBLE_BYTES);
-    _fmemcpy(screen_blue,rgb3_template,VGA_VISIBLE_BYTES);
+    if(!rgb3_active||!vga_direct_ready())return 0;
+    dosferCopyQr320(direct_template,screen_320);
+    dosferCopyQr320(direct_template,screen_green);
+    dosferCopyQr320(direct_template,screen_blue);
     return 1;
 }
 
@@ -850,9 +1246,93 @@ int vga_rgb3_direct_scatter(const u8 *const codewords[VGA_RGB_CHANNELS]) {
     return direct_scatter_rgb3(codewords);
 }
 
+int vga_direct_reset_template(void) {
+    if(rgb3_active||!vga_direct_ready())return 0;
+    dosferCopyQr320(direct_template,screen_320);
+    return 1;
+}
+
+int vga_direct_scatter(const u8 *codewords) {
+    return direct_scatter_bw(codewords);
+}
+
+int vga_direct_scatter_asm(const u8 *codewords) {
+    return direct_scatter_bw_optimized(codewords);
+}
+
 #endif
 
 #ifdef __WATCOMC__
+/* Exact BW codeword-centric scatter. FS streams the codewords, DS streams
+ * the placement map, and SS explicitly addresses near renderer state. */
+static void directScatterBw386(void);
+#pragma aux directScatterBw386 = \
+    "push ax" "push bx" "push cx" "push dx" \
+    "push si" "push di" "push bp" \
+    "push ds" "push fs" \
+    "mov di,word ptr ss:direct_asm_bw" \
+    "mov ax,word ptr ss:direct_asm_bw+2" "mov fs,ax" \
+    "mov si,word ptr ss:direct_asm_map" \
+    "mov ax,word ptr ss:direct_asm_map+2" "mov ds,ax" \
+    "mov cx,1853" \
+    "direct_bw_loop:" \
+    "mov al,fs:[di]" "inc di" \
+    "test al,80h" "jz direct_bw_m1" \
+    "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m1:" "test al,40h" "jz direct_bw_m2" \
+    "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m2:" "test al,20h" "jz direct_bw_m3" \
+    "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m3:" "test al,10h" "jz direct_bw_m4" \
+    "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m4:" "test al,08h" "jz direct_bw_m5" \
+    "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m5:" "test al,04h" "jz direct_bw_m6" \
+    "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m6:" "test al,02h" "jz direct_bw_m7" \
+    "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_m7:" "test al,01h" "jz direct_bw_done" \
+    "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw_done:" "add si,16" \
+    "mov al,fs:[di]" "inc di" \
+    "test al,80h" "jz direct_bw2_m1" \
+    "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m1:" "test al,40h" "jz direct_bw2_m2" \
+    "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m2:" "test al,20h" "jz direct_bw2_m3" \
+    "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m3:" "test al,10h" "jz direct_bw2_m4" \
+    "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m4:" "test al,08h" "jz direct_bw2_m5" \
+    "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m5:" "test al,04h" "jz direct_bw2_m6" \
+    "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m6:" "test al,02h" "jz direct_bw2_m7" \
+    "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_m7:" "test al,01h" "jz direct_bw2_done" \
+    "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
+    "mov dl,byte ptr ss:pixel_mask[bp]" "xor byte ptr ss:screen_320[bx],dl" \
+    "direct_bw2_done:" "add si,16" \
+    "dec cx" "jnz direct_bw_loop" \
+    "pop fs" "pop ds" \
+    "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp fs];
+
 /* Exact codeword-centric scatter, with all eight source bits and two
  * codewords per outer iteration unrolled. DS streams the packed placement
  * map; FS/GS/ES stream R/G/B once per codeword; SS explicitly addresses the
@@ -872,134 +1352,506 @@ static void directScatter386(void);
     "mov ax,word ptr ss:direct_asm_map+2" "mov ds,ax" \
     "mov cx,1853" \
     "direct_asm1_loop:" \
-    "xor eax,eax" \
     "mov al,fs:[di]" "inc di" \
     "mov ah,gs:[bp]" "inc bp" \
-    "mov dl,es:[bx]" "inc bx" \
-    "shl edx,16" "or eax,edx" \
+    "mov dh,es:[bx]" "inc bx" \
     "push bp" "push bx" \
     "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,80h" "jz direct_asm1_m0_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m0_g:" "test ah,80h" "jz direct_asm1_m0_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m0_b:" "test eax,00800000h" "jz direct_asm1_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m0_b:" "test dh,80h" "jz direct_asm1_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m0_done:" \
     "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,40h" "jz direct_asm1_m1_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m1_g:" "test ah,40h" "jz direct_asm1_m1_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m1_b:" "test eax,00400000h" "jz direct_asm1_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m1_b:" "test dh,40h" "jz direct_asm1_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m1_done:" \
     "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,20h" "jz direct_asm1_m2_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m2_g:" "test ah,20h" "jz direct_asm1_m2_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m2_b:" "test eax,00200000h" "jz direct_asm1_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m2_b:" "test dh,20h" "jz direct_asm1_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m2_done:" \
     "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,10h" "jz direct_asm1_m3_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m3_g:" "test ah,10h" "jz direct_asm1_m3_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m3_b:" "test eax,00100000h" "jz direct_asm1_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m3_b:" "test dh,10h" "jz direct_asm1_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m3_done:" \
     "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,08h" "jz direct_asm1_m4_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m4_g:" "test ah,08h" "jz direct_asm1_m4_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m4_b:" "test eax,00080000h" "jz direct_asm1_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m4_b:" "test dh,08h" "jz direct_asm1_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m4_done:" \
     "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,04h" "jz direct_asm1_m5_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m5_g:" "test ah,04h" "jz direct_asm1_m5_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m5_b:" "test eax,00040000h" "jz direct_asm1_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m5_b:" "test dh,04h" "jz direct_asm1_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m5_done:" \
     "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,02h" "jz direct_asm1_m6_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m6_g:" "test ah,02h" "jz direct_asm1_m6_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m6_b:" "test eax,00020000h" "jz direct_asm1_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m6_b:" "test dh,02h" "jz direct_asm1_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m6_done:" \
     "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,01h" "jz direct_asm1_m7_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm1_m7_g:" "test ah,01h" "jz direct_asm1_m7_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm1_m7_b:" "test eax,00010000h" "jz direct_asm1_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm1_m7_b:" "test dh,01h" "jz direct_asm1_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm1_m7_done:" \
     "pop bx" "pop bp" "add si,16" \
-    "xor eax,eax" \
     "mov al,fs:[di]" "inc di" \
     "mov ah,gs:[bp]" "inc bp" \
-    "mov dl,es:[bx]" "inc bx" \
-    "shl edx,16" "or eax,edx" \
+    "mov dh,es:[bx]" "inc bx" \
     "push bp" "push bx" \
     "movzx ebp,word ptr [si]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,80h" "jz direct_asm2_m0_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m0_g:" "test ah,80h" "jz direct_asm2_m0_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m0_b:" "test eax,00800000h" "jz direct_asm2_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m0_b:" "test dh,80h" "jz direct_asm2_m0_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m0_done:" \
     "movzx ebp,word ptr [si+2]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,40h" "jz direct_asm2_m1_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m1_g:" "test ah,40h" "jz direct_asm2_m1_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m1_b:" "test eax,00400000h" "jz direct_asm2_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m1_b:" "test dh,40h" "jz direct_asm2_m1_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m1_done:" \
     "movzx ebp,word ptr [si+4]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,20h" "jz direct_asm2_m2_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m2_g:" "test ah,20h" "jz direct_asm2_m2_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m2_b:" "test eax,00200000h" "jz direct_asm2_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m2_b:" "test dh,20h" "jz direct_asm2_m2_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m2_done:" \
     "movzx ebp,word ptr [si+6]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,10h" "jz direct_asm2_m3_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m3_g:" "test ah,10h" "jz direct_asm2_m3_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m3_b:" "test eax,00100000h" "jz direct_asm2_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m3_b:" "test dh,10h" "jz direct_asm2_m3_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m3_done:" \
     "movzx ebp,word ptr [si+8]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,08h" "jz direct_asm2_m4_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m4_g:" "test ah,08h" "jz direct_asm2_m4_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m4_b:" "test eax,00080000h" "jz direct_asm2_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m4_b:" "test dh,08h" "jz direct_asm2_m4_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m4_done:" \
     "movzx ebp,word ptr [si+10]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,04h" "jz direct_asm2_m5_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m5_g:" "test ah,04h" "jz direct_asm2_m5_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m5_b:" "test eax,00040000h" "jz direct_asm2_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m5_b:" "test dh,04h" "jz direct_asm2_m5_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m5_done:" \
     "movzx ebp,word ptr [si+12]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,02h" "jz direct_asm2_m6_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m6_g:" "test ah,02h" "jz direct_asm2_m6_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m6_b:" "test eax,00020000h" "jz direct_asm2_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m6_b:" "test dh,02h" "jz direct_asm2_m6_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m6_done:" \
     "movzx ebp,word ptr [si+14]" "mov bx,bp" "and bx,1fffh" "shr ebp,13" \
     "mov dl,byte ptr ss:pixel_mask[bp]" \
     "test al,01h" "jz direct_asm2_m7_g" "xor byte ptr ss:screen_320[bx],dl" \
     "direct_asm2_m7_g:" "test ah,01h" "jz direct_asm2_m7_b" "xor byte ptr ss:screen_green[bx],dl" \
-    "direct_asm2_m7_b:" "test eax,00010000h" "jz direct_asm2_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
+    "direct_asm2_m7_b:" "test dh,01h" "jz direct_asm2_m7_done" "xor byte ptr ss:screen_blue[bx],dl" \
     "direct_asm2_m7_done:" \
     "pop bx" "pop bp" "add si,16" \
     "dec cx" "jnz direct_asm1_loop" \
     "pop gs" "pop fs" "pop es" "pop ds" \
     "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
     modify [ax bx cx dx si di bp es fs gs];
+
+/* Run-level two-column stripe kernel. All three codeword streams have the
+ * same checked far offset. Each source byte is consumed as four two-bit row
+ * pairs; DS:SI supplies the run's four combined masks and DI advances by the
+ * fixed signed 40-byte row stride. Zero masks are intentionally XORed too:
+ * eliminating twelve data-dependent branches is cheaper to test than a
+ * second recipe/branch layer on statistically independent RGB data. */
+static void directStripe386(u16 source_offset,u16 count,u16 dest,
+        u16 pair_mask_offset);
+#pragma aux directStripe386 = \
+    "push bp" "push ds" "push es" "push fs" "push gs" \
+    "mov bp,ax" \
+    "mov ax,word ptr ss:direct_asm_red+2" "mov fs,ax" \
+    "mov ax,word ptr ss:direct_asm_green+2" "mov gs,ax" \
+    "mov ax,word ptr ss:direct_asm_blue+2" "mov es,ax" \
+    "mov ax,word ptr ss:stripe_asm_pair_mask+2" "mov ds,ax" \
+    "xor bh,bh" \
+    "test cx,cx" "jz stripe_done" \
+    "stripe_loop:" \
+    "mov al,fs:[bp]" "mov ah,gs:[bp]" "mov dh,es:[bp]" "inc bp" \
+    /* Row pair 0. */ \
+    "rol al,2" "mov bl,al" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_320[di],dl" \
+    "rol ah,2" "mov bl,ah" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_green[di],dl" \
+    "rol dh,2" "mov bl,dh" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_blue[di],dl" \
+    "add di,word ptr ss:stripe_asm_step" \
+    /* Row pair 1. */ \
+    "rol al,2" "mov bl,al" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_320[di],dl" \
+    "rol ah,2" "mov bl,ah" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_green[di],dl" \
+    "rol dh,2" "mov bl,dh" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_blue[di],dl" \
+    "add di,word ptr ss:stripe_asm_step" \
+    /* Row pair 2. */ \
+    "rol al,2" "mov bl,al" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_320[di],dl" \
+    "rol ah,2" "mov bl,ah" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_green[di],dl" \
+    "rol dh,2" "mov bl,dh" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_blue[di],dl" \
+    "add di,word ptr ss:stripe_asm_step" \
+    /* Row pair 3. */ \
+    "rol al,2" "mov bl,al" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_320[di],dl" \
+    "rol ah,2" "mov bl,ah" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_green[di],dl" \
+    "rol dh,2" "mov bl,dh" "and bl,3" "mov dl,ds:[si+bx]" "xor byte ptr ss:screen_blue[di],dl" \
+    "add di,word ptr ss:stripe_asm_step" \
+    "dec cx" "jnz stripe_loop" \
+    "stripe_done:" \
+    "pop gs" "pop fs" "pop es" "pop ds" "pop bp" \
+    parm [ax] [cx] [di] [si] modify [ax bx cx dx di];
+
+/* Four regular two-column runs fill one framebuffer byte. Pack their source
+ * bytes into EAX, normalize the alternating QR zigzag directions, transpose
+ * the four-by-four matrix of two-bit pairs, then update four destination rows
+ * once each. This plane kernel is invoked three times per group. */
+static void directStripeGroupPlane386(void);
+#pragma aux directStripeGroupPlane386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" "push fs" \
+    "mov ax,word ptr ss:stripe_group_source+2" "mov fs,ax" \
+    "mov bp,word ptr ss:stripe_group_src0" \
+    "mov si,word ptr ss:stripe_group_src1" \
+    "mov bx,word ptr ss:stripe_group_src2" \
+    "mov di,word ptr ss:stripe_group_dest" \
+    "mov cx,word ptr ss:stripe_group_count_asm" \
+    "test cx,cx" "jz stripe_group_done" \
+    "stripe_group_loop:" \
+    "mov al,fs:[bp]" "dec bp" \
+    "mov ah,fs:[si]" "inc si" \
+    "mov dl,fs:[bx]" "dec bx" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "mov dh,fs:[di]" "inc di" "mov word ptr ss:stripe_group_src3,di" "pop di" \
+    "movzx eax,ax" "movzx edx,dx" "shl edx,16" "or eax,edx" \
+    /* Reverse all bits for the upward 03/30 lanes; swap adjacent pair bits
+     * for the downward 0C/C0 lanes. */ \
+    "push bx" "mov edx,eax" "xor bh,bh" \
+    "mov bl,al" "mov al,byte ptr ss:stripe_bit_reverse[bx]" \
+    "mov bl,ah" "mov ah,byte ptr ss:stripe_pair_swap[bx]" \
+    "shr edx,16" \
+    "mov bl,dl" "mov dl,byte ptr ss:stripe_bit_reverse[bx]" \
+    "mov bl,dh" "mov dh,byte ptr ss:stripe_pair_swap[bx]" \
+    "and eax,0000ffffh" "shl edx,16" "or eax,edx" "pop bx" \
+    /* Transpose four bytes of four two-bit row pairs. The result byte order
+     * is bottom-to-top, matching the destination walk below. */ \
+    "mov edx,eax" "shr edx,6" "xor edx,eax" "and edx,00cc00cch" \
+    "xor eax,edx" "shl edx,6" "xor eax,edx" \
+    "mov edx,eax" "shr edx,12" "xor edx,eax" "and edx,0000f0f0h" \
+    "xor eax,edx" "shl edx,12" "xor eax,edx" \
+    "xor byte ptr ss:[di],al" "sub di,40" \
+    "xor byte ptr ss:[di],ah" "sub di,40" \
+    "ror eax,16" "xor byte ptr ss:[di],al" "sub di,40" \
+    "xor byte ptr ss:[di],ah" "add di,280" \
+    "dec cx" "jnz stripe_group_loop" \
+    "stripe_group_done:" \
+    "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp fs];
+/* Same byte transpose as the production group kernel, but two lanes begin
+ * halfway through a normalized codeword.  Combine the current low half with
+ * the following high half before transposing.  Phase 1 shifts the reverse
+ * lanes (03/30); phase 2 shifts the forward lanes (0C/C0). */
+static void directStripePhasePlane386(void);
+#pragma aux directStripePhasePlane386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" "push fs" \
+    "mov ax,word ptr ss:stripe_group_source+2" "mov fs,ax" \
+    "mov bp,word ptr ss:stripe_group_src0" \
+    "mov si,word ptr ss:stripe_group_src1" \
+    "mov bx,word ptr ss:stripe_group_src2" \
+    "mov di,word ptr ss:stripe_group_dest" \
+    "mov cx,word ptr ss:stripe_group_count_asm" \
+    "test cx,cx" "jz stripe_phase_done" \
+    "stripe_phase_loop:" \
+    "mov al,fs:[bp]" "dec bp" \
+    "mov ah,fs:[si]" "inc si" \
+    "mov dl,fs:[bx]" "dec bx" \
+    "push di" "mov di,word ptr ss:stripe_group_src3" \
+    "mov dh,fs:[di]" "inc di" "mov word ptr ss:stripe_group_src3,di" "pop di" \
+    "movzx eax,ax" "movzx edx,dx" "shl edx,16" "or eax,edx" \
+    "push bx" "mov edx,eax" "xor bh,bh" \
+    "mov bl,al" "mov al,byte ptr ss:stripe_bit_reverse[bx]" \
+    "mov bl,ah" "mov ah,byte ptr ss:stripe_pair_swap[bx]" \
+    "shr edx,16" \
+    "mov bl,dl" "mov dl,byte ptr ss:stripe_bit_reverse[bx]" \
+    "mov bl,dh" "mov dh,byte ptr ss:stripe_pair_swap[bx]" \
+    "and eax,0000ffffh" "shl edx,16" "or eax,edx" "pop bx" \
+    "cmp byte ptr ss:stripe_phase_type,1" "jne stripe_phase_forward" \
+    /* Reverse lanes use the next descending source codeword. */ \
+    "push si" "xor dx,dx" \
+    "mov dl,fs:[bp]" "mov si,dx" \
+    "mov dl,byte ptr ss:stripe_bit_reverse[si]" \
+    "mov dh,fs:[bx]" "movzx si,dh" \
+    "mov dh,byte ptr ss:stripe_bit_reverse[si]" "pop si" \
+    "shl al,4" "shr dl,4" "or al,dl" \
+    "ror eax,16" "shl al,4" "shr dh,4" "or al,dh" "ror eax,16" \
+    "jmp short stripe_phase_merged" \
+    "stripe_phase_forward:" \
+    /* Forward lanes use the next ascending source codeword. */ \
+    "push bx" "xor dx,dx" \
+    "mov dl,fs:[si]" "movzx bx,dl" \
+    "mov dl,byte ptr ss:stripe_pair_swap[bx]" \
+    "mov bx,word ptr ss:stripe_group_src3" "mov dh,fs:[bx]" \
+    "movzx bx,dh" "mov dh,byte ptr ss:stripe_pair_swap[bx]" "pop bx" \
+    "shl ah,4" "shr dl,4" "or ah,dl" \
+    "ror eax,16" "shl ah,4" "shr dh,4" "or ah,dh" "ror eax,16" \
+    "stripe_phase_merged:" \
+    "mov edx,eax" "shr edx,6" "xor edx,eax" "and edx,00cc00cch" \
+    "xor eax,edx" "shl edx,6" "xor eax,edx" \
+    "mov edx,eax" "shr edx,12" "xor edx,eax" "and edx,0000f0f0h" \
+    "xor eax,edx" "shl edx,12" "xor eax,edx" \
+    "xor byte ptr ss:[di],al" "sub di,40" \
+    "xor byte ptr ss:[di],ah" "sub di,40" \
+    "ror eax,16" "xor byte ptr ss:[di],al" "sub di,40" \
+    "xor byte ptr ss:[di],ah" "add di,280" \
+    "dec cx" "jnz stripe_phase_loop" \
+    "stripe_phase_done:" \
+    "pop fs" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp fs];
+
+/* Predecoded 10-byte edge recipes avoid the generic C run lookup and update
+ * all three planes while the source byte and destination are hot. */
+static void directStripeEdges386(void);
+#pragma aux directStripeEdges386 = \
+    "push ax" "push bx" "push cx" "push dx" "push si" "push di" "push bp" \
+    "push es" "push fs" "push gs" \
+    "mov ax,word ptr ss:direct_asm_red+2" "mov fs,ax" \
+    "mov ax,word ptr ss:direct_asm_green+2" "mov gs,ax" \
+    "mov ax,word ptr ss:direct_asm_blue+2" "mov es,ax" \
+    "mov si,offset stripe_phase_edges" \
+    "mov cx,word ptr ss:stripe_phase_edge_count" \
+    "xor bh,bh" "test cx,cx" "jz stripe_edges_done" \
+    "stripe_edges_loop:" \
+    "mov bp,word ptr ss:[si]" "add bp,word ptr ss:stripe_edge_source_offset" \
+    "mov al,fs:[bp]" "mov ah,gs:[bp]" "mov dh,es:[bp]" \
+    "push cx" "mov cl,byte ptr ss:[si+4]" \
+    "shr al,cl" "shr ah,cl" "shr dh,cl" "pop cx" \
+    "mov di,word ptr ss:[si+2]" \
+    "mov bl,al" "and bl,3" "mov dl,byte ptr ss:[si+bx+5]" \
+    "xor byte ptr ss:screen_320[di],dl" \
+    "mov bl,ah" "and bl,3" "mov dl,byte ptr ss:[si+bx+5]" \
+    "xor byte ptr ss:screen_green[di],dl" \
+    "mov bl,dh" "and bl,3" "mov dl,byte ptr ss:[si+bx+5]" \
+    "xor byte ptr ss:screen_blue[di],dl" \
+    "add si,10" "dec cx" "jnz stripe_edges_loop" \
+    "stripe_edges_done:" \
+    "pop gs" "pop fs" "pop es" "pop bp" "pop di" "pop si" "pop dx" "pop cx" "pop bx" "pop ax" \
+    modify [ax bx cx dx si di bp es fs gs];
 #else
+static void directScatterBw386(void) {}
 static void directScatter386(void) {}
+static void directStripe386(u16 source_offset,u16 count,u16 dest,
+        u16 pair_mask_offset) {
+    (void)source_offset;(void)count;(void)dest;(void)pair_mask_offset;
+}
+static void directStripeGroupPlane386(void) {}
+static void directStripePhasePlane386(void) {}
+static void directStripeEdges386(void) {}
 #endif
+
+static int direct_scatter_bw_optimized(const u8 *codewords) {
+    if(rgb3_active||!placement_entry||!codewords)return 0;
+#ifdef __WATCOMC__
+    direct_asm_bw=codewords;
+    direct_asm_map=placement_entry;
+    directScatterBw386();
+    return 1;
+#else
+    return direct_scatter_bw(codewords);
+#endif
+}
 
 static int direct_scatter_rgb3_optimized(
         const u8 *const codewords[VGA_RGB_CHANNELS]) {
-    if(!rgb3_active||!delta_entry||!codewords||!codewords[VGA_RGB_RED]||
+    if(!rgb3_active||!placement_entry||!codewords||!codewords[VGA_RGB_RED]||
             !codewords[VGA_RGB_GREEN]||!codewords[VGA_RGB_BLUE])return 0;
 #ifdef __WATCOMC__
     direct_asm_red=codewords[VGA_RGB_RED];
     direct_asm_green=codewords[VGA_RGB_GREEN];
     direct_asm_blue=codewords[VGA_RGB_BLUE];
-    direct_asm_map=delta_entry;
+    direct_asm_map=placement_entry;
     directScatter386();
+    return 1;
+#else
+    return direct_scatter_rgb3(codewords);
+#endif
+}
+
+static void stripe_group_plane(const VgaStripeGroup *group,
+        const u8 far *codewords,int channel) {
+    u16 offset=FP_OFF(codewords);
+    stripe_group_source=codewords;
+    stripe_group_src0=(u16)(offset+group->first[0]+group->count-1);
+    stripe_group_src1=(u16)(offset+group->first[1]);
+    stripe_group_src2=(u16)(offset+group->first[2]+group->count-1);
+    stripe_group_src3=(u16)(offset+group->first[3]);
+    stripe_group_dest=(u16)(FP_OFF((u8 far *)rgb_screen(channel))+
+        group->dest+3u*VGA_BYTES_PER_LINE);
+    stripe_group_count_asm=group->count;
+    directStripeGroupPlane386();
+}
+
+static void stripe_phase_group_plane(const VgaStripePhaseGroup *group,
+        const u8 far *codewords,int channel) {
+    u16 offset=FP_OFF(codewords);
+    u16 reverse_extra=(u16)(group->phase==1?1:0);
+    stripe_group_source=codewords;
+    stripe_group_src0=(u16)(offset+group->first[0]+group->count-1+
+        reverse_extra);
+    stripe_group_src1=(u16)(offset+group->first[1]);
+    stripe_group_src2=(u16)(offset+group->first[2]+group->count-1+
+        reverse_extra);
+    stripe_group_src3=(u16)(offset+group->first[3]);
+    stripe_group_dest=(u16)(FP_OFF((u8 far *)rgb_screen(channel))+
+        group->dest+3u*VGA_BYTES_PER_LINE);
+    stripe_group_count_asm=group->count;
+    stripe_phase_type=group->phase;
+    directStripePhasePlane386();
+}
+
+static void scatter_phase_edges(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef __WATCOMC__
+    (void)codewords;
+    stripe_edge_source_offset=FP_OFF(direct_asm_red);
+    directStripeEdges386();
+#else
+    u16 edge_index,channel;
+    for(edge_index=0;edge_index<stripe_phase_edge_count;++edge_index) {
+        const VgaStripeEdge *edge=&stripe_phase_edges[edge_index];
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+            u8 value=(u8)((codewords[channel][edge->codeword]>>edge->shift)&3u);
+            rgb_screen(channel)[edge->dest]^=edge->pair_mask[value];
+        }
+    }
+#endif
+}
+
+static int direct_scatter_rgb3_phased_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef __WATCOMC__
+    u16 run_index,group_index,channel,offset,current=0;
+    if(!rgb3_active||!placement_entry||!stripe_runs||!stripe_run_count||
+       !stripe_group_count||!stripe_phase_group_count||!codewords||
+       !codewords[VGA_RGB_RED]||!codewords[VGA_RGB_GREEN]||
+       !codewords[VGA_RGB_BLUE])return 0;
+    offset=FP_OFF(codewords[VGA_RGB_RED]);
+    if(FP_OFF(codewords[VGA_RGB_GREEN])!=offset||
+       FP_OFF(codewords[VGA_RGB_BLUE])!=offset||
+       (u32)offset+DOSFER_QR_CODEWORDS>0xFFFFUL)return 0;
+    direct_asm_red=codewords[VGA_RGB_RED];
+    direct_asm_green=codewords[VGA_RGB_GREEN];
+    direct_asm_blue=codewords[VGA_RGB_BLUE];
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range(codewords,current,
+                (u16)(run->first-current));
+        if(!run->group_flags) {
+            stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+            stripe_asm_pair_mask=run->pair_mask;
+            directStripe386((u16)(offset+run->first),run->count,run->dest,
+                FP_OFF(run->pair_mask));
+        }
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range(codewords,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
+    for(group_index=0;group_index<stripe_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_group_plane(&stripe_groups[group_index],codewords[channel],
+                channel);
+    for(group_index=0;group_index<stripe_phase_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
+            stripe_phase_group_plane(&stripe_phase_groups[group_index],
+                codewords[channel],channel);
+        }
+    scatter_phase_edges(codewords);
+    return 1;
+#else
+    return direct_scatter_rgb3(codewords);
+#endif
+}
+
+static int direct_scatter_rgb3_grouped_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef __WATCOMC__
+    u16 run_index,group_index,channel,offset,current=0;
+    if(!rgb3_active||!placement_entry||!stripe_runs||!stripe_run_count||
+       !stripe_group_count||!codewords||!codewords[VGA_RGB_RED]||
+       !codewords[VGA_RGB_GREEN]||!codewords[VGA_RGB_BLUE])return 0;
+    offset=FP_OFF(codewords[VGA_RGB_RED]);
+    if(FP_OFF(codewords[VGA_RGB_GREEN])!=offset||
+       FP_OFF(codewords[VGA_RGB_BLUE])!=offset||
+       (u32)offset+DOSFER_QR_CODEWORDS>0xFFFFUL)return 0;
+    direct_asm_red=codewords[VGA_RGB_RED];
+    direct_asm_green=codewords[VGA_RGB_GREEN];
+    direct_asm_blue=codewords[VGA_RGB_BLUE];
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range(codewords,current,
+                (u16)(run->first-current));
+        if(!(run->group_flags&VGA_STRIPE_GROUP_EXACT)) {
+            stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+            stripe_asm_pair_mask=run->pair_mask;
+            directStripe386((u16)(offset+run->first),run->count,run->dest,
+                FP_OFF(run->pair_mask));
+        }
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range(codewords,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
+    for(group_index=0;group_index<stripe_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_group_plane(&stripe_groups[group_index],codewords[channel],
+                channel);
+    return 1;
+#else
+    return direct_scatter_rgb3(codewords);
+#endif
+}
+
+static int direct_scatter_rgb3_stripe_optimized(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+#ifdef __WATCOMC__
+    u16 run_index,current=0,offset;
+    if(!rgb3_active||!placement_entry||!codewords||
+       !codewords[VGA_RGB_RED]||!codewords[VGA_RGB_GREEN]||
+       !codewords[VGA_RGB_BLUE])return 0;
+    if(!stripe_runs||!stripe_run_count)
+        return direct_scatter_rgb3_optimized(codewords);
+    offset=FP_OFF(codewords[VGA_RGB_RED]);
+    if(FP_OFF(codewords[VGA_RGB_GREEN])!=offset||
+       FP_OFF(codewords[VGA_RGB_BLUE])!=offset||
+       (u32)offset+DOSFER_QR_CODEWORDS>0xFFFFUL)
+        return direct_scatter_rgb3_optimized(codewords);
+    if(stripe_phase_group_count)
+        return direct_scatter_rgb3_phased_optimized(codewords);
+    if(stripe_group_count)
+        return direct_scatter_rgb3_grouped_optimized(codewords);
+    direct_asm_red=codewords[VGA_RGB_RED];
+    direct_asm_green=codewords[VGA_RGB_GREEN];
+    direct_asm_blue=codewords[VGA_RGB_BLUE];
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range(codewords,current,
+                (u16)(run->first-current));
+        stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+        stripe_asm_pair_mask=run->pair_mask;
+        directStripe386((u16)(offset+run->first),run->count,run->dest,
+            FP_OFF(run->pair_mask));
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range(codewords,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
     return 1;
 #else
     return direct_scatter_rgb3(codewords);
@@ -1009,6 +1861,214 @@ static int direct_scatter_rgb3_optimized(
 #ifdef DOSFER_DIRECT_BENCH
 int vga_rgb3_direct_scatter_asm(const u8 *const codewords[VGA_RGB_CHANNELS]) {
     return direct_scatter_rgb3_optimized(codewords);
+}
+
+int vga_rgb3_direct_scatter_stripe(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 saved_group_count=stripe_group_count;
+    u16 saved_phase_group_count=stripe_phase_group_count;
+    int result;
+    stripe_group_count=0;
+    stripe_phase_group_count=0;
+    result=direct_scatter_rgb3_stripe_optimized(codewords);
+    stripe_group_count=saved_group_count;
+    stripe_phase_group_count=saved_phase_group_count;
+    return result;
+}
+
+void vga_rgb3_stripe_stats(u16 *runs,u16 *covered) {
+    if(runs)*runs=stripe_run_count;
+    if(covered)*covered=stripe_codewords_covered;
+}
+
+static int benchmark_stripe_sources(
+        const u8 *const codewords[VGA_RGB_CHANNELS],u16 *offset) {
+    if(!rgb3_active||!placement_entry||!stripe_runs||!stripe_run_count||
+       !codewords||!codewords[VGA_RGB_RED]||!codewords[VGA_RGB_GREEN]||
+       !codewords[VGA_RGB_BLUE])return 0;
+    *offset=FP_OFF(codewords[VGA_RGB_RED]);
+    if(FP_OFF(codewords[VGA_RGB_GREEN])!=*offset||
+       FP_OFF(codewords[VGA_RGB_BLUE])!=*offset||
+       (u32)*offset+DOSFER_QR_CODEWORDS>0xFFFFUL)return 0;
+    direct_asm_red=codewords[VGA_RGB_RED];
+    direct_asm_green=codewords[VGA_RGB_GREEN];
+    direct_asm_blue=codewords[VGA_RGB_BLUE];
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_stripe_runs(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 run_index,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+        stripe_asm_pair_mask=run->pair_mask;
+        directStripe386((u16)(offset+run->first),run->count,run->dest,
+            FP_OFF(run->pair_mask));
+    }
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_stripe_fallback(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 run_index,current=0,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    (void)offset;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(run->first>current)
+            direct_scatter_rgb3_range(codewords,current,
+                (u16)(run->first-current));
+        current=(u16)(run->first+run->count);
+    }
+    if(current<DOSFER_QR_CODEWORDS)
+        direct_scatter_rgb3_range(codewords,current,
+            (u16)(DOSFER_QR_CODEWORDS-current));
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_stripe_setup(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 run_index,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+        stripe_asm_pair_mask=run->pair_mask;
+        directStripe386((u16)(offset+run->first),0,run->dest,
+            FP_OFF(run->pair_mask));
+    }
+    return 1;
+}
+
+void vga_rgb3_stripe_geometry_stats(u16 run_count[4],u16 codeword_count[4],
+        u16 *other_runs,u16 *other_codewords) {
+    static const u8 geometry_mask[4]={0xC0,0x30,0x0C,0x03};
+    u16 run_index;
+    int geometry;
+    for(geometry=0;geometry<4;++geometry)
+        run_count[geometry]=codeword_count[geometry]=0;
+    if(other_runs)*other_runs=0;
+    if(other_codewords)*other_codewords=0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        for(geometry=0;geometry<4;++geometry)
+            if(run->pair_mask[3]==geometry_mask[geometry])break;
+        if(geometry<4) {
+            ++run_count[geometry];
+            codeword_count[geometry]=(u16)(codeword_count[geometry]+run->count);
+        } else {
+            if(other_runs)++*other_runs;
+            if(other_codewords)*other_codewords=(u16)(*other_codewords+run->count);
+        }
+    }
+}
+
+void vga_rgb3_stripe_group_stats(u16 *groups,u16 *source_codewords,
+        u16 *destination_bytes) {
+    if(groups)*groups=stripe_group_count;
+    if(source_codewords)*source_codewords=stripe_group_codewords;
+    if(destination_bytes)*destination_bytes=stripe_group_codewords;
+}
+
+void vga_rgb3_stripe_phase_stats(u16 *groups,u16 *source_codewords,
+        u16 *destination_bytes,u16 *edge_contributions) {
+    if(groups)*groups=stripe_phase_group_count;
+    if(source_codewords)*source_codewords=stripe_phase_codewords;
+    if(destination_bytes)*destination_bytes=stripe_phase_destination_bytes;
+    if(edge_contributions)*edge_contributions=stripe_phase_edge_count;
+}
+
+int vga_rgb3_direct_scatter_group_baseline(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 group_index,run_index,slot,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(group_index=0;group_index<stripe_group_count;++group_index) {
+        VgaStripeGroup *group=&stripe_groups[group_index];
+        for(slot=0;slot<4;++slot)for(run_index=0;
+                run_index<stripe_run_count;++run_index) {
+            VgaStripeRun far *run=&stripe_runs[run_index];
+            if(run->first!=group->first[slot])continue;
+            stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+            stripe_asm_pair_mask=run->pair_mask;
+            directStripe386((u16)(offset+run->first),run->count,run->dest,
+                FP_OFF(run->pair_mask));
+            break;
+        }
+    }
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_groups(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 group_index,channel,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    (void)offset;
+    for(group_index=0;group_index<stripe_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_group_plane(&stripe_groups[group_index],
+                codewords[channel],channel);
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_grouped(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    return direct_scatter_rgb3_grouped_optimized(codewords);
+}
+
+int vga_rgb3_direct_scatter_phase_baseline(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 run_index,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    for(run_index=0;run_index<stripe_run_count;++run_index) {
+        VgaStripeRun far *run=&stripe_runs[run_index];
+        if(!(run->group_flags&VGA_STRIPE_GROUP_PHASE))continue;
+        stripe_asm_step=(u16)(run->direction*VGA_BYTES_PER_LINE);
+        stripe_asm_pair_mask=run->pair_mask;
+        directStripe386((u16)(offset+run->first),run->count,run->dest,
+            FP_OFF(run->pair_mask));
+    }
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_phase_groups(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 group_index,channel,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    (void)offset;
+    for(group_index=0;group_index<stripe_phase_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_phase_group_plane(&stripe_phase_groups[group_index],
+                codewords[channel],channel);
+    scatter_phase_edges(codewords);
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_phase_kernel(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 group_index,channel,offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    (void)offset;
+    for(group_index=0;group_index<stripe_phase_group_count;++group_index)
+        for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
+            stripe_phase_group_plane(&stripe_phase_groups[group_index],
+                codewords[channel],channel);
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_phase_edges(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    u16 offset;
+    if(!benchmark_stripe_sources(codewords,&offset))return 0;
+    (void)offset;
+    scatter_phase_edges(codewords);
+    return 1;
+}
+
+int vga_rgb3_direct_scatter_phased(
+        const u8 *const codewords[VGA_RGB_CHANNELS]) {
+    return direct_scatter_rgb3_phased_optimized(codewords);
 }
 
 #endif
@@ -1034,7 +2094,7 @@ void vga_rgb3_map_layout_stats(u32 *entries,u32 *within_codeword_bytes,
     u16 codeword,bit,prior,offset;
     static u8 seen[VGA_VISIBLE_BYTES];
     u32 total_entries=0,total_within_codeword=0,total_global=0;
-    if(!delta_entry) {
+    if(!placement_entry) {
         if(entries)*entries=0;
         if(within_codeword_bytes)*within_codeword_bytes=0;
         if(global_unique_bytes)*global_unique_bytes=0;
@@ -1043,11 +2103,11 @@ void vga_rgb3_map_layout_stats(u32 *entries,u32 *within_codeword_bytes,
     memset(seen,0,sizeof(seen));
     for(codeword=0;codeword<DOSFER_QR_CODEWORDS;++codeword) {
         for(bit=0;bit<8;++bit) {
-            offset=(u16)(delta_entry[(u32)codeword*8+bit]&0x1FFF);
+            offset=(u16)(placement_entry[(u32)codeword*8+bit]&0x1FFF);
             ++total_entries;
             if(!seen[offset]) {seen[offset]=1;++total_global;}
             for(prior=0;prior<bit;++prior)
-                if((delta_entry[(u32)codeword*8+prior]&0x1FFF)==offset)break;
+                if((placement_entry[(u32)codeword*8+prior]&0x1FFF)==offset)break;
             if(prior==bit)++total_within_codeword;
         }
     }
@@ -1108,7 +2168,9 @@ int vga_show_full_qr_at(const u8 *qr,const u8 *codewords,
     if(!build_qr_image_320(qr,invert))return 0;
     /* Delta acceleration is optional. A low-memory machine must still be
      * able to transmit using canonical full redraws. */
-    prepare_delta();
+    prepare_placement_map();
+    /* Capture is optional: low-memory systems retain the delta/full paths. */
+    if(placement_entry)capture_bw_template(codewords);
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;
     profile_start=profile_now;
@@ -1125,7 +2187,7 @@ int vga_show_prepared_at(int invert,const char *status,u32 earliest_tick) {
 #ifdef DOSFER_PROFILE
     u32 profile_start,profile_now;
 #endif
-    if(!vga_active||!delta_entry||screen_invert!=invert)return 0;
+    if(!vga_active||!placement_entry||screen_invert!=invert)return 0;
 #ifdef DOSFER_PROFILE
     profile_start=timer_ticks();
 #endif
@@ -1151,10 +2213,10 @@ int vga_show_full_qr3_at(const u8 *const qr[VGA_RGB_CHANNELS],
     profile_start=timer_ticks();
 #endif
     if(!build_qr_image_rgb3(qr,invert))return 0;
-    prepare_delta();
+    prepare_placement_map();
     /* Direct rendering is optional on low-memory systems. A failed template
      * allocation leaves the canonical full-render path operational. */
-    if(delta_entry)capture_rgb3_template((const u8 *const *)codewords);
+    if(placement_entry)capture_rgb3_template((const u8 *const *)codewords);
 #ifdef DOSFER_PROFILE
     profile_now=timer_ticks();dosferVgaProfileTicks[0]+=profile_now-profile_start;
     profile_start=profile_now;
@@ -1171,7 +2233,7 @@ int vga_show_prepared3_at(int invert,const char *status,u32 earliest_tick) {
 #ifdef DOSFER_PROFILE
     u32 profile_start,profile_now;
 #endif
-    if(!vga_active||!rgb3_active||!delta_entry||screen_invert!=invert)return 0;
+    if(!vga_active||!rgb3_active||!placement_entry||screen_invert!=invert)return 0;
 #ifdef DOSFER_PROFILE
     profile_start=timer_ticks();
 #endif
@@ -1202,7 +2264,7 @@ void vga_benchmark_delta(const u8 *codewords,int loops,
     int i;
     u32 a,b,state=0x6A67C69DUL;
 
-    if(!alternate||!current||!delta_entry){
+    if(!alternate||!current||!placement_entry){
         *update_ms=*copy_ms=*text_ms=0;
         if(alternate)_ffree(alternate);
         if(current)_ffree(current);

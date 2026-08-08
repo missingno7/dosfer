@@ -37,3 +37,23 @@ cc -O2 -std=c99 -DDOSFER_HOST_TEST -Iinclude -Ithird_party \
 ```
 
 The DOS release executable does not include these host tests.
+
+## DOS/Open Watcom verification and benchmarks
+
+The Open Watcom oracles exercise the 16-bit far-memory RS and VGA paths:
+
+```bat
+tests\run_watcom_rs.bat
+tests\run_watcom_rgb_vga.bat
+```
+
+The renderer benchmarks build standalone DOS executables. Run them in DOSBox-X
+with `cpu cycles=3000` to compare the production direct paths against their
+bit-identical delta and portable-C oracles. The RGB benchmark also reports the
+run-level fallback, aligned four-stripe groups, phase-shifted groups, and their
+predecoded boundary-edge loop separately:
+
+```bat
+tests\run_watcom_bw_bench.bat
+tests\run_watcom_rgb_bench.bat
+```

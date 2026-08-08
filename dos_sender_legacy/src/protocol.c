@@ -11,9 +11,101 @@ u32 dosferProtocolProfileTicks[3];
 #define WHITEN_STEP 0x9E3779B9UL
 #define WHITEN_FALLBACK 0xA5A5A5A5UL
 
-static u32 crc_table[256];
-static u32 crc_slice[3][256];
+/* Row 0 is the byte table; rows 1..3 advance it by one byte each. Keeping
+ * all four rows contiguous also lets the DOS assembly hold one table base. */
+static u32 crc_lut[4][256];
 static int crc_ready;
+
+#ifdef __WATCOMC__
+/* Production DATA frames use one xorshift32 whitening stream and CRC the
+ * resulting bytes. Keep the far source/destination segments and the CRC
+ * table base live for the whole payload instead of making the 16-bit C
+ * compiler spill them around every dword. The CRC recurrence is the same
+ * reflected IEEE CRC-32 byte recurrence used by crc_byte(). */
+static u32 copyWhitenedCrc386(u8 __far *dst,const u8 __far *src,u16 len,
+        u32 seed,const u32 __near *table);
+#pragma aux copyWhitenedCrc386 = \
+    "push ds" \
+    "push bp" \
+    "push cx" \
+    "push ss" \
+    "pop ds" \
+    "movzx ebx,bx" \
+    "shl edx,16" \
+    "mov dx,ax" \
+    "xor eax,eax" \
+    "dec eax" \
+    "shr cx,2" \
+    "jz wc_words_done" \
+    "wc_word_loop:" \
+    "mov ebp,edx" \
+    "shl ebp,13" \
+    "xor edx,ebp" \
+    "mov ebp,edx" \
+    "shr ebp,17" \
+    "xor edx,ebp" \
+    "mov ebp,edx" \
+    "shl ebp,5" \
+    "xor edx,ebp" \
+    "mov ebp,dword ptr fs:[si]" \
+    "xor ebp,edx" \
+    "mov dword ptr es:[di],ebp" \
+    "xor eax,ebp" \
+    "push edx" \
+    "movzx edx,al" \
+    "mov ebp,dword ptr ds:[ebx+edx*4+3072]" \
+    "shr eax,8" \
+    "movzx edx,al" \
+    "xor ebp,dword ptr ds:[ebx+edx*4+2048]" \
+    "shr eax,8" \
+    "movzx edx,al" \
+    "xor ebp,dword ptr ds:[ebx+edx*4+1024]" \
+    "shr eax,8" \
+    "movzx edx,al" \
+    "xor ebp,dword ptr ds:[ebx+edx*4]" \
+    "mov eax,ebp" \
+    "pop edx" \
+    "add si,4" \
+    "add di,4" \
+    "dec cx" \
+    "jnz wc_word_loop" \
+    "wc_words_done:" \
+    "pop cx" \
+    "and cx,3" \
+    "jz wc_done" \
+    "mov ebp,edx" \
+    "shl ebp,13" \
+    "xor edx,ebp" \
+    "mov ebp,edx" \
+    "shr ebp,17" \
+    "xor edx,ebp" \
+    "mov ebp,edx" \
+    "shl ebp,5" \
+    "xor edx,ebp" \
+    "wc_tail_loop:" \
+    "push eax" \
+    "mov al,byte ptr fs:[si]" \
+    "xor al,dl" \
+    "mov byte ptr es:[di],al" \
+    "pop eax" \
+    "xor al,byte ptr es:[di]" \
+    "movzx ebp,al" \
+    "shr eax,8" \
+    "xor eax,dword ptr ds:[ebx+ebp*4]" \
+    "shr edx,8" \
+    "inc si" \
+    "inc di" \
+    "dec cx" \
+    "jnz wc_tail_loop" \
+    "wc_done:" \
+    "not eax" \
+    "mov edx,eax" \
+    "shr edx,16" \
+    "pop bp" \
+    "pop ds" \
+    parm [es di] [fs si] [cx] [dx ax] [bx] value [dx ax] \
+    modify [ax bx cx dx si di];
+#endif
 
 static u32 xorshift32(u32 x) {
     x^=x<<13;
@@ -33,26 +125,27 @@ static void crc_init(void) {
         u32 c=(u32)i;
         for(j=0;j<8;++j)
             c=(c&1)?(CRC_POLY^(c>>1)):(c>>1);
-        crc_table[i]=c;
+        crc_lut[0][i]=c;
     }
 
     for(i=0;i<256;++i) {
-        u32 c=crc_table[i];
-        crc_slice[0][i]=(c>>8)^crc_table[(u8)c];
-        crc_slice[1][i]=(crc_slice[0][i]>>8)^crc_table[(u8)crc_slice[0][i]];
-        crc_slice[2][i]=(crc_slice[1][i]>>8)^crc_table[(u8)crc_slice[1][i]];
+        u32 c=crc_lut[0][i];
+        for(j=1;j<4;++j) {
+            c=(c>>8)^crc_lut[0][(u8)c];
+            crc_lut[j][i]=c;
+        }
     }
     crc_ready=1;
 }
 
 static u32 crc_word(u32 crc,u32 value) {
     crc^=value;
-    return crc_slice[2][(u8)crc]^crc_slice[1][(u8)(crc>>8)]^
-           crc_slice[0][(u8)(crc>>16)]^crc_table[(u8)(crc>>24)];
+    return crc_lut[3][(u8)crc]^crc_lut[2][(u8)(crc>>8)]^
+           crc_lut[1][(u8)(crc>>16)]^crc_lut[0][(u8)(crc>>24)];
 }
 
 static u32 crc_byte(u32 crc,u8 value) {
-    return crc_table[(u8)(crc^value)]^(crc>>8);
+    return crc_lut[0][(u8)(crc^value)]^(crc>>8);
 }
 
 u32 crc32_update(u32 crc,const void *data,u16 len) {
@@ -103,25 +196,41 @@ static u32 copy_payload_crc(u8 *dst,const u8 *src,u16 len,u16 flags,
      * payload instead of re-testing all whitening modes for every word. */
     if((flags&(FF_GROUP_XOR_WHITENED|FF_PAIR_WHITENED|FF_WHITENED))==
             FF_WHITENED) {
+#ifdef __WATCOMC__
+        return copyWhitenedCrc386(dst,src,len,left,
+            (const u32 __near *)crc_lut[0]);
+#else
         while(len>=8) {
             u32 value=*(const u32 *)src;
-            left=xorshift32(left);
+            left^=left<<13;
+            left^=left>>17;
+            left^=left<<5;
             value^=left;
             *(u32 *)dst=value;
-            crc=crc_word(crc,value);
+            crc^=value;
+            crc=crc_lut[3][(u8)crc]^crc_lut[2][(u8)(crc>>8)]^
+                crc_lut[1][(u8)(crc>>16)]^crc_lut[0][(u8)(crc>>24)];
             value=*(const u32 *)(src+4);
-            left=xorshift32(left);
+            left^=left<<13;
+            left^=left>>17;
+            left^=left<<5;
             value^=left;
             *(u32 *)(dst+4)=value;
-            crc=crc_word(crc,value);
+            crc^=value;
+            crc=crc_lut[3][(u8)crc]^crc_lut[2][(u8)(crc>>8)]^
+                crc_lut[1][(u8)(crc>>16)]^crc_lut[0][(u8)(crc>>24)];
             src+=8;dst+=8;len-=8;
         }
         if(len>=4) {
             u32 value=*(const u32 *)src;
-            left=xorshift32(left);
+            left^=left<<13;
+            left^=left>>17;
+            left^=left<<5;
             value^=left;
             *(u32 *)dst=value;
-            crc=crc_word(crc,value);
+            crc^=value;
+            crc=crc_lut[3][(u8)crc]^crc_lut[2][(u8)(crc>>8)]^
+                crc_lut[1][(u8)(crc>>16)]^crc_lut[0][(u8)(crc>>24)];
             src+=4;dst+=4;len-=4;
         }
         if(len) {
@@ -134,6 +243,7 @@ static u32 copy_payload_crc(u8 *dst,const u8 *src,u16 len,u16 flags,
             }
         }
         return crc^0xFFFFFFFFUL;
+#endif
     }
     if(flags&FF_GROUP_XOR_WHITENED) {
         /* RGB3 parity uses the XOR of up to three DATA whitening streams.

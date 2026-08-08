@@ -25,6 +25,9 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __WATCOMC__
+#include <dos.h>
+#endif
 #include "qrcodegen.h"
 
 #ifdef DOSFER_PROFILE
@@ -133,6 +136,20 @@ testable const int8_t ECC_CODEWORDS_PER_BLOCK[4][41] = {
 #define qrcodegen_REED_SOLOMON_DEGREE_MAX 30  // Based on the table above
 #define DOSFER_RS_STRIDE 32  /* Power-of-two rows make factor lookup one shift on a 386. */
 
+/* The lookup table is declared before the inline kernels because the fused
+ * RGB kernel addresses it directly instead of carrying a generic base pointer
+ * in a register. */
+static uint8_t
+#ifdef __WATCOMC__
+	__near
+#endif
+	dosferRsStep[256U * DOSFER_RS_STRIDE];
+
+#ifdef __WATCOMC__
+static uint8_t __near dosferRsEcc3[3][32];
+static const uint8_t __far *dosferRsBlue3;
+#endif
+
 #ifdef __WATCOMC__
 /* V40-L interleaves each block at a constant 25-byte destination stride.
  * Keeping this tiny copy loop in registers avoids two C loop tests and a
@@ -229,6 +246,124 @@ static void dosferCopyV40LongData(const uint8_t __far *data,uint8_t __far *resul
 	"mov es:[di+2955],al" \
 	parm [fs si] [es di] modify [ax si di];
 
+/* Transpose the common 118 bytes of all 25 V40-L data blocks. Reading one
+ * byte from each block makes the 25 destination bytes contiguous and cuts
+ * the loop/control count from 25*15 to 118 iterations. */
+static void dosferInterleaveDataV40(const uint8_t __far *data,
+		uint8_t __far *result);
+#pragma aux dosferInterleaveDataV40 = \
+	"mov cx,118" \
+	"v40data_row:" \
+	"mov al,fs:[si]"      "mov es:[di],al" \
+	"mov al,fs:[si+118]"  "mov es:[di+1],al" \
+	"mov al,fs:[si+236]"  "mov es:[di+2],al" \
+	"mov al,fs:[si+354]"  "mov es:[di+3],al" \
+	"mov al,fs:[si+472]"  "mov es:[di+4],al" \
+	"mov al,fs:[si+590]"  "mov es:[di+5],al" \
+	"mov al,fs:[si+708]"  "mov es:[di+6],al" \
+	"mov al,fs:[si+826]"  "mov es:[di+7],al" \
+	"mov al,fs:[si+944]"  "mov es:[di+8],al" \
+	"mov al,fs:[si+1062]" "mov es:[di+9],al" \
+	"mov al,fs:[si+1180]" "mov es:[di+10],al" \
+	"mov al,fs:[si+1298]" "mov es:[di+11],al" \
+	"mov al,fs:[si+1416]" "mov es:[di+12],al" \
+	"mov al,fs:[si+1534]" "mov es:[di+13],al" \
+	"mov al,fs:[si+1652]" "mov es:[di+14],al" \
+	"mov al,fs:[si+1770]" "mov es:[di+15],al" \
+	"mov al,fs:[si+1888]" "mov es:[di+16],al" \
+	"mov al,fs:[si+2006]" "mov es:[di+17],al" \
+	"mov al,fs:[si+2124]" "mov es:[di+18],al" \
+	"mov al,fs:[si+2242]" "mov es:[di+19],al" \
+	"mov al,fs:[si+2361]" "mov es:[di+20],al" \
+	"mov al,fs:[si+2480]" "mov es:[di+21],al" \
+	"mov al,fs:[si+2599]" "mov es:[di+22],al" \
+	"mov al,fs:[si+2718]" "mov es:[di+23],al" \
+	"mov al,fs:[si+2837]" "mov es:[di+24],al" \
+	"inc si" \
+	"add di,25" \
+	"dec cx" \
+	"jnz v40data_row" \
+	parm [fs si] [es di] modify [ax cx si di];
+
+/* The 25 working ECC registers use 32-byte rows so the four-byte RS kernel
+ * has two explicit zero tail bytes. Transpose their first 30 columns into
+ * canonical V40-L interleaved order. */
+static void dosferInterleaveEccV40(const uint8_t __near *ecc,
+		uint8_t __far *result);
+#pragma aux dosferInterleaveEccV40 = \
+	"mov cx,30" \
+	"v40ecc_row:" \
+	"mov al,[si]"     "mov es:[di],al" \
+	"mov al,[si+32]"  "mov es:[di+1],al" \
+	"mov al,[si+64]"  "mov es:[di+2],al" \
+	"mov al,[si+96]"  "mov es:[di+3],al" \
+	"mov al,[si+128]" "mov es:[di+4],al" \
+	"mov al,[si+160]" "mov es:[di+5],al" \
+	"mov al,[si+192]" "mov es:[di+6],al" \
+	"mov al,[si+224]" "mov es:[di+7],al" \
+	"mov al,[si+256]" "mov es:[di+8],al" \
+	"mov al,[si+288]" "mov es:[di+9],al" \
+	"mov al,[si+320]" "mov es:[di+10],al" \
+	"mov al,[si+352]" "mov es:[di+11],al" \
+	"mov al,[si+384]" "mov es:[di+12],al" \
+	"mov al,[si+416]" "mov es:[di+13],al" \
+	"mov al,[si+448]" "mov es:[di+14],al" \
+	"mov al,[si+480]" "mov es:[di+15],al" \
+	"mov al,[si+512]" "mov es:[di+16],al" \
+	"mov al,[si+544]" "mov es:[di+17],al" \
+	"mov al,[si+576]" "mov es:[di+18],al" \
+	"mov al,[si+608]" "mov es:[di+19],al" \
+	"mov al,[si+640]" "mov es:[di+20],al" \
+	"mov al,[si+672]" "mov es:[di+21],al" \
+	"mov al,[si+704]" "mov es:[di+22],al" \
+	"mov al,[si+736]" "mov es:[di+23],al" \
+	"mov al,[si+768]" "mov es:[di+24],al" \
+	"inc si" \
+	"add di,25" \
+	"dec cx" \
+	"jnz v40ecc_row" \
+	parm [si] [es di] modify [ax cx si di];
+
+/* Transpose caller-visible block-major ECC rows (25 * 30 bytes) into the
+ * canonical interleaved stream. This is used by the fused RGB encoder, whose
+ * public ECC oracle intentionally emits the same block-major layout as the
+ * single-channel routine. */
+static void dosferInterleaveEcc30V40(const uint8_t __far *ecc,
+		uint8_t __far *result);
+#pragma aux dosferInterleaveEcc30V40 = \
+	"mov cx,30" \
+	"v40ecc30_row:" \
+	"mov al,fs:[si]"     "mov es:[di],al" \
+	"mov al,fs:[si+30]"  "mov es:[di+1],al" \
+	"mov al,fs:[si+60]"  "mov es:[di+2],al" \
+	"mov al,fs:[si+90]"  "mov es:[di+3],al" \
+	"mov al,fs:[si+120]" "mov es:[di+4],al" \
+	"mov al,fs:[si+150]" "mov es:[di+5],al" \
+	"mov al,fs:[si+180]" "mov es:[di+6],al" \
+	"mov al,fs:[si+210]" "mov es:[di+7],al" \
+	"mov al,fs:[si+240]" "mov es:[di+8],al" \
+	"mov al,fs:[si+270]" "mov es:[di+9],al" \
+	"mov al,fs:[si+300]" "mov es:[di+10],al" \
+	"mov al,fs:[si+330]" "mov es:[di+11],al" \
+	"mov al,fs:[si+360]" "mov es:[di+12],al" \
+	"mov al,fs:[si+390]" "mov es:[di+13],al" \
+	"mov al,fs:[si+420]" "mov es:[di+14],al" \
+	"mov al,fs:[si+450]" "mov es:[di+15],al" \
+	"mov al,fs:[si+480]" "mov es:[di+16],al" \
+	"mov al,fs:[si+510]" "mov es:[di+17],al" \
+	"mov al,fs:[si+540]" "mov es:[di+18],al" \
+	"mov al,fs:[si+570]" "mov es:[di+19],al" \
+	"mov al,fs:[si+600]" "mov es:[di+20],al" \
+	"mov al,fs:[si+630]" "mov es:[di+21],al" \
+	"mov al,fs:[si+660]" "mov es:[di+22],al" \
+	"mov al,fs:[si+690]" "mov es:[di+23],al" \
+	"mov al,fs:[si+720]" "mov es:[di+24],al" \
+	"inc si" \
+	"add di,25" \
+	"dec cx" \
+	"jnz v40ecc30_row" \
+	parm [fs si] [es di] modify [ax cx si di];
+
 static void dosferRs28Asm(const uint8_t __far *data,uint16_t len,
 		const uint8_t __near *table,uint8_t __near *ecc);
 #pragma aux dosferRs28Asm = \
@@ -242,7 +377,7 @@ static void dosferRs28Asm(const uint8_t __far *data,uint16_t len,
 	"xor ah,ah" \
 	"shl ax,5" \
 	"add ax,bx" \
-	"mov bp,ax" \
+	"movzx ebp,ax" \
 	"mov eax,dword ptr [di+1]" \
 	"xor eax,dword ptr ds:[bp]" \
 	"mov dword ptr [di],eax" \
@@ -359,15 +494,16 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 		const uint8_t __near *table,uint8_t __near *ecc);
 #pragma aux dosferRs30PairAsm = \
 	"push bp" \
+	"push cx" \
+	"shr cx,1" \
+	"jz rs30p_pairs_done" \
 	"rs30p_loop:" \
-	"cmp cx,2" \
-	"jb rs30p_tail" \
 	"mov al,es:[si]" \
 	"xor al,[di]" \
 	"xor ah,ah" \
 	"shl ax,5" \
 	"add ax,bx" \
-	"movzx ebp,ax" \
+	"mov bp,ax" \
 	"mov al,es:[si+1]" \
 	"xor al,[di+1]" \
 	"xor al,byte ptr ds:[ebp]" \
@@ -407,10 +543,11 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 	"mov ax,word ptr ds:[edx+28]" \
 	"xor al,byte ptr ds:[ebp+29]" \
 	"mov word ptr [di+28],ax" \
-	"sub cx,2" \
-	"jmp rs30p_loop" \
-	"rs30p_tail:" \
-	"test cx,cx" \
+	"dec cx" \
+	"jnz rs30p_loop" \
+	"rs30p_pairs_done:" \
+	"pop cx" \
+	"test cl,1" \
 	"jz rs30p_done" \
 	"mov al,es:[si]" \
 	"xor al,[di]" \
@@ -446,6 +583,310 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 	"pop bp" \
 	parm [es si] [cx] [bx] [di] modify [ax cx dx si];
 
+/* Advance the degree-30 register by four bytes while reading and writing the
+ * ECC state only once. The caller passes a multiple-of-four length; V40-L's
+ * final two or three bytes continue through the proven pair kernel above.
+ *
+ * D[j] = E[j+4] ^ row(f1)[j+3] ^ row(f2)[j+2]
+ *                  ^ row(f3)[j+1] ^ row(f4)[j]. */
+static void dosferRs30QuadAsm(const uint8_t __far *data,uint16_t len,
+		const uint8_t __near *table,uint8_t __near *ecc);
+#pragma aux dosferRs30QuadAsm = \
+	"push bp" \
+	"push bx" \
+	"shr cx,2" \
+	"jz rs30q_done" \
+	"push cx" \
+	"rs30q_loop:" \
+	"mov al,es:[si]" \
+	"xor al,[di]" \
+	"xor ah,ah" \
+	"shl ax,5" \
+	"add ax,bx" \
+	"movzx ebp,ax" \
+	"mov al,es:[si+1]" \
+	"xor al,[di+1]" \
+	"xor al,byte ptr ds:[ebp]" \
+	"xor ah,ah" \
+	"shl ax,5" \
+	"add ax,bx" \
+	"movzx edx,ax" \
+	"mov al,es:[si+2]" \
+	"xor al,[di+2]" \
+	"xor al,byte ptr ds:[ebp+1]" \
+	"xor al,byte ptr ds:[edx]" \
+	"xor ah,ah" \
+	"shl ax,5" \
+	"add ax,bx" \
+	"movzx ecx,ax" \
+	"mov al,es:[si+3]" \
+	"xor al,[di+3]" \
+	"xor al,byte ptr ds:[ebp+2]" \
+	"xor al,byte ptr ds:[edx+1]" \
+	"xor al,byte ptr ds:[ecx]" \
+	"xor ah,ah" \
+	"shl ax,5" \
+	"add ax,bx" \
+	"movzx ebx,ax" \
+	"mov eax,dword ptr [di+4]" \
+	"xor eax,dword ptr ds:[ebp+3]" \
+	"xor eax,dword ptr ds:[edx+2]" \
+	"xor eax,dword ptr ds:[ecx+1]" \
+	"xor eax,dword ptr ds:[ebx]" \
+	"mov dword ptr [di],eax" \
+	"mov eax,dword ptr [di+8]" \
+	"xor eax,dword ptr ds:[ebp+7]" \
+	"xor eax,dword ptr ds:[edx+6]" \
+	"xor eax,dword ptr ds:[ecx+5]" \
+	"xor eax,dword ptr ds:[ebx+4]" \
+	"mov dword ptr [di+4],eax" \
+	"mov eax,dword ptr [di+12]" \
+	"xor eax,dword ptr ds:[ebp+11]" \
+	"xor eax,dword ptr ds:[edx+10]" \
+	"xor eax,dword ptr ds:[ecx+9]" \
+	"xor eax,dword ptr ds:[ebx+8]" \
+	"mov dword ptr [di+8],eax" \
+	"mov eax,dword ptr [di+16]" \
+	"xor eax,dword ptr ds:[ebp+15]" \
+	"xor eax,dword ptr ds:[edx+14]" \
+	"xor eax,dword ptr ds:[ecx+13]" \
+	"xor eax,dword ptr ds:[ebx+12]" \
+	"mov dword ptr [di+12],eax" \
+	"mov eax,dword ptr [di+20]" \
+	"xor eax,dword ptr ds:[ebp+19]" \
+	"xor eax,dword ptr ds:[edx+18]" \
+	"xor eax,dword ptr ds:[ecx+17]" \
+	"xor eax,dword ptr ds:[ebx+16]" \
+	"mov dword ptr [di+16],eax" \
+	"mov eax,dword ptr [di+24]" \
+	"xor eax,dword ptr ds:[ebp+23]" \
+	"xor eax,dword ptr ds:[edx+22]" \
+	"xor eax,dword ptr ds:[ecx+21]" \
+	"xor eax,dword ptr ds:[ebx+20]" \
+	"mov dword ptr [di+20],eax" \
+	"mov eax,dword ptr [di+28]" \
+	"xor eax,dword ptr ds:[ebp+27]" \
+	"xor eax,dword ptr ds:[edx+26]" \
+	"xor eax,dword ptr ds:[ecx+25]" \
+	"xor eax,dword ptr ds:[ebx+24]" \
+	"mov dword ptr [di+24],eax" \
+	"mov ax,word ptr ds:[ebx+28]" \
+	"xor al,byte ptr ds:[ecx+29]" \
+	"mov word ptr [di+28],ax" \
+	"mov bx,word ptr ss:[esp+2]" \
+	"add si,4" \
+	"dec word ptr ss:[esp]" \
+	"jnz rs30q_loop" \
+	"add sp,2" \
+	"rs30q_done:" \
+	"pop bx" \
+	"pop bp" \
+	parm [es si] [cx] [bx] [di] modify [ax bx cx dx si];
+
+/* Fused three-channel version of the proven four-byte transition. R and G
+ * share one checked far offset in SI while ES/FS/GS select the channel. Each
+ * channel has an independent 32-byte near ECC state; only source traversal
+ * and quad loop control are shared. */
+static void dosferRs30Quad3Asm(const uint8_t __far *red,
+		const uint8_t __far *green,uint16_t len);
+#pragma aux dosferRs30Quad3Asm = \
+	"push bp" \
+	"push gs" \
+	"mov ax,word ptr dosferRsBlue3+2" \
+	"mov gs,ax" \
+	"shr cx,2" \
+	"jz rs30q3_done" \
+	"push cx" \
+	"rs30q3_loop:" \
+	/* Red factors and state transition. */ \
+	"mov al,es:[si]" "xor al,byte ptr dosferRsEcc3" \
+	"xor ah,ah" "shl ax,5" "movzx ebp,ax" \
+	"mov al,es:[si+1]" "xor al,byte ptr dosferRsEcc3+1" \
+	"xor al,byte ptr ds:dosferRsStep[ebp]" \
+	"xor ah,ah" "shl ax,5" "movzx edx,ax" \
+	"mov al,es:[si+2]" "xor al,byte ptr dosferRsEcc3+2" \
+	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
+	"xor al,byte ptr ds:dosferRsStep[edx]" \
+	"xor ah,ah" "shl ax,5" "movzx ecx,ax" \
+	"mov al,es:[si+3]" "xor al,byte ptr dosferRsEcc3+3" \
+	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
+	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
+	"xor al,byte ptr ds:dosferRsStep[ecx]" \
+	"xor ah,ah" "shl ax,5" "movzx ebx,ax" \
+	"mov eax,dword ptr dosferRsEcc3+4" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+1]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx]" \
+	"mov dword ptr dosferRsEcc3,eax" \
+	"mov eax,dword ptr dosferRsEcc3+8" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+7]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+6]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+5]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+4]" \
+	"mov dword ptr dosferRsEcc3+4,eax" \
+	"mov eax,dword ptr dosferRsEcc3+12" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+11]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+10]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+9]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+8]" \
+	"mov dword ptr dosferRsEcc3+8,eax" \
+	"mov eax,dword ptr dosferRsEcc3+16" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+15]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+14]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+13]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+12]" \
+	"mov dword ptr dosferRsEcc3+12,eax" \
+	"mov eax,dword ptr dosferRsEcc3+20" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+19]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+18]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+17]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+16]" \
+	"mov dword ptr dosferRsEcc3+16,eax" \
+	"mov eax,dword ptr dosferRsEcc3+24" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+23]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+22]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+21]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+20]" \
+	"mov dword ptr dosferRsEcc3+20,eax" \
+	"mov eax,dword ptr dosferRsEcc3+28" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+27]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+26]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+25]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+24]" \
+	"mov dword ptr dosferRsEcc3+24,eax" \
+	"mov ax,word ptr ds:dosferRsStep[ebx+28]" \
+	"xor al,byte ptr ds:dosferRsStep[ecx+29]" \
+	"mov word ptr dosferRsEcc3+28,ax" \
+	/* Green factors and state transition. */ \
+	"mov al,fs:[si]" "xor al,byte ptr dosferRsEcc3+32" \
+	"xor ah,ah" "shl ax,5" "movzx ebp,ax" \
+	"mov al,fs:[si+1]" "xor al,byte ptr dosferRsEcc3+33" \
+	"xor al,byte ptr ds:dosferRsStep[ebp]" \
+	"xor ah,ah" "shl ax,5" "movzx edx,ax" \
+	"mov al,fs:[si+2]" "xor al,byte ptr dosferRsEcc3+34" \
+	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
+	"xor al,byte ptr ds:dosferRsStep[edx]" \
+	"xor ah,ah" "shl ax,5" "movzx ecx,ax" \
+	"mov al,fs:[si+3]" "xor al,byte ptr dosferRsEcc3+35" \
+	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
+	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
+	"xor al,byte ptr ds:dosferRsStep[ecx]" \
+	"xor ah,ah" "shl ax,5" "movzx ebx,ax" \
+	"mov eax,dword ptr dosferRsEcc3+36" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+1]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx]" \
+	"mov dword ptr dosferRsEcc3+32,eax" \
+	"mov eax,dword ptr dosferRsEcc3+40" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+7]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+6]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+5]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+4]" \
+	"mov dword ptr dosferRsEcc3+36,eax" \
+	"mov eax,dword ptr dosferRsEcc3+44" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+11]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+10]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+9]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+8]" \
+	"mov dword ptr dosferRsEcc3+40,eax" \
+	"mov eax,dword ptr dosferRsEcc3+48" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+15]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+14]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+13]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+12]" \
+	"mov dword ptr dosferRsEcc3+44,eax" \
+	"mov eax,dword ptr dosferRsEcc3+52" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+19]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+18]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+17]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+16]" \
+	"mov dword ptr dosferRsEcc3+48,eax" \
+	"mov eax,dword ptr dosferRsEcc3+56" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+23]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+22]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+21]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+20]" \
+	"mov dword ptr dosferRsEcc3+52,eax" \
+	"mov eax,dword ptr dosferRsEcc3+60" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+27]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+26]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+25]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+24]" \
+	"mov dword ptr dosferRsEcc3+56,eax" \
+	"mov ax,word ptr ds:dosferRsStep[ebx+28]" \
+	"xor al,byte ptr ds:dosferRsStep[ecx+29]" \
+	"mov word ptr dosferRsEcc3+60,ax" \
+	/* Blue factors and state transition. */ \
+	"mov al,gs:[si]" "xor al,byte ptr dosferRsEcc3+64" \
+	"xor ah,ah" "shl ax,5" "movzx ebp,ax" \
+	"mov al,gs:[si+1]" "xor al,byte ptr dosferRsEcc3+65" \
+	"xor al,byte ptr ds:dosferRsStep[ebp]" \
+	"xor ah,ah" "shl ax,5" "movzx edx,ax" \
+	"mov al,gs:[si+2]" "xor al,byte ptr dosferRsEcc3+66" \
+	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
+	"xor al,byte ptr ds:dosferRsStep[edx]" \
+	"xor ah,ah" "shl ax,5" "movzx ecx,ax" \
+	"mov al,gs:[si+3]" "xor al,byte ptr dosferRsEcc3+67" \
+	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
+	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
+	"xor al,byte ptr ds:dosferRsStep[ecx]" \
+	"xor ah,ah" "shl ax,5" "movzx ebx,ax" \
+	"mov eax,dword ptr dosferRsEcc3+68" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+1]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx]" \
+	"mov dword ptr dosferRsEcc3+64,eax" \
+	"mov eax,dword ptr dosferRsEcc3+72" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+7]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+6]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+5]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+4]" \
+	"mov dword ptr dosferRsEcc3+68,eax" \
+	"mov eax,dword ptr dosferRsEcc3+76" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+11]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+10]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+9]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+8]" \
+	"mov dword ptr dosferRsEcc3+72,eax" \
+	"mov eax,dword ptr dosferRsEcc3+80" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+15]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+14]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+13]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+12]" \
+	"mov dword ptr dosferRsEcc3+76,eax" \
+	"mov eax,dword ptr dosferRsEcc3+84" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+19]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+18]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+17]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+16]" \
+	"mov dword ptr dosferRsEcc3+80,eax" \
+	"mov eax,dword ptr dosferRsEcc3+88" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+23]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+22]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+21]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+20]" \
+	"mov dword ptr dosferRsEcc3+84,eax" \
+	"mov eax,dword ptr dosferRsEcc3+92" \
+	"xor eax,dword ptr ds:dosferRsStep[ebp+27]" \
+	"xor eax,dword ptr ds:dosferRsStep[edx+26]" \
+	"xor eax,dword ptr ds:dosferRsStep[ecx+25]" \
+	"xor eax,dword ptr ds:dosferRsStep[ebx+24]" \
+	"mov dword ptr dosferRsEcc3+88,eax" \
+	"mov ax,word ptr ds:dosferRsStep[ebx+28]" \
+	"xor al,byte ptr ds:dosferRsStep[ecx+29]" \
+	"mov word ptr dosferRsEcc3+92,ax" \
+	"add si,4" \
+	"dec word ptr ss:[esp]" \
+	"jnz rs30q3_loop" \
+	"add sp,2" \
+	"rs30q3_done:" \
+	"pop gs" \
+	"pop bp" \
+	parm [es si] [fs di] [cx] modify [ax bx cx dx si di bp];
+
 #endif
 
 /* DOSfer 386 fast path: 768 bytes avoid eight shift/XOR rounds for every
@@ -458,11 +899,6 @@ static bool dosferCodewordsOnly = false;
 static bool dosferAlignedFast = true;
 static uint8_t dosferRsDiv[qrcodegen_REED_SOLOMON_DEGREE_MAX];
 static uint8_t dosferRsDivLog[qrcodegen_REED_SOLOMON_DEGREE_MAX];
-static uint8_t
-#ifdef __WATCOMC__
-	__near
-#endif
-	dosferRsStep[256U * DOSFER_RS_STRIDE];
 static int dosferRsDegree;
 void qrcodegen_dosferSetCodewordsOnly(bool enabled) { dosferCodewordsOnly = enabled; }
 void qrcodegen_dosferSetAlignedFast(bool enabled) { dosferAlignedFast = enabled; }
@@ -891,7 +1327,13 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 #ifdef __WATCOMC__
 		__near
 #endif
-		ecc[31];
+		ecc[
+#ifdef __WATCOMC__
+		25*32
+#else
+		32
+#endif
+		];
 	int block,j;
 
 	#ifdef __WATCOMC__
@@ -900,12 +1342,17 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 	dosferPrepareRs(30);
 	for(block=0;block<25;block++) {
 		int datLen=block<19?118:119;
-		memset(ecc,0,sizeof(ecc));
 #ifdef __WATCOMC__
-		dosferRs30PairAsm(dat,(uint16_t)datLen,dosferRsStep,ecc);
-		dosferStrideCopy118(dat,result+block);
-		dosferStrideCopy30(ecc,result+2956+block);
+		{
+			uint8_t __near *blockEcc=ecc+block*32;
+			uint16_t quadLen=(uint16_t)(datLen&~3);
+			memset(blockEcc,0,32);
+			dosferRs30QuadAsm(dat,quadLen,dosferRsStep,blockEcc);
+			dosferRs30PairAsm(dat+quadLen,(uint16_t)(datLen-quadLen),
+				dosferRsStep,blockEcc);
+		}
 #else
+		memset(ecc,0,sizeof(ecc));
 		for(j=0;j<datLen;j++) {
 			uint8_t factor=(uint8_t)(dat[j]^ecc[0]);
 			const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
@@ -919,7 +1366,9 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 		dat+=datLen;
 	}
 #ifdef __WATCOMC__
+	dosferInterleaveDataV40(data,result);
 	dosferCopyV40LongData(data,result);
+	dosferInterleaveEccV40(ecc,result+2956);
 #endif
 }
 
@@ -929,24 +1378,21 @@ static void dosferAddEccInterleaveV40L(uint8_t data[], uint8_t result[]) {
 bool qrcodegen_dosferPackFrameV40L(const uint8_t frame[], uint16_t frameLen,
 		uint8_t dataCodewords[]) {
 	const int dataCapacity=2956;
-	int bitLen,terminatorBits,i;
+	int i;
 	uint8_t padByte;
 
 	if(!frame||!dataCodewords||frameLen>2952)return false;
-	memset(dataCodewords,0,(size_t)dataCapacity);
 	dataCodewords[0]=0x70;
 	dataCodewords[1]=0x34;
 	dataCodewords[2]=(uint8_t)(frameLen>>8);
 	dataCodewords[3]=(uint8_t)frameLen;
 	if(frameLen)memcpy(dataCodewords+4,frame,frameLen);
-	bitLen=32+(int)frameLen*8;
-
-	terminatorBits=dataCapacity*8-bitLen;
-	if(terminatorBits>4)terminatorBits=4;
-	bitLen+=terminatorBits;
-	bitLen=(bitLen+7)&~7;
+	i=4+(int)frameLen;
+	/* Every accepted short frame leaves at least one complete byte. Four zero
+	 * terminator bits plus byte alignment therefore occupy exactly this byte. */
+	if(i<dataCapacity)dataCodewords[i++]=0;
 	padByte=0xEC;
-	for(i=bitLen>>3;i<dataCapacity;i++,padByte^=0xEC^0x11)
+	for(;i<dataCapacity;i++,padByte^=0xEC^0x11)
 		dataCodewords[i]=padByte;
 	return true;
 }
@@ -961,7 +1407,7 @@ void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
 #ifdef __WATCOMC__
 		__near
 #endif
-		ecc[31];
+		ecc[32];
 	int block,j;
 
 	#ifdef __WATCOMC__
@@ -972,7 +1418,12 @@ void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
 		int datLen=block<19?118:119;
 		memset(ecc,0,sizeof(ecc));
 #ifdef __WATCOMC__
-		dosferRs30PairAsm(dat,(uint16_t)datLen,dosferRsStep,ecc);
+		{
+			uint16_t quadLen=(uint16_t)(datLen&~3);
+			dosferRs30QuadAsm(dat,quadLen,dosferRsStep,ecc);
+			dosferRs30PairAsm(dat+quadLen,(uint16_t)(datLen-quadLen),
+				dosferRsStep,ecc);
+		}
 #else
 		for(j=0;j<datLen;j++) {
 			uint8_t factor=(uint8_t)(dat[j]^ecc[0]);
@@ -984,6 +1435,92 @@ void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
 		memcpy(eccBlocks+block*30,ecc,30);
 		dat+=datLen;
 	}
+}
+
+/* Compute three independent V40-L ECC streams in one block/quad traversal.
+ * The mathematical recurrence and block-major output layout are identical to
+ * three qrcodegen_dosferComputeEccBlocksV40L() calls. */
+void qrcodegen_dosferComputeEccBlocks3V40L(
+		const uint8_t *const dataCodewords[3],uint8_t *const eccBlocks[3]) {
+#ifdef __WATCOMC__
+	const uint8_t *red,*green,*blue;
+	int block,channel,aligned;
+
+	if(!dataCodewords||!eccBlocks)return;
+	for(channel=0;channel<3;channel++)
+		if(!dataCodewords[channel]||!eccBlocks[channel])return;
+	red=dataCodewords[0];green=dataCodewords[1];blue=dataCodewords[2];
+	aligned=FP_OFF(red)==FP_OFF(green)&&FP_OFF(red)==FP_OFF(blue);
+	dosferRestoreDgroup();
+	dosferPrepareRs(30);
+	for(block=0;block<25;block++) {
+		uint16_t datLen=(uint16_t)(block<19?118:119);
+		uint16_t quadLen=(uint16_t)(datLen&~3);
+		memset(dosferRsEcc3,0,sizeof(dosferRsEcc3));
+		if(aligned) {
+			dosferRsBlue3=blue;
+			dosferRs30Quad3Asm(red,green,quadLen);
+		} else {
+			dosferRs30QuadAsm(red,quadLen,dosferRsStep,dosferRsEcc3[0]);
+			dosferRs30QuadAsm(green,quadLen,dosferRsStep,dosferRsEcc3[1]);
+			dosferRs30QuadAsm(blue,quadLen,dosferRsStep,dosferRsEcc3[2]);
+		}
+		dosferRs30PairAsm(red+quadLen,(uint16_t)(datLen-quadLen),
+			dosferRsStep,dosferRsEcc3[0]);
+		dosferRs30PairAsm(green+quadLen,(uint16_t)(datLen-quadLen),
+			dosferRsStep,dosferRsEcc3[1]);
+		dosferRs30PairAsm(blue+quadLen,(uint16_t)(datLen-quadLen),
+			dosferRsStep,dosferRsEcc3[2]);
+		for(channel=0;channel<3;channel++)
+			memcpy(eccBlocks[channel]+block*30,dosferRsEcc3[channel],30);
+		red+=datLen;green+=datLen;blue+=datLen;
+	}
+#else
+	int channel;
+	if(!dataCodewords||!eccBlocks)return;
+	for(channel=0;channel<3;channel++)
+		qrcodegen_dosferComputeEccBlocksV40L(dataCodewords[channel],
+			eccBlocks[channel]);
+#endif
+}
+
+bool qrcodegen_dosferEncodePrepacked3V40L(
+		uint8_t *const dataCodewords[3],uint8_t *const result[3]) {
+	uint8_t *eccBlocks[3];
+	int channel;
+	if(!dataCodewords||!result)return false;
+	for(channel=0;channel<3;channel++) {
+		if(!dataCodewords[channel]||!result[channel])return false;
+		eccBlocks[channel]=dataCodewords[channel]+2956;
+	}
+	qrcodegen_dosferComputeEccBlocks3V40L(
+		(const uint8_t *const *)dataCodewords,eccBlocks);
+#ifdef __WATCOMC__
+	for(channel=0;channel<3;channel++) {
+		dosferInterleaveDataV40(dataCodewords[channel],result[channel]);
+		dosferCopyV40LongData(dataCodewords[channel],result[channel]);
+		dosferInterleaveEcc30V40(eccBlocks[channel],result[channel]+2956);
+	}
+#else
+	for(channel=0;channel<3;channel++) {
+		int block,row;
+		const uint8_t *dat=dataCodewords[channel];
+		for(row=0;row<118;row++) {
+			int offset=0;
+			for(block=0;block<25;block++) {
+				result[channel][row*25+block]=dat[offset+row];
+				offset+=block<19?118:119;
+			}
+		}
+		for(block=19;block<25;block++) {
+			int offset=19*118+(block-19)*119;
+			result[channel][2950+block-19]=dat[offset+118];
+		}
+		for(row=0;row<30;row++)for(block=0;block<25;block++)
+			result[channel][2956+row*25+block]=eccBlocks[channel][block*30+row];
+	}
+#endif
+	return true;
 }
 
 /* Encode one complete DOSfer transport frame as fixed QR V40-L + ECI 3.
@@ -1029,7 +1566,7 @@ bool qrcodegen_dosferCorrectXorV40L(const uint8_t encodedXor[],uint16_t xorCount
 #ifdef __WATCOMC__
         __near
 #endif
-        ecc[31];
+        ecc[32];
     uint16_t i;
 #ifdef DOSFER_PROFILE
     u32 profileStart=timer_ticks(),profileNow;
@@ -1044,7 +1581,8 @@ bool qrcodegen_dosferCorrectXorV40L(const uint8_t encodedXor[],uint16_t xorCount
     }
     memcpy(data+4,protocolHeaderXor,48);dosferPrepareRs(30);
 #ifdef __WATCOMC__
-    dosferRs30PairAsm(data,118,dosferRsStep,ecc);
+    dosferRs30QuadAsm(data,116,dosferRsStep,ecc);
+    dosferRs30PairAsm(data+116,2,dosferRsStep,ecc);
 #else
     for(i=0;i<118;i++){uint8_t factor=data[i]^ecc[0];const uint8_t *row=dosferRsStep+(unsigned)factor*DOSFER_RS_STRIDE;
         ecc[30]=0;for(int j=0;j<30;j++)ecc[j]=ecc[j+1]^row[j];}

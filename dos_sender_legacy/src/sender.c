@@ -34,12 +34,15 @@ static u8 qr_codewords[DOSFER_QR_CODEWORDS], qr_workspace[QR_BUFFER+1],
 static SelectionStats selection;
 static u32 completed_session,completed_frames,completed_bytes;
 static u32 last_visible_tick;
-static int qr_delta_ready;
+static int qr_stream_ready;
 static int encoded_qr_mask=-1;
 static u8 chain_payload[MAX_FRAME_PAYLOAD];
 static u8 far *rgb_codewords[VGA_RGB_CHANNELS];
+static u8 far *rgb_codewords_alloc[VGA_RGB_CHANNELS];
 static u8 far *rgb_workspace[VGA_RGB_CHANNELS];
+static u8 far *rgb_workspace_alloc[VGA_RGB_CHANNELS];
 static u8 far *rgb_parity_codewords[VGA_RGB_CHANNELS];
+static u8 far *rgb_parity_alloc[VGA_RGB_CHANNELS];
 static u8 rgb_headers[VGA_RGB_CHANNELS][FRAME_HEADER_SIZE];
 static int rgb_direct_ready;
 static int rgb_template_mask=-1;
@@ -48,6 +51,11 @@ static int chain_cache_valid;
 static u32 chain_cache_session,chain_cache_window,chain_cache_global;
 static u16 chain_cache_rawlen,chain_cache_index;
 static u8 chain_cache_mask;
+
+static u8 far *align_far16(u8 far *p) {
+    u32 paragraphs=((u32)FP_OFF(p)+15UL)>>4;
+    return (u8 far *)MK_FP((u16)(FP_SEG(p)+paragraphs),0);
+}
 
 static void free_chain_cache(void) {
     if(chain_left_codewords)_ffree(chain_left_codewords);
@@ -60,12 +68,15 @@ static void free_chain_cache(void) {
 static void free_rgb_state(void) {
     int channel;
     for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
-        if(rgb_codewords[channel])_ffree(rgb_codewords[channel]);
-        if(rgb_workspace[channel])_ffree(rgb_workspace[channel]);
-        if(rgb_parity_codewords[channel])_ffree(rgb_parity_codewords[channel]);
+        if(rgb_codewords_alloc[channel])_ffree(rgb_codewords_alloc[channel]);
+        if(rgb_workspace_alloc[channel])_ffree(rgb_workspace_alloc[channel]);
+        if(rgb_parity_alloc[channel])_ffree(rgb_parity_alloc[channel]);
         rgb_codewords[channel]=0;
+        rgb_codewords_alloc[channel]=0;
         rgb_workspace[channel]=0;
+        rgb_workspace_alloc[channel]=0;
         rgb_parity_codewords[channel]=0;
+        rgb_parity_alloc[channel]=0;
     }
     rgb_direct_ready=0;
     rgb_template_mask=-1;
@@ -74,14 +85,27 @@ static void free_rgb_state(void) {
 static int ensure_rgb_state(void) {
     int channel;
     for(channel=0;channel<VGA_RGB_CHANNELS;++channel) {
-        if(!rgb_codewords[channel])
-            rgb_codewords[channel]=(u8 far *)_fmalloc(DOSFER_QR_CODEWORDS);
-        if(!rgb_workspace[channel])
-            rgb_workspace[channel]=(u8 far *)_fmalloc(QR_BUFFER+1);
-        if(!rgb_parity_codewords[channel])
-            rgb_parity_codewords[channel]=(u8 far *)_fmalloc(DOSFER_QR_CODEWORDS);
-        if(!rgb_codewords[channel]||!rgb_workspace[channel]||
-           !rgb_parity_codewords[channel]) {
+        if(!rgb_codewords_alloc[channel]) {
+            rgb_codewords_alloc[channel]=(u8 far *)_fmalloc(
+                DOSFER_QR_CODEWORDS+15);
+            if(rgb_codewords_alloc[channel])
+                rgb_codewords[channel]=align_far16(rgb_codewords_alloc[channel]);
+        }
+        if(!rgb_workspace_alloc[channel]) {
+            rgb_workspace_alloc[channel]=(u8 far *)_fmalloc(QR_BUFFER+16);
+            if(rgb_workspace_alloc[channel])
+                rgb_workspace[channel]=align_far16(rgb_workspace_alloc[channel]);
+        }
+        if(!rgb_parity_alloc[channel]) {
+            rgb_parity_alloc[channel]=(u8 far *)_fmalloc(
+                DOSFER_QR_CODEWORDS+15);
+            if(rgb_parity_alloc[channel])
+                rgb_parity_codewords[channel]=align_far16(rgb_parity_alloc[channel]);
+        }
+        if(!rgb_codewords_alloc[channel]||!rgb_codewords[channel]||
+           !rgb_workspace_alloc[channel]||
+           !rgb_workspace[channel]||
+           !rgb_parity_alloc[channel]||!rgb_parity_codewords[channel]) {
             free_rgb_state();
             return 0;
         }
@@ -111,14 +135,18 @@ static int ensure_chain_cache(void) {
     return 0;
 }
 
-static int can_delta(u8 display_mask) {
-    return qr_delta_ready&&display_mask==encoded_qr_mask;
+static int can_prepare(u8 display_mask) {
+    return qr_stream_ready&&display_mask==encoded_qr_mask;
 }
 
-static int qr_prepare_mask(const u8 *data,u16 n,int delta_only,u8 mask) {
+static int qr_prepare_mask(const u8 *data,u16 n,int prepared,u8 mask) {
     int ok;
 
-    if(delta_only) {
+    if(prepared&&vga_direct_ready()) {
+        ok=qrcodegen_dosferEncodeFrameV40L(data,n,qr_codewords,qr_workspace,
+            (enum qrcodegen_Mask)mask,true);
+        if(ok)ok=vga_apply_codewords_direct(qr_codewords);
+    } else if(prepared) {
 #ifdef DOSFER_PROFILE
         u32 t=timer_ticks(),now;
 #endif
@@ -141,8 +169,8 @@ static int qr_prepare_mask(const u8 *data,u16 n,int delta_only,u8 mask) {
     return ok;
 }
 
-static int qr_prepare(const u8 *data,u16 n,const Config *cfg,int delta_only) {
-    return qr_prepare_mask(data,n,delta_only,cfg->qr_mask);
+static int qr_prepare(const u8 *data,u16 n,const Config *cfg,int prepared) {
+    return qr_prepare_mask(data,n,prepared,cfg->qr_mask);
 }
 
 static int make_prepacked_data(const Window *w,u16 i,u32 session,u16 flags,u8 mask) {
@@ -152,29 +180,35 @@ static int make_prepacked_data(const Window *w,u16 i,u32 session,u16 flags,u8 ma
     n=make_frame(qr_workspace+4,FK_DATA,flags,session,w->id,f->global_index,
         i,w->count,f->stream_id,f->stream_offset,f->payload,f->payload_len);
     if(n!=2952)return 0;
+    if(vga_direct_ready()) {
+        if(!qrcodegen_dosferEncodePrepackedV40L(qr_workspace,qr_codewords)||
+           !vga_apply_codewords_direct(qr_codewords))return 0;
+    } else {
 #ifdef DOSFER_PROFILE
-    {u32 t=timer_ticks();
+        {u32 t=timer_ticks();
 #endif
-    qrcodegen_dosferComputeEccBlocksV40L(qr_workspace,
-        qr_workspace+QR_DATA_CODEWORDS);
+        qrcodegen_dosferComputeEccBlocksV40L(qr_workspace,
+            qr_workspace+QR_DATA_CODEWORDS);
 #ifdef DOSFER_PROFILE
-    dosferQrProfileTicks[1]+=timer_ticks()-t;}
+        dosferQrProfileTicks[1]+=timer_ticks()-t;}
 #endif
-    if(!vga_apply_v40l_delta(qr_workspace,
-            qr_workspace+QR_DATA_CODEWORDS,qr_codewords))return 0;
+        if(!vga_apply_v40l_delta(qr_workspace,
+                qr_workspace+QR_DATA_CODEWORDS,qr_codewords))return 0;
+    }
     encoded_qr_mask=mask;
     return n;
 }
 
-static int display_encoded(const Config *cfg,const char *status,int delta,u16 hold_ms) {
+static int display_encoded(const Config *cfg,const char *status,int prepared,
+        u16 hold_ms) {
     u32 earliest=0;
     if(last_visible_tick&&hold_ms)
         earliest=last_visible_tick+timer_ticks_from_ms(hold_ms);
-    if(delta) {
+    if(prepared) {
         if(!vga_show_prepared_at(cfg->invert,status,earliest))return 0;
     } else if(!vga_show_full_qr_at(qr_workspace,qr_codewords,cfg->invert,
             status,earliest))return 0;
-    qr_delta_ready=vga_delta_ready();
+    qr_stream_ready=vga_delta_ready();
     last_visible_tick=vga_last_flip_tick();
     return 1;
 }
@@ -187,20 +221,24 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
     char status_buf[41];
 #endif
     u16 n;
-    int delta=can_delta(display_mask);
+    int prepared=can_prepare(display_mask);
 #ifdef DOSFER_DEVTOOLS
     int rescue=hold_ms!=cfg->hold_ms||display_mask!=cfg->qr_mask;
 #endif
 
-    if(delta&&!repeated&&chain_cache_valid&&chain_cache_session==session&&
+    if(prepared&&!repeated&&chain_cache_valid&&chain_cache_session==session&&
        chain_cache_window==w->id&&chain_cache_global==f->global_index&&
        chain_cache_index==i&&chain_cache_mask==display_mask) {
         n=chain_cache_rawlen;
         _fmemcpy(raw_frame,chain_cached_raw,FRAME_HEADER_SIZE);
-        if(!vga_apply_codeword_delta(chain_right_codewords,qr_codewords))return 0;
+        if(vga_direct_ready()) {
+            _fmemcpy(qr_codewords,chain_right_codewords,DOSFER_QR_CODEWORDS);
+            if(!vga_apply_codewords_direct(qr_codewords))return 0;
+        } else if(!vga_apply_codeword_delta(chain_right_codewords,
+                qr_codewords))return 0;
         encoded_qr_mask=display_mask;
         chain_cache_valid=0;
-    } else if(delta&&f->payload_len==2904) {
+    } else if(prepared&&f->payload_len==2904) {
         n=(u16)make_prepacked_data(w,i,session,
             (u16)((repeated?FF_REPEATED:0)|FF_WHITENED),display_mask);
         if(!n)return 0;
@@ -213,7 +251,7 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
         n=make_frame(raw_frame,FK_DATA,(repeated?FF_REPEATED:0)|FF_WHITENED,
             session,w->id,f->global_index,i,w->count,f->stream_id,
             f->stream_offset,f->payload,f->payload_len);
-        if(!qr_prepare_mask(raw_frame,n,delta,display_mask))return 0;
+        if(!qr_prepare_mask(raw_frame,n,prepared,display_mask))return 0;
     }
 
 #ifdef DOSFER_DEVTOOLS
@@ -228,7 +266,7 @@ static int show_frame(const Window *w,u16 i,const Config *cfg,u32 session,
     }
 #endif
 
-    return display_encoded(cfg,status,delta,hold_ms);
+    return display_encoded(cfg,status,prepared,hold_ms);
 }
 
 static u32 read_u32be(const u8 *p) {
@@ -254,12 +292,12 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
 #ifdef DOSFER_DEVTOOLS
     char status[41];
 #endif
-    int delta=can_delta(cfg->qr_mask),cached=0,derived=0;
+    int prepared=can_prepare(cfg->qr_mask),cached=0,derived=0;
 
     /* C2 has a V40-L affine shortcut: encode the right DATA frame once,
      * derive the XOR QR from the two canonical codeword streams, then cache
      * the right frame because it is the next DATA frame to display. */
-    if(delta&&ensure_chain_cache()) {
+    if(prepared&&ensure_chain_cache()) {
         _fmemcpy(left_header,raw_frame,FRAME_HEADER_SIZE);
         _fmemcpy(chain_left_codewords,qr_codewords,DOSFER_QR_CODEWORDS);
         qr_workspace[0]=0x70;qr_workspace[1]=0x34;qr_workspace[2]=0x0B;qr_workspace[3]=0x88;
@@ -287,26 +325,31 @@ static int show_chain(const Window *w,u16 i,const Config *cfg,u32 session,u16 ho
             session,w->id,left->global_index,i,w->count,lengths,0,chain_crc,n);
         for(j=0;j<FRAME_HEADER_SIZE;++j)
             header_xor[j]=(u8)(left_header[j]^chain_cached_raw[j]^raw_frame[j]);
-        derived=qrcodegen_dosferDeriveXorV40L(chain_left_codewords,
-            chain_right_codewords,header_xor,qr_workspace);
-        if(derived) {
-            derived=vga_apply_codeword_delta(qr_workspace,qr_codewords);
-            if(derived)encoded_qr_mask=cfg->qr_mask;
+        if(vga_direct_ready()) {
+            derived=qrcodegen_dosferDeriveXorV40L(chain_left_codewords,
+                chain_right_codewords,header_xor,qr_codewords);
+            if(derived)derived=vga_apply_codewords_direct(qr_codewords);
+        } else {
+            derived=qrcodegen_dosferDeriveXorV40L(chain_left_codewords,
+                chain_right_codewords,header_xor,qr_workspace);
+            if(derived)
+                derived=vga_apply_codeword_delta(qr_workspace,qr_codewords);
         }
+        if(derived)encoded_qr_mask=cfg->qr_mask;
     }
 
     if(!derived) {
         n=xor_frame_payload(left,right);
         rawlen=make_frame(raw_frame,FK_CHAIN_XOR,FF_PAIR_WHITENED,session,w->id,
             left->global_index,i,w->count,lengths,0,chain_payload,n);
-        if(!qr_prepare_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
+        if(!qr_prepare_mask(raw_frame,rawlen,prepared,cfg->qr_mask))return 0;
     }
 
 #ifdef DOSFER_DEVTOOLS
     sprintf(status,"TRANSFER V40L XOR %u-%u/%u",i+1,i+2,w->count);
-    return display_encoded(cfg,status,delta,hold_ms);
+    return display_encoded(cfg,status,prepared,hold_ms);
 #else
-    return display_encoded(cfg,0,delta,hold_ms);
+    return display_encoded(cfg,0,prepared,hold_ms);
 #endif
 }
 
@@ -330,18 +373,18 @@ static int show_block_parity(const Window *w,u16 first,u16 count,const Config *c
     char status[41];
 #endif
     u16 n=xor_block_payload(w,first,count),rawlen;
-    int delta=can_delta(cfg->qr_mask);
+    int prepared=can_prepare(cfg->qr_mask);
 
     rawlen=make_frame(raw_frame,FK_BLOCK_XOR,FF_WHITENED,session,w->id,
         base->global_index,first,w->count,count,0,chain_payload,n);
-    if(!qr_prepare_mask(raw_frame,rawlen,delta,cfg->qr_mask))return 0;
+    if(!qr_prepare_mask(raw_frame,rawlen,prepared,cfg->qr_mask))return 0;
 
 #ifdef DOSFER_DEVTOOLS
     sprintf(status,"TRANSFER V40L XOR %u-%u/%u",
         first+1,first+count,w->count);
-    return display_encoded(cfg,status,delta,hold_ms);
+    return display_encoded(cfg,status,prepared,hold_ms);
 #else
-    return display_encoded(cfg,0,delta,hold_ms);
+    return display_encoded(cfg,0,prepared,hold_ms);
 #endif
 }
 
@@ -447,11 +490,16 @@ static int rgb_prepare_items(const Window *w,const RgbItem items[VGA_RGB_CHANNEL
         rawlen=make_rgb_item_frame(w,&items[channel],session);
         if(!rawlen)return 0;
         _fmemcpy(rgb_headers[channel],raw_frame,FRAME_HEADER_SIZE);
-        if(!qrcodegen_dosferEncodeFrameV40L(raw_frame,rawlen,
+        if(direct) {
+            if(!qrcodegen_dosferPackFrameV40L(raw_frame,rawlen,
+                    rgb_workspace[channel]))return 0;
+        } else if(!qrcodegen_dosferEncodeFrameV40L(raw_frame,rawlen,
                 rgb_codewords[channel],rgb_workspace[channel],
-                (enum qrcodegen_Mask)display_mask,direct!=0))return 0;
+                (enum qrcodegen_Mask)display_mask,false))return 0;
     }
     if(direct) {
+        if(!qrcodegen_dosferEncodePrepacked3V40L(rgb_workspace,
+                rgb_codewords))return 0;
         for(channel=0;channel<VGA_RGB_CHANNELS;++channel)
             codewords[channel]=rgb_codewords[channel];
         if(!vga_apply_codewords3_direct(codewords))return 0;
@@ -479,7 +527,7 @@ static int display_rgb_items(const Window *w,const RgbItem items[VGA_RGB_CHANNEL
         }
         if(!vga_show_full_qr3_at(qr,rgb_codewords,cfg->invert,status,earliest))return 0;
     }
-    rgb_direct_ready=vga_rgb3_direct_ready();
+    rgb_direct_ready=vga_direct_ready();
     last_visible_tick=vga_last_flip_tick();
     return 1;
 }
@@ -816,7 +864,7 @@ static int transmit(const Window *w,const Config *cfg,u32 session,
 static void show_eow(const Window *w,const Config *cfg,u32 session) {
     char status[41];
     u16 n;
-    int delta;
+    int prepared;
     sprintf(status,"W%lu DONE  Enter R M Esc",w->id+1);
     if(cfg->rgb3) {
         RgbItem items[VGA_RGB_CHANNELS];
@@ -830,9 +878,9 @@ static void show_eow(const Window *w,const Config *cfg,u32 session) {
     } else {
         n=make_frame(raw_frame,FK_END_WINDOW,0,session,w->id,
             w->frames[w->count-1].global_index,0,w->count,0,0,0,0);
-        delta=can_delta(cfg->qr_mask);
-        if(qr_prepare(raw_frame,n,cfg,delta))
-            display_encoded(cfg,status,delta,cfg->hold_ms);
+        prepared=can_prepare(cfg->qr_mask);
+        if(qr_prepare(raw_frame,n,cfg,prepared))
+            display_encoded(cfg,status,prepared,cfg->hold_ms);
     }
     if(cfg->speaker)speaker_beep();
 }
@@ -891,7 +939,7 @@ static int enter_transfer_vga(const Config *cfg) {
         puts("Could not enter planar EGA/VGA 320x200 mode");
         return 0;
     }
-    qr_delta_ready=0;
+    qr_stream_ready=0;
     encoded_qr_mask=-1;
     rgb_direct_ready=0;
     rgb_template_mask=-1;
@@ -1039,7 +1087,7 @@ static int calibration(Config *cfg) {
 
     if(!vga_enter(cfg->video_mode,0))return 0;
     last_visible_tick=0;
-    qr_delta_ready=0;
+    qr_stream_ready=0;
     encoded_qr_mask=-1;
     for(;;) {
         n=cfg->frame_payload;
@@ -1052,11 +1100,11 @@ static int calibration(Config *cfg) {
         n=make_frame(raw_frame,FK_CALIBRATION,0,session,0,seq,
             (u16)(seq&0xFFFF),100,0,0,payload,n);
         {
-            int delta=can_delta(cfg->qr_mask);
-            if(!qr_prepare(raw_frame,n,cfg,delta)){vga_leave();return 0;}
+            int prepared=can_prepare(cfg->qr_mask);
+            if(!qr_prepare(raw_frame,n,cfg,prepared)){vga_leave();return 0;}
             sprintf(status,"CAL V40L %s hold %u",
                 config_video_name(cfg),cfg->hold_ms);
-            if(!display_encoded(cfg,status,delta,cfg->hold_ms)){vga_leave();return 0;}
+            if(!display_encoded(cfg,status,prepared,cfg->hold_ms)){vga_leave();return 0;}
         }
         ++seq;
 
@@ -1083,6 +1131,9 @@ static void benchmark(const char *path,Config *cfg) {
     u32 build_ms=0,copy_ms=0,text_ms=0,first_ms=0,steady_ms=0;
     u32 useful,dirty_hash=0,full_hash=0;
     int i,encoded=0,ok=1,display_ok=0,redraw_ok=0;
+#ifdef DOSFER_PROFILE
+    u32 steady_qr_profile[6],steady_protocol_profile[3],steady_vga_profile[5];
+#endif
 
     {u8 record_test[100],record_input[80];u16 exact,refused;
         memset(record_test,0xCC,sizeof(record_test));
@@ -1152,7 +1203,7 @@ static void benchmark(const char *path,Config *cfg) {
     printf("VGA flip/copy x25: %lu ms (%lu ms/frame)\n",copy_ms,copy_ms/25UL);
     printf("VGA status x25: %lu ms (%lu ms/frame)\n",text_ms,text_ms/25UL);
 
-    qr_delta_ready=0;
+    qr_stream_ready=0;
     rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,0,0,1,0,0,b,cfg->frame_payload);
     t0=timer_ticks();
     if(!qr_prepare(raw_frame,rawlen,cfg,0)||
@@ -1160,7 +1211,7 @@ static void benchmark(const char *path,Config *cfg) {
             "BENCH first V40 frame",0))ok=0;
     t1=timer_ticks();
     first_ms=timer_elapsed_ms(t0,t1);
-    qr_delta_ready=vga_delta_ready();
+    qr_stream_ready=vga_delta_ready();
     vga_delta_stats(&map_bits);
 
 #ifdef DOSFER_PROFILE
@@ -1172,12 +1223,19 @@ static void benchmark(const char *path,Config *cfg) {
     for(i=1;i<25&&ok;++i){
         rawlen=make_frame(raw_frame,FK_DATA,FF_WHITENED,1,0,(u32)i,0,1,0,0,
             b,cfg->frame_payload);
-        if(!qr_prepare(raw_frame,rawlen,cfg,qr_delta_ready)||
-           !vga_show_prepared_at(cfg->invert,"BENCH delta V40 frame",0))ok=0;
-        qr_delta_ready=vga_delta_ready();
+        if(!qr_prepare(raw_frame,rawlen,cfg,qr_stream_ready)||
+           !vga_show_prepared_at(cfg->invert,"BENCH direct V40 frame",0))ok=0;
+        qr_stream_ready=vga_delta_ready();
     }
     t1=timer_ticks();
     steady_ms=timer_elapsed_ms(t0,t1);
+#ifdef DOSFER_PROFILE
+    memcpy(steady_qr_profile,dosferQrProfileTicks,sizeof(steady_qr_profile));
+    memcpy(steady_protocol_profile,dosferProtocolProfileTicks,
+        sizeof(steady_protocol_profile));
+    memcpy(steady_vga_profile,dosferVgaProfileTicks,
+        sizeof(steady_vga_profile));
+#endif
 
     if(ok){
         dirty_hash=vga_screen_hash();
@@ -1188,26 +1246,26 @@ static void benchmark(const char *path,Config *cfg) {
             full_hash=vga_screen_hash();
             redraw_ok=dirty_hash==full_hash;
         }
-        printf("Stateful renderer: map %u bits, first %lu ms, next 24 %lu ms = %lu ms/frame\n",
+        printf("Steady renderer: map %u bits, first %lu ms, next 24 %lu ms = %lu ms/frame\n",
             map_bits,first_ms,steady_ms,steady_ms/24UL);
         printf("Stateful raster: %s (%08lX/%08lX), VGA page: %s\n",
             redraw_ok?"MATCH":"FAIL",dirty_hash,full_hash,display_ok?"MATCH":"FAIL");
         {u32 du,dc,dt;
             vga_benchmark_delta(qr_codewords,24,&du,&dc,&dt);
-            printf("Delta microbench x24: update %lu ms, flip %lu ms, status %lu ms\n",du,dc,dt);
+            printf("Delta oracle x24: update %lu ms, flip %lu ms, status %lu ms\n",du,dc,dt);
         }
 #ifdef DOSFER_PROFILE
         printf("  steady protocol: header %lu  payload+CRC %lu  header CRC %lu ms\n",
-            timer_elapsed_ms(0,dosferProtocolProfileTicks[0]),timer_elapsed_ms(0,dosferProtocolProfileTicks[1]),
-            timer_elapsed_ms(0,dosferProtocolProfileTicks[2]));
+            timer_elapsed_ms(0,steady_protocol_profile[0]),timer_elapsed_ms(0,steady_protocol_profile[1]),
+            timer_elapsed_ms(0,steady_protocol_profile[2]));
         printf("  steady QR: pack %lu  ECC %lu  func1 %lu  data %lu  func2 %lu  mask %lu ms\n",
-            timer_elapsed_ms(0,dosferQrProfileTicks[0]),timer_elapsed_ms(0,dosferQrProfileTicks[1]),
-            timer_elapsed_ms(0,dosferQrProfileTicks[2]),timer_elapsed_ms(0,dosferQrProfileTicks[3]),
-            timer_elapsed_ms(0,dosferQrProfileTicks[4]),timer_elapsed_ms(0,dosferQrProfileTicks[5]));
+            timer_elapsed_ms(0,steady_qr_profile[0]),timer_elapsed_ms(0,steady_qr_profile[1]),
+            timer_elapsed_ms(0,steady_qr_profile[2]),timer_elapsed_ms(0,steady_qr_profile[3]),
+            timer_elapsed_ms(0,steady_qr_profile[4]),timer_elapsed_ms(0,steady_qr_profile[5]));
         printf("  steady VGA: render %lu  upload %lu  retrace %lu  flip %lu  status %lu ms\n",
-            timer_elapsed_ms(0,dosferVgaProfileTicks[0]),timer_elapsed_ms(0,dosferVgaProfileTicks[1]),
-            timer_elapsed_ms(0,dosferVgaProfileTicks[2]),timer_elapsed_ms(0,dosferVgaProfileTicks[3]),
-            timer_elapsed_ms(0,dosferVgaProfileTicks[4]));
+            timer_elapsed_ms(0,steady_vga_profile[0]),timer_elapsed_ms(0,steady_vga_profile[1]),
+            timer_elapsed_ms(0,steady_vga_profile[2]),timer_elapsed_ms(0,steady_vga_profile[3]),
+            timer_elapsed_ms(0,steady_vga_profile[4]));
 #endif
     }
     vga_leave();

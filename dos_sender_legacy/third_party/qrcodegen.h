@@ -404,6 +404,10 @@ bool qrcodegen_dosferPackFrameV40L(const uint8_t frame[], uint16_t frameLen,
 		uint8_t dataCodewords[]);
 void qrcodegen_dosferComputeEccBlocksV40L(const uint8_t dataCodewords[],
 		uint8_t eccBlocks[]);
+void qrcodegen_dosferComputeEccBlocks3V40L(
+		const uint8_t *const dataCodewords[3],uint8_t *const eccBlocks[3]);
+bool qrcodegen_dosferEncodePrepacked3V40L(
+		uint8_t *const dataCodewords[3],uint8_t *const result[3]);
 bool qrcodegen_dosferEncodeFrameV40L(const uint8_t frame[], uint16_t frameLen,
 		uint8_t codewords[], uint8_t workspace[], enum qrcodegen_Mask mask,
 		bool codewordsOnly);
