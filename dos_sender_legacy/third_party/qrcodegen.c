@@ -701,19 +701,19 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"rs30q3_loop:" \
 	/* Red factors and state transition. */ \
 	"mov al,es:[si]" "xor al,byte ptr dosferRsEcc3" \
-	"xor ah,ah" "shl ax,5" "movzx ebp,ax" \
+	"movzx ebp,al" "shl ebp,5" \
 	"mov al,es:[si+1]" "xor al,byte ptr dosferRsEcc3+1" \
 	"xor al,byte ptr ds:dosferRsStep[ebp]" \
-	"xor ah,ah" "shl ax,5" "movzx edx,ax" \
+	"movzx edx,al" "shl edx,5" \
 	"mov al,es:[si+2]" "xor al,byte ptr dosferRsEcc3+2" \
 	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
 	"xor al,byte ptr ds:dosferRsStep[edx]" \
-	"xor ah,ah" "shl ax,5" "movzx ecx,ax" \
+	"movzx ecx,al" "shl ecx,5" \
 	"mov al,es:[si+3]" "xor al,byte ptr dosferRsEcc3+3" \
 	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
 	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
 	"xor al,byte ptr ds:dosferRsStep[ecx]" \
-	"xor ah,ah" "shl ax,5" "movzx ebx,ax" \
+	"movzx ebx,al" "shl ebx,5" \
 	"mov eax,dword ptr dosferRsEcc3+4" \
 	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
@@ -761,19 +761,19 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"mov word ptr dosferRsEcc3+28,ax" \
 	/* Green factors and state transition. */ \
 	"mov al,fs:[si]" "xor al,byte ptr dosferRsEcc3+32" \
-	"xor ah,ah" "shl ax,5" "movzx ebp,ax" \
+	"movzx ebp,al" "shl ebp,5" \
 	"mov al,fs:[si+1]" "xor al,byte ptr dosferRsEcc3+33" \
 	"xor al,byte ptr ds:dosferRsStep[ebp]" \
-	"xor ah,ah" "shl ax,5" "movzx edx,ax" \
+	"movzx edx,al" "shl edx,5" \
 	"mov al,fs:[si+2]" "xor al,byte ptr dosferRsEcc3+34" \
 	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
 	"xor al,byte ptr ds:dosferRsStep[edx]" \
-	"xor ah,ah" "shl ax,5" "movzx ecx,ax" \
+	"movzx ecx,al" "shl ecx,5" \
 	"mov al,fs:[si+3]" "xor al,byte ptr dosferRsEcc3+35" \
 	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
 	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
 	"xor al,byte ptr ds:dosferRsStep[ecx]" \
-	"xor ah,ah" "shl ax,5" "movzx ebx,ax" \
+	"movzx ebx,al" "shl ebx,5" \
 	"mov eax,dword ptr dosferRsEcc3+36" \
 	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
@@ -821,19 +821,19 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"mov word ptr dosferRsEcc3+60,ax" \
 	/* Blue factors and state transition. */ \
 	"mov al,gs:[si]" "xor al,byte ptr dosferRsEcc3+64" \
-	"xor ah,ah" "shl ax,5" "movzx ebp,ax" \
+	"movzx ebp,al" "shl ebp,5" \
 	"mov al,gs:[si+1]" "xor al,byte ptr dosferRsEcc3+65" \
 	"xor al,byte ptr ds:dosferRsStep[ebp]" \
-	"xor ah,ah" "shl ax,5" "movzx edx,ax" \
+	"movzx edx,al" "shl edx,5" \
 	"mov al,gs:[si+2]" "xor al,byte ptr dosferRsEcc3+66" \
 	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
 	"xor al,byte ptr ds:dosferRsStep[edx]" \
-	"xor ah,ah" "shl ax,5" "movzx ecx,ax" \
+	"movzx ecx,al" "shl ecx,5" \
 	"mov al,gs:[si+3]" "xor al,byte ptr dosferRsEcc3+67" \
 	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
 	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
 	"xor al,byte ptr ds:dosferRsStep[ecx]" \
-	"xor ah,ah" "shl ax,5" "movzx ebx,ax" \
+	"movzx ebx,al" "shl ebx,5" \
 	"mov eax,dword ptr dosferRsEcc3+68" \
 	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
