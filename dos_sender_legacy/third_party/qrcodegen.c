@@ -148,6 +148,7 @@ static uint8_t
 #ifdef __WATCOMC__
 static uint8_t __near dosferRsEcc3[3][32];
 static const uint8_t __far *dosferRsBlue3;
+static uint8_t __far *dosferRsEccBlueOut3;
 #endif
 
 #ifdef __WATCOMC__
@@ -887,6 +888,42 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"pop bp" \
 	parm [es si] [fs di] [cx] modify [ax bx cx dx si di bp];
 
+/* Export the three independent 30-byte ECC states with one segment setup.
+ * The fused encoder aligns all three workspaces to the same far offset; the
+ * caller retains generic memcpy fallback for any unaligned external use. */
+static void dosferCopyEcc3Asm(uint8_t __far *red,uint8_t __far *green);
+#pragma aux dosferCopyEcc3Asm = \
+	"push bx" "push ds" "push gs" \
+	"push ss" "pop ds" \
+	"mov bx,word ptr dosferRsEccBlueOut3" \
+	"mov ax,word ptr dosferRsEccBlueOut3+2" "mov gs,ax" \
+	"mov eax,dword ptr dosferRsEcc3" "mov es:[di],eax" \
+	"mov eax,dword ptr dosferRsEcc3+4" "mov es:[di+4],eax" \
+	"mov eax,dword ptr dosferRsEcc3+8" "mov es:[di+8],eax" \
+	"mov eax,dword ptr dosferRsEcc3+12" "mov es:[di+12],eax" \
+	"mov eax,dword ptr dosferRsEcc3+16" "mov es:[di+16],eax" \
+	"mov eax,dword ptr dosferRsEcc3+20" "mov es:[di+20],eax" \
+	"mov eax,dword ptr dosferRsEcc3+24" "mov es:[di+24],eax" \
+	"mov ax,word ptr dosferRsEcc3+28" "mov es:[di+28],ax" \
+	"mov eax,dword ptr dosferRsEcc3+32" "mov fs:[si],eax" \
+	"mov eax,dword ptr dosferRsEcc3+36" "mov fs:[si+4],eax" \
+	"mov eax,dword ptr dosferRsEcc3+40" "mov fs:[si+8],eax" \
+	"mov eax,dword ptr dosferRsEcc3+44" "mov fs:[si+12],eax" \
+	"mov eax,dword ptr dosferRsEcc3+48" "mov fs:[si+16],eax" \
+	"mov eax,dword ptr dosferRsEcc3+52" "mov fs:[si+20],eax" \
+	"mov eax,dword ptr dosferRsEcc3+56" "mov fs:[si+24],eax" \
+	"mov ax,word ptr dosferRsEcc3+60" "mov fs:[si+28],ax" \
+	"mov eax,dword ptr dosferRsEcc3+64" "mov gs:[bx],eax" \
+	"mov eax,dword ptr dosferRsEcc3+68" "mov gs:[bx+4],eax" \
+	"mov eax,dword ptr dosferRsEcc3+72" "mov gs:[bx+8],eax" \
+	"mov eax,dword ptr dosferRsEcc3+76" "mov gs:[bx+12],eax" \
+	"mov eax,dword ptr dosferRsEcc3+80" "mov gs:[bx+16],eax" \
+	"mov eax,dword ptr dosferRsEcc3+84" "mov gs:[bx+20],eax" \
+	"mov eax,dword ptr dosferRsEcc3+88" "mov gs:[bx+24],eax" \
+	"mov ax,word ptr dosferRsEcc3+92" "mov gs:[bx+28],ax" \
+	"pop gs" "pop ds" "pop bx" \
+	parm [es di] [fs si] modify [ax];
+
 #endif
 
 /* DOSfer 386 fast path: 768 bytes avoid eight shift/XOR rounds for every
@@ -1444,13 +1481,15 @@ void qrcodegen_dosferComputeEccBlocks3V40L(
 		const uint8_t *const dataCodewords[3],uint8_t *const eccBlocks[3]) {
 #ifdef __WATCOMC__
 	const uint8_t *red,*green,*blue;
-	int block,channel,aligned;
+	int block,channel,aligned,outputsAligned;
 
 	if(!dataCodewords||!eccBlocks)return;
 	for(channel=0;channel<3;channel++)
 		if(!dataCodewords[channel]||!eccBlocks[channel])return;
 	red=dataCodewords[0];green=dataCodewords[1];blue=dataCodewords[2];
 	aligned=FP_OFF(red)==FP_OFF(green)&&FP_OFF(red)==FP_OFF(blue);
+	outputsAligned=FP_OFF(eccBlocks[0])==FP_OFF(eccBlocks[1])&&
+		FP_OFF(eccBlocks[0])==FP_OFF(eccBlocks[2]);
 	dosferRestoreDgroup();
 	dosferPrepareRs(30);
 	for(block=0;block<25;block++) {
@@ -1471,8 +1510,15 @@ void qrcodegen_dosferComputeEccBlocks3V40L(
 			dosferRsStep,dosferRsEcc3[1]);
 		dosferRs30PairAsm(blue+quadLen,(uint16_t)(datLen-quadLen),
 			dosferRsStep,dosferRsEcc3[2]);
-		for(channel=0;channel<3;channel++)
-			memcpy(eccBlocks[channel]+block*30,dosferRsEcc3[channel],30);
+		if(outputsAligned) {
+			uint16_t outputOffset=(uint16_t)(block*30);
+			dosferRsEccBlueOut3=eccBlocks[2]+outputOffset;
+			dosferCopyEcc3Asm(eccBlocks[0]+outputOffset,
+				eccBlocks[1]+outputOffset);
+		} else {
+			for(channel=0;channel<3;channel++)
+				memcpy(eccBlocks[channel]+block*30,dosferRsEcc3[channel],30);
+		}
 		red+=datLen;green+=datLen;blue+=datLen;
 	}
 #else
