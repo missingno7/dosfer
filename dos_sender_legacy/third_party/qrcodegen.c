@@ -501,17 +501,15 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 	"rs30p_loop:" \
 	"mov al,es:[si]" \
 	"xor al,[di]" \
-	"xor ah,ah" \
-	"shl ax,5" \
-	"add ax,bx" \
-	"mov bp,ax" \
+	"movzx ebp,al" \
+	"shl ebp,5" \
+	"add bp,bx" \
 	"mov al,es:[si+1]" \
 	"xor al,[di+1]" \
 	"xor al,byte ptr ds:[ebp]" \
-	"xor ah,ah" \
-	"shl ax,5" \
-	"add ax,bx" \
-	"movzx edx,ax" \
+	"movzx edx,al" \
+	"shl edx,5" \
+	"add dx,bx" \
 	"add si,2" \
 	"mov eax,dword ptr [di+2]" \
 	"xor eax,dword ptr ds:[ebp+1]" \
@@ -552,10 +550,9 @@ static void dosferRs30PairAsm(const uint8_t __far *data,uint16_t len,
 	"jz rs30p_done" \
 	"mov al,es:[si]" \
 	"xor al,[di]" \
-	"xor ah,ah" \
-	"shl ax,5" \
-	"add ax,bx" \
-	"mov bp,ax" \
+	"movzx ebp,al" \
+	"shl ebp,5" \
+	"add bp,bx" \
 	"mov eax,dword ptr [di+1]" \
 	"xor eax,dword ptr ds:[bp]" \
 	"mov dword ptr [di],eax" \
@@ -691,7 +688,6 @@ static void dosferRs30QuadAsm(const uint8_t __far *data,uint16_t len,
 static void dosferRs30Quad3Asm(const uint8_t __far *red,
 		const uint8_t __far *green,uint16_t len);
 #pragma aux dosferRs30Quad3Asm = \
-	"push bp" \
 	"push gs" \
 	"mov ax,word ptr dosferRsBlue3+2" \
 	"mov gs,ax" \
@@ -701,57 +697,57 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"rs30q3_loop:" \
 	/* Red factors and state transition. */ \
 	"mov al,es:[si]" "xor al,byte ptr dosferRsEcc3" \
-	"movzx ebp,al" "shl ebp,5" \
+	"movzx edi,al" "shl edi,5" \
 	"mov al,es:[si+1]" "xor al,byte ptr dosferRsEcc3+1" \
-	"xor al,byte ptr ds:dosferRsStep[ebp]" \
+	"xor al,byte ptr ds:dosferRsStep[edi]" \
 	"movzx edx,al" "shl edx,5" \
 	"mov al,es:[si+2]" "xor al,byte ptr dosferRsEcc3+2" \
-	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
+	"xor al,byte ptr ds:dosferRsStep[edi+1]" \
 	"xor al,byte ptr ds:dosferRsStep[edx]" \
 	"movzx ecx,al" "shl ecx,5" \
 	"mov al,es:[si+3]" "xor al,byte ptr dosferRsEcc3+3" \
-	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
+	"xor al,byte ptr ds:dosferRsStep[edi+2]" \
 	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
 	"xor al,byte ptr ds:dosferRsStep[ecx]" \
 	"movzx ebx,al" "shl ebx,5" \
 	"mov eax,dword ptr dosferRsEcc3+4" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+3]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+1]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx]" \
 	"mov dword ptr dosferRsEcc3,eax" \
 	"mov eax,dword ptr dosferRsEcc3+8" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+7]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+7]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+6]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+5]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+4]" \
 	"mov dword ptr dosferRsEcc3+4,eax" \
 	"mov eax,dword ptr dosferRsEcc3+12" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+11]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+11]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+10]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+9]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+8]" \
 	"mov dword ptr dosferRsEcc3+8,eax" \
 	"mov eax,dword ptr dosferRsEcc3+16" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+15]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+15]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+14]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+13]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+12]" \
 	"mov dword ptr dosferRsEcc3+12,eax" \
 	"mov eax,dword ptr dosferRsEcc3+20" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+19]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+19]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+18]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+17]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+16]" \
 	"mov dword ptr dosferRsEcc3+16,eax" \
 	"mov eax,dword ptr dosferRsEcc3+24" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+23]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+23]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+22]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+21]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+20]" \
 	"mov dword ptr dosferRsEcc3+20,eax" \
 	"mov eax,dword ptr dosferRsEcc3+28" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+27]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+27]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+26]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+25]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+24]" \
@@ -761,57 +757,57 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"mov word ptr dosferRsEcc3+28,ax" \
 	/* Green factors and state transition. */ \
 	"mov al,fs:[si]" "xor al,byte ptr dosferRsEcc3+32" \
-	"movzx ebp,al" "shl ebp,5" \
+	"movzx edi,al" "shl edi,5" \
 	"mov al,fs:[si+1]" "xor al,byte ptr dosferRsEcc3+33" \
-	"xor al,byte ptr ds:dosferRsStep[ebp]" \
+	"xor al,byte ptr ds:dosferRsStep[edi]" \
 	"movzx edx,al" "shl edx,5" \
 	"mov al,fs:[si+2]" "xor al,byte ptr dosferRsEcc3+34" \
-	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
+	"xor al,byte ptr ds:dosferRsStep[edi+1]" \
 	"xor al,byte ptr ds:dosferRsStep[edx]" \
 	"movzx ecx,al" "shl ecx,5" \
 	"mov al,fs:[si+3]" "xor al,byte ptr dosferRsEcc3+35" \
-	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
+	"xor al,byte ptr ds:dosferRsStep[edi+2]" \
 	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
 	"xor al,byte ptr ds:dosferRsStep[ecx]" \
 	"movzx ebx,al" "shl ebx,5" \
 	"mov eax,dword ptr dosferRsEcc3+36" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+3]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+1]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx]" \
 	"mov dword ptr dosferRsEcc3+32,eax" \
 	"mov eax,dword ptr dosferRsEcc3+40" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+7]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+7]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+6]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+5]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+4]" \
 	"mov dword ptr dosferRsEcc3+36,eax" \
 	"mov eax,dword ptr dosferRsEcc3+44" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+11]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+11]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+10]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+9]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+8]" \
 	"mov dword ptr dosferRsEcc3+40,eax" \
 	"mov eax,dword ptr dosferRsEcc3+48" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+15]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+15]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+14]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+13]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+12]" \
 	"mov dword ptr dosferRsEcc3+44,eax" \
 	"mov eax,dword ptr dosferRsEcc3+52" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+19]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+19]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+18]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+17]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+16]" \
 	"mov dword ptr dosferRsEcc3+48,eax" \
 	"mov eax,dword ptr dosferRsEcc3+56" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+23]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+23]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+22]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+21]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+20]" \
 	"mov dword ptr dosferRsEcc3+52,eax" \
 	"mov eax,dword ptr dosferRsEcc3+60" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+27]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+27]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+26]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+25]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+24]" \
@@ -821,57 +817,57 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"mov word ptr dosferRsEcc3+60,ax" \
 	/* Blue factors and state transition. */ \
 	"mov al,gs:[si]" "xor al,byte ptr dosferRsEcc3+64" \
-	"movzx ebp,al" "shl ebp,5" \
+	"movzx edi,al" "shl edi,5" \
 	"mov al,gs:[si+1]" "xor al,byte ptr dosferRsEcc3+65" \
-	"xor al,byte ptr ds:dosferRsStep[ebp]" \
+	"xor al,byte ptr ds:dosferRsStep[edi]" \
 	"movzx edx,al" "shl edx,5" \
 	"mov al,gs:[si+2]" "xor al,byte ptr dosferRsEcc3+66" \
-	"xor al,byte ptr ds:dosferRsStep[ebp+1]" \
+	"xor al,byte ptr ds:dosferRsStep[edi+1]" \
 	"xor al,byte ptr ds:dosferRsStep[edx]" \
 	"movzx ecx,al" "shl ecx,5" \
 	"mov al,gs:[si+3]" "xor al,byte ptr dosferRsEcc3+67" \
-	"xor al,byte ptr ds:dosferRsStep[ebp+2]" \
+	"xor al,byte ptr ds:dosferRsStep[edi+2]" \
 	"xor al,byte ptr ds:dosferRsStep[edx+1]" \
 	"xor al,byte ptr ds:dosferRsStep[ecx]" \
 	"movzx ebx,al" "shl ebx,5" \
 	"mov eax,dword ptr dosferRsEcc3+68" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+3]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+3]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+2]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+1]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx]" \
 	"mov dword ptr dosferRsEcc3+64,eax" \
 	"mov eax,dword ptr dosferRsEcc3+72" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+7]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+7]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+6]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+5]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+4]" \
 	"mov dword ptr dosferRsEcc3+68,eax" \
 	"mov eax,dword ptr dosferRsEcc3+76" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+11]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+11]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+10]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+9]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+8]" \
 	"mov dword ptr dosferRsEcc3+72,eax" \
 	"mov eax,dword ptr dosferRsEcc3+80" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+15]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+15]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+14]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+13]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+12]" \
 	"mov dword ptr dosferRsEcc3+76,eax" \
 	"mov eax,dword ptr dosferRsEcc3+84" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+19]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+19]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+18]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+17]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+16]" \
 	"mov dword ptr dosferRsEcc3+80,eax" \
 	"mov eax,dword ptr dosferRsEcc3+88" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+23]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+23]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+22]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+21]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+20]" \
 	"mov dword ptr dosferRsEcc3+84,eax" \
 	"mov eax,dword ptr dosferRsEcc3+92" \
-	"xor eax,dword ptr ds:dosferRsStep[ebp+27]" \
+	"xor eax,dword ptr ds:dosferRsStep[edi+27]" \
 	"xor eax,dword ptr ds:dosferRsStep[edx+26]" \
 	"xor eax,dword ptr ds:dosferRsStep[ecx+25]" \
 	"xor eax,dword ptr ds:dosferRsStep[ebx+24]" \
@@ -885,8 +881,7 @@ static void dosferRs30Quad3Asm(const uint8_t __far *red,
 	"add sp,2" \
 	"rs30q3_done:" \
 	"pop gs" \
-	"pop bp" \
-	parm [es si] [fs di] [cx] modify [ax bx cx dx si di bp];
+	parm [es si] [fs di] [cx] modify [ax bx cx dx si di];
 
 /* Export the three independent 30-byte ECC states with one segment setup.
  * The fused encoder aligns all three workspaces to the same far offset; the
