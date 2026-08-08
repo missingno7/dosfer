@@ -37,6 +37,9 @@ static u32 copyWhitenedCrc386(u8 __far *dst,const u8 __far *src,u16 len,
     "dec eax" \
     "shr cx,2" \
     "jz wc_words_done" \
+    /* Save the word count once so ECX can index all four CRC slices without
+     * pushing/popping the live whitening state for every payload dword. */ \
+    "push cx" \
     "wc_word_loop:" \
     "mov ebp,edx" \
     "shl ebp,13" \
@@ -51,24 +54,24 @@ static u32 copyWhitenedCrc386(u8 __far *dst,const u8 __far *src,u16 len,
     "xor ebp,edx" \
     "mov dword ptr es:[di],ebp" \
     "xor eax,ebp" \
-    "push edx" \
-    "movzx edx,al" \
-    "mov ebp,dword ptr ds:[ebx+edx*4+3072]" \
+    "movzx ecx,al" \
+    "mov ebp,dword ptr ds:[ebx+ecx*4+3072]" \
     "shr eax,8" \
-    "movzx edx,al" \
-    "xor ebp,dword ptr ds:[ebx+edx*4+2048]" \
+    "movzx ecx,al" \
+    "xor ebp,dword ptr ds:[ebx+ecx*4+2048]" \
     "shr eax,8" \
-    "movzx edx,al" \
-    "xor ebp,dword ptr ds:[ebx+edx*4+1024]" \
+    "movzx ecx,al" \
+    "xor ebp,dword ptr ds:[ebx+ecx*4+1024]" \
     "shr eax,8" \
-    "movzx edx,al" \
-    "xor ebp,dword ptr ds:[ebx+edx*4]" \
+    "movzx ecx,al" \
+    "xor ebp,dword ptr ds:[ebx+ecx*4]" \
     "mov eax,ebp" \
-    "pop edx" \
     "add si,4" \
     "add di,4" \
-    "dec cx" \
+    "mov bp,sp" \
+    "dec word ptr ss:[bp]" \
     "jnz wc_word_loop" \
+    "add sp,2" \
     "wc_words_done:" \
     "pop cx" \
     "and cx,3" \
